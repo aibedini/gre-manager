@@ -4,6 +4,39 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-07-31
+
+### Added
+- **Non-interactive CLI** for automation/Ansible:
+  - `gre node list [--json]` — list configured Iran nodes (foreign side).
+  - `gre node add --name NAME --ip IRAN_IP [--idx N] [--key K] [--yes]` —
+    non-interactive equivalent of the menu's add-node flow; defaults
+    `idx = next free`, `key = 1000 + idx`, keeps the GRE whitelist rule
+    ordering intact and prints the values to enter on the Iran server.
+  - `gre node remove --name NAME [--yes]` — deletes the tunnel, its whitelist
+    ACCEPT rule and the node config.
+  - `gre iran-setup --foreign-ip IP [--iran-ip IP] [--name NAME] [--idx N]
+    [--key K] [--wan IFACE] [--tcp-ports LIST] [--udp-ports LIST]
+    [--mss-clamp on|off] [--yes]` — full non-interactive Iran setup;
+    auto-detects the public IP/WAN interface when omitted. A TCP list covering
+    port 22 aborts unless `--yes` is passed.
+  - All mutating CLI commands ask for confirmation unless `--yes` is passed;
+    unknown flags error out with usage.
+- **JSON status**: `gre status --json` / `gre --status --json` prints pure-bash
+  JSON (no jq needed): version, roles, service/watchdog state, tunnel count,
+  per-node reachability and the Iran-side config.
+- **`gre doctor`**: diagnostics with PASS/WARN/FAIL per check and a non-zero
+  exit code on any FAIL — required binaries, `ip_forward`, WAN interface and
+  Iran IP assignment, tunnel existence + peer ping, NAT DNAT rules, GRE
+  whitelist rules, systemd service/watchdog state, and local port conflicts.
+- **Backup/restore**: `gre export [path]` writes a mode-600 tar.gz of
+  `/etc/multi-gre` (default `./gre-backup-<timestamp>.tar.gz`);
+  `gre import <file> [--yes]` verifies the archive (gzip tar, must contain
+  `etc/multi-gre`, no absolute/`..` paths), stops tunnels, restores, and
+  re-applies everything.
+- **Port-conflict warning**: the interactive Iran setup now warns (non-fatally)
+  when a forwarded port is already listened on by a local service.
+
 ## [1.1.0] - 2026-07-31
 
 ### Added
@@ -55,3 +88,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [1.0.0]: https://github.com/aibedini/gre-manager/releases/tag/v1.0.0
 [1.1.0]: https://github.com/aibedini/gre-manager/releases/tag/v1.1.0
+[1.2.0]: https://github.com/aibedini/gre-manager/releases/tag/v1.2.0

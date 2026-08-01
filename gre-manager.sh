@@ -26,7 +26,16 @@
 #   gre --apply         bring up everything that is configured   (used by systemd)
 #   gre --stop          tear everything down (config is kept)    (used by systemd)
 #   gre --watchdog      check tunnels, re-apply dead ones        (used by systemd timer)
-#   gre --status        show status
+#   gre status [--json] show status (machine-readable JSON with --json)
+#   gre doctor          diagnostics: PASS/WARN/FAIL per check, non-zero exit on FAIL
+#   gre node list [--json]                              list Iran nodes (FOREIGN)
+#   gre node add --name NAME --ip IRAN_IP [--idx N] [--key K] [--yes]
+#   gre node remove --name NAME [--yes]
+#   gre iran-setup --foreign-ip IP [--iran-ip IP] [--name NAME] [--idx N]
+#                  [--key K] [--wan IFACE] [--tcp-ports LIST] [--udp-ports LIST]
+#                  [--mss-clamp on|off] [--yes]
+#   gre export [path] [--yes]   back up /etc/multi-gre to a tar.gz archive
+#   gre import <file> [--yes]   restore a backup made by 'gre export'
 #   gre watchdog        watchdog timer: enable|disable|status
 #   gre update          self-update to the latest version from GitHub
 #   gre --version       print version
@@ -34,7 +43,7 @@
 #
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 GITHUB_REPO="aibedini/gre-manager"
 RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/gre-manager.sh"
@@ -157,6 +166,41 @@ port_list_covers_22() {
         fi
     done
     return 1
+}
+
+# ------------------------------------------------------------- port conflicts
+port_in_use() { # proto(tcp|udp) port -> 0 if a local service listens on it
+    local proto="$1" port="$2"
+    command -v ss >/dev/null 2>&1 || return 1
+    case "$proto" in
+        tcp) ss -tlnH "sport = :$port" 2>/dev/null | grep -q . ;;
+        udp) ss -ulnH "sport = :$port" 2>/dev/null | grep -q . ;;
+        *)   return 1 ;;
+    esac
+}
+
+# Call a callback-style check for each port in a list; ranges are only checked
+# at both endpoints (checking 65k ports one by one would be too slow).
+warn_port_conflicts() { # proto(tcp|udp) list — warn for ports already listened on locally
+    local proto="$1" list="$2" item a b port
+    [[ -z "$list" ]] && return 0
+    local IFS=','
+    local -a items=()
+    read -ra items <<< "$list"
+    unset IFS
+    for item in "${items[@]}"; do
+        if [[ "$item" == *:* ]]; then
+            a="${item%%:*}"; b="${item##*:}"
+            for port in "$a" "$b"; do
+                if port_in_use "$proto" "$port"; then
+                    warn "Port $port/$proto (from range $item) is already listened on by a local service; forwarding it may not work as expected."
+                fi
+            done
+        elif port_in_use "$proto" "$item"; then
+            warn "Port $item/$proto is already listened on by a local service; forwarding it may not work as expected."
+        fi
+    done
+    return 0
 }
 
 # ------------------------------------------------------------- detection
@@ -544,6 +588,9 @@ setup_iran() {
     valid_port_list "$TCP_PORTS" || { err "Invalid TCP port list"; return 1; }
     valid_port_list "$UDP_PORTS" || { err "Invalid UDP port list"; return 1; }
 
+    warn_port_conflicts "tcp" "$TCP_PORTS"
+    warn_port_conflicts "udp" "$UDP_PORTS"
+
     if port_list_covers_22 "$TCP_PORTS"; then
         warn "Port 22 (SSH) is in the TCP list: SSH to this server will be forwarded to the FOREIGN server!"
         confirm "Are you sure you want to forward port 22?" || { info "Aborted."; return 1; }
@@ -845,6 +892,564 @@ self_update() {
     exit 0
 }
 
+# ------------------------------------------------------------- CLI: node mgmt
+cli_node_list() { # gre node list [--json]
+    local json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)     json=1; shift ;;
+            --help|-h)  echo "Usage: gre node list [--json]"; return 0 ;;
+            *)          err "Unknown option: $1"; err "Usage: gre node list [--json]"; return 1 ;;
+        esac
+    done
+    [[ -f "$FOREIGN_CONF" ]] || { err "This server is not configured as FOREIGN."; return 1; }
+
+    local f NAME="" IRAN_IP="" IDX="" KEY="" TUN=""
+    if (( json )); then
+        local out="[" sep=""
+        for f in "$NODES_DIR"/*.conf; do
+            [[ -e "$f" ]] || continue
+            NAME=""; IRAN_IP=""; IDX=""; KEY=""; TUN=""
+            source "$f"
+            out+="${sep}{\"name\":\"$NAME\",\"iran_ip\":\"$IRAN_IP\",\"idx\":$IDX,\"key\":$KEY,\"tun\":\"$TUN\"}"
+            sep=","
+        done
+        out+="]"
+        printf '%s\n' "$out"
+    else
+        info "Configured Iran nodes:"
+        local found=0
+        for f in "$NODES_DIR"/*.conf; do
+            [[ -e "$f" ]] || continue
+            found=1
+            NAME=""; IRAN_IP=""; IDX=""; KEY=""; TUN=""
+            source "$f"
+            printf '  %s  iran ip %s, idx %s, key %s, tunnel %s\n' \
+                "$NAME" "$IRAN_IP" "$IDX" "$KEY" "$TUN"
+        done
+        (( found )) || info "  (none)"
+    fi
+}
+
+cli_node_add() { # gre node add --name NAME --ip IRAN_IP [--idx N] [--key K] [--yes]
+    require_root
+    if [[ ! -f "$FOREIGN_CONF" ]]; then
+        err "This server is not configured as FOREIGN yet."
+        err "Run 'gre' (menu option 2) once for the initial foreign setup, then retry."
+        return 1
+    fi
+    local NAME="" IRAN_IP="" IDX="" KEY="" YES=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name)     [[ -n "${2:-}" ]] || { err "Missing value for --name"; return 1; }; NAME="$2"; shift 2 ;;
+            --ip)       [[ -n "${2:-}" ]] || { err "Missing value for --ip"; return 1; }; IRAN_IP="$2"; shift 2 ;;
+            --idx)      [[ -n "${2:-}" ]] || { err "Missing value for --idx"; return 1; }; IDX="$2"; shift 2 ;;
+            --key)      [[ -n "${2:-}" ]] || { err "Missing value for --key"; return 1; }; KEY="$2"; shift 2 ;;
+            --yes|-y)   YES=1; shift ;;
+            --help|-h)  echo "Usage: gre node add --name NAME --ip IRAN_IP [--idx N] [--key K] [--yes]"; return 0 ;;
+            *)          err "Unknown option: $1"
+                        err "Usage: gre node add --name NAME --ip IRAN_IP [--idx N] [--key K] [--yes]"
+                        return 1 ;;
+        esac
+    done
+    [[ -n "$NAME" ]]    || { err "Missing required option: --name"; err "Usage: gre node add --name NAME --ip IRAN_IP [--idx N] [--key K] [--yes]"; return 1; }
+    [[ -n "$IRAN_IP" ]] || { err "Missing required option: --ip";   err "Usage: gre node add --name NAME --ip IRAN_IP [--idx N] [--key K] [--yes]"; return 1; }
+
+    valid_name "$NAME" || { err "Invalid node name: $NAME"; return 1; }
+    if [[ -f "$NODES_DIR/$NAME.conf" ]]; then
+        err "Node '$NAME' already exists. Remove it first (gre node remove --name $NAME)."
+        return 1
+    fi
+    valid_ip "$IRAN_IP" || { err "Invalid IP: $IRAN_IP"; return 1; }
+
+    if [[ -z "$IDX" ]]; then
+        IDX="$(next_free_idx)" || { err "No free tunnel index left"; return 1; }
+    fi
+    [[ "$IDX" =~ ^[0-9]+$ ]] && (( IDX >= 1 && IDX <= 254 )) || { err "Invalid index: $IDX"; return 1; }
+    local f existing_idx=""
+    for f in "$NODES_DIR"/*.conf; do
+        [[ -e "$f" ]] || continue
+        existing_idx="$(grep -E '^IDX=' "$f" | cut -d= -f2)"
+        if [[ "$existing_idx" == "$IDX" ]]; then
+            err "Index $IDX is already used by another node."
+            return 1
+        fi
+    done
+    [[ -z "$KEY" ]] && KEY=$(( 1000 + IDX ))
+    [[ "$KEY" =~ ^[0-9]+$ ]] || { err "Invalid key: $KEY"; return 1; }
+
+    if (( ! YES )); then
+        confirm "Add node '$NAME' (iran ip $IRAN_IP, idx $IDX, key $KEY)?" || { info "Cancelled."; return; }
+    fi
+
+    mkdir -p "$NODES_DIR"
+    cat > "$NODES_DIR/$NAME.conf" <<EOF
+NAME=$NAME
+IRAN_IP=$IRAN_IP
+IDX=$IDX
+KEY=$KEY
+TUN=gre-$NAME
+EOF
+    chmod 600 "$NODES_DIR/$NAME.conf"
+
+    # FOREIGN_IP must be in scope for apply_foreign_node; GRE_WHITELIST decides
+    # whether the firewall hardening below needs a refresh.
+    local FOREIGN_IP="" ICMP_DROP="" GRE_WHITELIST=""
+    # shellcheck disable=SC1090
+    source "$FOREIGN_CONF"
+
+    apply_foreign_node "$NODES_DIR/$NAME.conf" || {
+        err "Failed to create the tunnel."
+        rm -f "$NODES_DIR/$NAME.conf"
+        return 1
+    }
+    # refresh firewall hardening so the new node's ACCEPT lands before the block rule
+    if [[ "${GRE_WHITELIST:-0}" == "1" ]]; then
+        ipt_del filter INPUT -p gre -m comment --comment "multi-gre-block" -j DROP
+        ipt_add filter INPUT -p gre -s "$IRAN_IP" \
+            -m comment --comment "multi-gre-node-$NAME" -j ACCEPT
+        ipt_add filter INPUT -p gre -m comment --comment "multi-gre-block" -j DROP
+    fi
+    audit_log "node-add name=$NAME iran_ip=$IRAN_IP idx=$IDX key=$KEY"
+
+    echo
+    ok "Node '$NAME' added on FOREIGN."
+    echo "------------------------------------------------------------"
+    echo "  Run 'gre' -> option 1 on the IRAN server and enter:"
+    echo "    Public IP of THIS Iran server : $IRAN_IP"
+    echo "    Public IP of the FOREIGN server: $FOREIGN_IP"
+    echo "    Node name                     : $NAME"
+    echo "    Tunnel index                  : $IDX"
+    echo "    GRE key                       : $KEY"
+    echo "------------------------------------------------------------"
+    info "Test from here:  ping ${SUBNET_BASE}.${IDX}.2  (after the Iran side is up)"
+}
+
+cli_node_remove() { # gre node remove --name NAME [--yes]
+    require_root
+    [[ -f "$FOREIGN_CONF" ]] || { err "This server is not configured as FOREIGN."; return 1; }
+    local NAME="" YES=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name)     [[ -n "${2:-}" ]] || { err "Missing value for --name"; return 1; }; NAME="$2"; shift 2 ;;
+            --yes|-y)   YES=1; shift ;;
+            --help|-h)  echo "Usage: gre node remove --name NAME [--yes]"; return 0 ;;
+            *)          err "Unknown option: $1"; err "Usage: gre node remove --name NAME [--yes]"; return 1 ;;
+        esac
+    done
+    [[ -n "$NAME" ]] || { err "Missing required option: --name"; err "Usage: gre node remove --name NAME [--yes]"; return 1; }
+
+    local f="$NODES_DIR/$NAME.conf"
+    [[ -f "$f" ]] || { err "Node '$NAME' does not exist."; return 1; }
+    local IRAN_IP="" IDX="" KEY="" TUN=""
+    # shellcheck disable=SC1090
+    source "$f"
+    if (( ! YES )); then
+        confirm "Remove node '$NAME' (tunnel $TUN)?" || { info "Cancelled."; return; }
+    fi
+    delete_tunnel "$TUN"
+    ipt_del filter INPUT -p gre -s "$IRAN_IP" \
+        -m comment --comment "multi-gre-node-$NAME" -j ACCEPT
+    rm -f "$f"
+    audit_log "node-remove name=$NAME iran_ip=$IRAN_IP idx=$IDX"
+    ok "Node '$NAME' removed."
+    info "On the IRAN server itself, run menu option 7 (Uninstall) to clean up that side."
+}
+
+# ------------------------------------------------------------- CLI: iran setup
+cli_iran_setup() { # gre iran-setup --foreign-ip IP [options]
+    require_root
+    local FOREIGN_IP="" IRAN_IP="" NAME="ir01" IDX="1" KEY="" WAN_IF="" \
+          TCP_PORTS="" UDP_PORTS="" MSS="on" YES=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --foreign-ip) [[ -n "${2:-}" ]] || { err "Missing value for --foreign-ip"; return 1; }; FOREIGN_IP="$2"; shift 2 ;;
+            --iran-ip)    [[ -n "${2:-}" ]] || { err "Missing value for --iran-ip"; return 1; }; IRAN_IP="$2"; shift 2 ;;
+            --name)       [[ -n "${2:-}" ]] || { err "Missing value for --name"; return 1; }; NAME="$2"; shift 2 ;;
+            --idx)        [[ -n "${2:-}" ]] || { err "Missing value for --idx"; return 1; }; IDX="$2"; shift 2 ;;
+            --key)        [[ -n "${2:-}" ]] || { err "Missing value for --key"; return 1; }; KEY="$2"; shift 2 ;;
+            --wan)        [[ -n "${2:-}" ]] || { err "Missing value for --wan"; return 1; }; WAN_IF="$2"; shift 2 ;;
+            --tcp-ports)  [[ -n "${2:-}" ]] || { err "Missing value for --tcp-ports"; return 1; }; TCP_PORTS="$2"; shift 2 ;;
+            --udp-ports)  [[ -n "${2:-}" ]] || { err "Missing value for --udp-ports"; return 1; }; UDP_PORTS="$2"; shift 2 ;;
+            --mss-clamp)  [[ "${2:-}" == "on" || "${2:-}" == "off" ]] || { err "--mss-clamp must be 'on' or 'off'"; return 1; }; MSS="$2"; shift 2 ;;
+            --yes|-y)     YES=1; shift ;;
+            --help|-h)    echo "Usage: gre iran-setup --foreign-ip IP [--iran-ip IP] [--name NAME] [--idx N] [--key K] [--wan IFACE] [--tcp-ports LIST] [--udp-ports LIST] [--mss-clamp on|off] [--yes]"; return 0 ;;
+            *)            err "Unknown option: $1"
+                          err "Usage: gre iran-setup --foreign-ip IP [--iran-ip IP] [--name NAME] [--idx N] [--key K] [--wan IFACE] [--tcp-ports LIST] [--udp-ports LIST] [--mss-clamp on|off] [--yes]"
+                          return 1 ;;
+        esac
+    done
+    if [[ -z "$FOREIGN_IP" ]]; then
+        err "Missing required option: --foreign-ip"
+        err "Usage: gre iran-setup --foreign-ip IP [--iran-ip IP] [--name NAME] [--idx N] [--key K] [--wan IFACE] [--tcp-ports LIST] [--udp-ports LIST] [--mss-clamp on|off] [--yes]"
+        return 1
+    fi
+
+    if [[ -z "$WAN_IF" ]]; then
+        WAN_IF="$(detect_wan_iface)"
+    fi
+    if [[ -z "$IRAN_IP" ]]; then
+        IRAN_IP="$(detect_public_ip "$WAN_IF")"
+    fi
+
+    valid_ip "$IRAN_IP"    || { err "Invalid or undetectable Iran IP: '$IRAN_IP' (pass --iran-ip)"; return 1; }
+    valid_ip "$FOREIGN_IP" || { err "Invalid foreign IP: $FOREIGN_IP"; return 1; }
+    valid_name "$NAME"     || { err "Invalid node name: $NAME"; return 1; }
+    [[ "$IDX" =~ ^[0-9]+$ ]] && (( IDX >= 1 && IDX <= 254 )) || { err "Invalid index: $IDX"; return 1; }
+    [[ -z "$KEY" ]] && KEY=$(( 1000 + IDX ))
+    [[ "$KEY" =~ ^[0-9]+$ ]] || { err "Invalid key: $KEY"; return 1; }
+    [[ -n "$WAN_IF" ]] || { err "WAN interface could not be detected (pass --wan)"; return 1; }
+    valid_port_list "$TCP_PORTS" || { err "Invalid TCP port list"; return 1; }
+    valid_port_list "$UDP_PORTS" || { err "Invalid UDP port list"; return 1; }
+
+    warn_port_conflicts "tcp" "$TCP_PORTS"
+    warn_port_conflicts "udp" "$UDP_PORTS"
+
+    if port_list_covers_22 "$TCP_PORTS" && (( ! YES )); then
+        err "The TCP port list covers port 22 (SSH): SSH to this server would be forwarded to the FOREIGN server!"
+        err "Re-run with --yes to confirm."
+        return 1
+    fi
+
+    # only tear down the old config once every new value has been validated
+    if [[ -f "$IRAN_CONF" ]]; then
+        warn "This server is already configured as an IRAN node."
+        if (( ! YES )); then
+            confirm "Reconfigure from scratch?" || return
+        fi
+        stop_iran
+        rm -f "$IRAN_CONF"
+    fi
+
+    local mss_clamp="0"
+    [[ "$MSS" == "on" ]] && mss_clamp="1"
+
+    mkdir -p "$CONF_DIR"
+    cat > "$IRAN_CONF" <<EOF
+NAME=$NAME
+FOREIGN_IP=$FOREIGN_IP
+IRAN_IP=$IRAN_IP
+WAN_IF=$WAN_IF
+IDX=$IDX
+KEY=$KEY
+TUN=gre-$NAME
+TCP_PORTS=$TCP_PORTS
+UDP_PORTS=$UDP_PORTS
+MSS_CLAMP=$mss_clamp
+EOF
+    chmod 600 "$IRAN_CONF"
+
+    apply_iran || { err "Failed to bring the tunnel up. Check the IPs and that GRE (proto 47) is not blocked."; return 1; }
+    install_service
+    audit_log "iran-setup name=$NAME foreign=$FOREIGN_IP idx=$IDX key=$KEY tcp='$TCP_PORTS' udp='$UDP_PORTS' mss=$mss_clamp"
+
+    echo
+    ok "IRAN node '$NAME' configured."
+    info "Tunnel: gre-$NAME  ${SUBNET_BASE}.${IDX}.2/30  <->  $FOREIGN_IP (key $KEY)"
+    info "On the FOREIGN server this node must exist with the SAME name, index and key (gre node add)."
+    info "Test from here:  ping ${SUBNET_BASE}.${IDX}.1"
+}
+
+# ------------------------------------------------------------- CLI: JSON status
+show_status_json() { # pure-bash JSON; values are pre-validated (IPs/alphanumeric)
+    local roles="[" sep=""
+    if [[ -f "$FOREIGN_CONF" ]]; then roles+="${sep}\"foreign\""; sep=","; fi
+    if [[ -f "$IRAN_CONF" ]];    then roles+="${sep}\"iran\"";    sep=","; fi
+    roles+="]"
+
+    local nodes_json="[" nsep=""
+    if [[ -f "$FOREIGN_CONF" ]]; then
+        local f NAME="" IRAN_IP="" IDX="" KEY="" TUN=""
+        for f in "$NODES_DIR"/*.conf; do
+            [[ -e "$f" ]] || continue
+            NAME=""; IRAN_IP=""; IDX=""; KEY=""; TUN=""
+            source "$f"
+            local reach="false"
+            ping -c 1 -W 2 "${SUBNET_BASE}.${IDX}.2" >/dev/null 2>&1 && reach="true"
+            nodes_json+="${nsep}{\"name\":\"$NAME\",\"iran_ip\":\"$IRAN_IP\",\"idx\":$IDX,\"key\":$KEY,\"tun\":\"$TUN\",\"reachable\":$reach}"
+            nsep=","
+        done
+    fi
+    nodes_json+="]"
+
+    local iran_json="null"
+    if [[ -f "$IRAN_CONF" ]]; then
+        local NAME="" FOREIGN_IP="" IRAN_IP="" WAN_IF="" IDX="" KEY="" TUN="" \
+              TCP_PORTS="" UDP_PORTS="" MSS_CLAMP=""
+        # shellcheck disable=SC1090
+        source "$IRAN_CONF"
+        local reach="false"
+        ping -c 1 -W 2 "${SUBNET_BASE}.${IDX}.1" >/dev/null 2>&1 && reach="true"
+        iran_json="{\"name\":\"$NAME\",\"foreign_ip\":\"$FOREIGN_IP\",\"idx\":$IDX,\"key\":$KEY,\"tun\":\"$TUN\",\"tcp_ports\":\"$TCP_PORTS\",\"udp_ports\":\"$UDP_PORTS\",\"reachable\":$reach}"
+    fi
+
+    local svc_state wd_state
+    svc_state="$(service_state)";  svc_state="${svc_state:-unknown}"
+    wd_state="$(watchdog_state)";  wd_state="${wd_state:-unknown}"
+
+    cat <<EOF
+{
+  "version": "$VERSION",
+  "roles": $roles,
+  "service": "$svc_state",
+  "watchdog": "$wd_state",
+  "tunnels_up": $(tunnel_count),
+  "nodes": $nodes_json,
+  "iran": $iran_json
+}
+EOF
+}
+
+# ------------------------------------------------------------- CLI: doctor
+d_pass() { printf '%s[PASS]%s %s\n'  "$C_GREEN"  "$C_RESET" "$*"; }
+d_warn() { DOC_WARN=$(( ${DOC_WARN:-0} + 1 )); printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"; }
+d_fail() { DOC_FAIL=$(( ${DOC_FAIL:-0} + 1 )); printf '%s[FAIL]%s %s\n' "$C_RED"    "$C_RESET" "$*" >&2; }
+
+doctor() { # gre doctor — diagnostics; exits non-zero if any check FAILs
+    local DOC_FAIL=0 DOC_WARN=0
+    echo
+    info "Running multi-gre diagnostics..."
+    echo
+
+    # --- required binaries
+    local b
+    for b in ip iptables ping systemctl curl; do
+        if command -v "$b" >/dev/null 2>&1; then
+            d_pass "binary found: $b"
+        else
+            d_fail "missing required binary: $b"
+        fi
+    done
+
+    local is_foreign=0 is_iran=0
+    [[ -f "$FOREIGN_CONF" ]] && is_foreign=1
+    [[ -f "$IRAN_CONF" ]]    && is_iran=1
+    if (( ! is_foreign && ! is_iran )); then
+        d_warn "no configuration found in $CONF_DIR — fresh server, role checks skipped"
+    fi
+
+    # --- IRAN role checks
+    if (( is_iran )); then
+        local NAME="" FOREIGN_IP="" IRAN_IP="" WAN_IF="" IDX="" KEY="" TUN="" \
+              TCP_PORTS="" UDP_PORTS="" MSS_CLAMP=""
+        # shellcheck disable=SC1090
+        source "$IRAN_CONF"
+        local peer="${SUBNET_BASE}.${IDX}.1"
+
+        if [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]]; then
+            d_pass "net.ipv4.ip_forward = 1"
+        else
+            d_fail "net.ipv4.ip_forward is not 1 (fix: sysctl -w net.ipv4.ip_forward=1)"
+        fi
+        if [[ -n "$WAN_IF" ]] && ip link show "$WAN_IF" >/dev/null 2>&1; then
+            d_pass "WAN interface '$WAN_IF' exists"
+        else
+            d_fail "WAN interface '$WAN_IF' from iran.conf does not exist"
+        fi
+        if ip -4 -o addr show 2>/dev/null | awk '{split($4,a,"/"); print a[1]}' | grep -qx "$IRAN_IP"; then
+            d_pass "IRAN_IP $IRAN_IP is assigned to a local interface"
+        else
+            d_fail "IRAN_IP $IRAN_IP is not assigned to any local interface"
+        fi
+        if [[ -n "$TUN" ]]; then
+            if tun_exists "$TUN"; then
+                d_pass "tunnel $TUN exists"
+            else
+                d_fail "tunnel $TUN is missing (fix: gre --apply)"
+            fi
+            if ping -c 2 -W 2 "$peer" >/dev/null 2>&1; then
+                d_pass "tunnel peer $peer answers ping"
+            else
+                d_fail "tunnel peer $peer does not answer ping"
+            fi
+        fi
+        # NAT DNAT rules from iran.conf
+        if [[ -n "$TCP_PORTS" ]]; then
+            if iptables -t nat -C PREROUTING -i "$WAN_IF" -d "$IRAN_IP" -p tcp \
+                -m multiport --dports "$TCP_PORTS" -j DNAT --to-destination "$peer" 2>/dev/null; then
+                d_pass "NAT DNAT rule for TCP ports $TCP_PORTS is present"
+            else
+                d_fail "NAT DNAT rule for TCP ports $TCP_PORTS is missing (fix: gre --apply)"
+            fi
+        fi
+        if [[ -n "$UDP_PORTS" ]]; then
+            if iptables -t nat -C PREROUTING -i "$WAN_IF" -d "$IRAN_IP" -p udp \
+                -m multiport --dports "$UDP_PORTS" -j DNAT --to-destination "$peer" 2>/dev/null; then
+                d_pass "NAT DNAT rule for UDP ports $UDP_PORTS is present"
+            else
+                d_fail "NAT DNAT rule for UDP ports $UDP_PORTS is missing (fix: gre --apply)"
+            fi
+        fi
+        # port conflicts: a local service already listening on a forwarded port
+        local conflicts=0 proto plist item a b port
+        for proto in tcp udp; do
+            if [[ "$proto" == "tcp" ]]; then plist="$TCP_PORTS"; else plist="$UDP_PORTS"; fi
+            [[ -z "$plist" ]] && continue
+            local IFS=','
+            local -a pitems=()
+            read -ra pitems <<< "$plist"
+            unset IFS
+            for item in "${pitems[@]}"; do
+                if [[ "$item" == *:* ]]; then
+                    a="${item%%:*}"; b="${item##*:}"
+                    for port in "$a" "$b"; do
+                        if port_in_use "$proto" "$port"; then
+                            d_warn "port $port/$proto (range $item) is already listened on by a local service"
+                            conflicts=1
+                        fi
+                    done
+                elif port_in_use "$proto" "$item"; then
+                    d_warn "port $item/$proto is already listened on by a local service"
+                    conflicts=1
+                fi
+            done
+        done
+        if (( conflicts == 0 )) && [[ -n "$TCP_PORTS" || -n "$UDP_PORTS" ]]; then
+            d_pass "no local listeners conflict with the forwarded ports"
+        fi
+    fi
+
+    # --- FOREIGN role checks
+    if (( is_foreign )); then
+        local FOREIGN_IP="" ICMP_DROP="" GRE_WHITELIST=""
+        # shellcheck disable=SC1090
+        source "$FOREIGN_CONF"
+        local f NAME="" IRAN_IP="" IDX="" KEY="" TUN=""
+        local node_count=0
+        for f in "$NODES_DIR"/*.conf; do
+            [[ -e "$f" ]] || continue
+            node_count=$(( node_count + 1 ))
+            NAME=""; IRAN_IP=""; IDX=""; KEY=""; TUN=""
+            source "$f"
+            if tun_exists "$TUN"; then
+                d_pass "tunnel $TUN (node $NAME) exists"
+            else
+                d_fail "tunnel $TUN (node $NAME) is missing (fix: gre --apply)"
+            fi
+            if ping -c 2 -W 2 "${SUBNET_BASE}.${IDX}.2" >/dev/null 2>&1; then
+                d_pass "node $NAME (${SUBNET_BASE}.${IDX}.2) answers ping"
+            else
+                d_fail "node $NAME (${SUBNET_BASE}.${IDX}.2) does not answer ping"
+            fi
+        done
+        (( node_count == 0 )) && d_warn "FOREIGN is configured but has no Iran nodes yet"
+        if [[ "${GRE_WHITELIST:-0}" == "1" ]]; then
+            if iptables -C INPUT -p gre -m comment --comment "multi-gre-block" -j DROP 2>/dev/null; then
+                d_pass "GRE whitelist block rule is present"
+            else
+                d_fail "GRE whitelist block rule is missing (fix: gre --apply)"
+            fi
+            for f in "$NODES_DIR"/*.conf; do
+                [[ -e "$f" ]] || continue
+                NAME=""; IRAN_IP=""; IDX=""; KEY=""; TUN=""
+                source "$f"
+                if iptables -C INPUT -p gre -s "$IRAN_IP" \
+                    -m comment --comment "multi-gre-node-$NAME" -j ACCEPT 2>/dev/null; then
+                    d_pass "GRE whitelist ACCEPT rule for node $NAME is present"
+                else
+                    d_fail "GRE whitelist ACCEPT rule for node $NAME is missing (fix: gre --apply)"
+                fi
+            done
+        fi
+    fi
+
+    # --- systemd
+    if [[ "$(service_state)" == "enabled" ]]; then
+        d_pass "multi-gre.service is enabled"
+    else
+        d_warn "multi-gre.service is not enabled"
+    fi
+    if [[ "$(watchdog_state)" == "active" ]]; then
+        d_pass "multi-gre-watchdog.timer is active"
+    else
+        d_warn "multi-gre-watchdog.timer is not active"
+    fi
+
+    echo
+    info "Note: GRE (protocol 47) must be allowed by the datacenter on both sides."
+    echo
+    if (( DOC_FAIL > 0 )); then
+        err "doctor: $DOC_FAIL check(s) failed, $DOC_WARN warning(s)."
+        return 1
+    fi
+    ok "doctor: all checks passed ($DOC_WARN warning(s))."
+    return 0
+}
+
+# ------------------------------------------------------------- CLI: backup
+cli_export() { # gre export [path] [--yes]
+    require_root
+    local path="" YES=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --yes|-y)   YES=1; shift ;;
+            --help|-h)  echo "Usage: gre export [path] [--yes]"; return 0 ;;
+            -*)         err "Unknown option: $1"; err "Usage: gre export [path] [--yes]"; return 1 ;;
+            *)          [[ -z "$path" ]] || { err "Unexpected extra argument: $1"; err "Usage: gre export [path] [--yes]"; return 1; }
+                        path="$1"; shift ;;
+        esac
+    done
+    [[ -z "$path" ]] && path="./gre-backup-$(date '+%Y%m%d-%H%M%S').tar.gz"
+
+    if [[ ! -d "$CONF_DIR" ]]; then
+        if (( ! YES )); then
+            err "No configuration found ($CONF_DIR does not exist); nothing to export."
+            return 1
+        fi
+        warn "No configuration found ($CONF_DIR does not exist); writing an empty backup."
+        tar -czf "$path" --files-from /dev/null || { err "Backup failed."; rm -f "$path"; return 1; }
+    else
+        tar -czf "$path" -C / etc/multi-gre || { err "Backup failed."; rm -f "$path"; return 1; }
+    fi
+    chmod 600 "$path"
+    audit_log "export path=$path"
+    ok "Backup written to $path"
+}
+
+cli_import() { # gre import <file> [--yes]
+    require_root
+    local file="" YES=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --yes|-y)   YES=1; shift ;;
+            --help|-h)  echo "Usage: gre import <file> [--yes]"; return 0 ;;
+            -*)         err "Unknown option: $1"; err "Usage: gre import <file> [--yes]"; return 1 ;;
+            *)          [[ -z "$file" ]] || { err "Unexpected extra argument: $1"; err "Usage: gre import <file> [--yes]"; return 1; }
+                        file="$1"; shift ;;
+        esac
+    done
+    [[ -n "$file" ]] || { err "Missing backup file."; err "Usage: gre import <file> [--yes]"; return 1; }
+    [[ -f "$file" ]] || { err "File not found: $file"; return 1; }
+
+    if ! tar -tzf "$file" >/dev/null 2>&1; then
+        err "Not a gzip tar archive: $file"
+        return 1
+    fi
+    local list
+    list="$(tar -tzf "$file")"
+    if ! grep -Eq '^(\./)?etc/multi-gre(/|$)' <<< "$list"; then
+        err "Archive does not contain etc/multi-gre; refusing to import."
+        return 1
+    fi
+    if grep -Eq '(^|/)\.\.(/|$)|^/' <<< "$list"; then
+        err "Archive contains unsafe paths (absolute or '..'); refusing to import."
+        return 1
+    fi
+
+    if (( ! YES )); then
+        confirm "Import '$file'? This replaces the current multi-gre configuration on this server." \
+            || { info "Cancelled."; return; }
+    fi
+
+    info "Stopping current tunnels..."
+    stop_all
+    tar -xzf "$file" -C / || { err "Extraction failed."; return 1; }
+    install_service
+    apply_all
+    audit_log "import file=$file"
+    ok "Import complete."
+}
+
 # ------------------------------------------------------------- main
 banner() {
     local roles="not configured"
@@ -912,15 +1517,31 @@ usage() {
 Multi-GRE Tunnel Manager v$VERSION — https://github.com/$GITHUB_REPO
 
 Usage:
-  gre              interactive menu
-  gre --apply      bring up all configured tunnels (used by systemd)
-  gre --stop       tear down all tunnels, keep config (used by systemd)
-  gre --watchdog   check tunnels and re-apply dead ones (used by systemd timer)
-  gre watchdog     watchdog timer: enable|disable|status
-  gre --status     show status
-  gre update       self-update to the latest version
-  gre --version    print version
-  gre --help       this help
+  gre                     interactive menu
+  gre status [--json]     show status (machine-readable JSON with --json)
+  gre doctor              diagnostics: PASS/WARN/FAIL per check, non-zero exit on FAIL
+  gre node list [--json]  list configured Iran nodes (FOREIGN)
+  gre node add --name NAME --ip IRAN_IP [--idx N] [--key K] [--yes]
+                          add an Iran node on FOREIGN (non-interactive)
+  gre node remove --name NAME [--yes]
+                          remove an Iran node from FOREIGN
+  gre iran-setup --foreign-ip IP [--iran-ip IP] [--name NAME] [--idx N]
+                 [--key K] [--wan IFACE] [--tcp-ports LIST] [--udp-ports LIST]
+                 [--mss-clamp on|off] [--yes]
+                          configure this server as an IRAN node (non-interactive)
+  gre export [path] [--yes]
+                          back up /etc/multi-gre (default: ./gre-backup-<timestamp>.tar.gz)
+  gre import <file> [--yes]
+                          restore a backup created by 'gre export'
+  gre watchdog            watchdog timer: enable|disable|status
+  gre update              self-update to the latest version
+  gre --apply             bring up all configured tunnels (used by systemd)
+  gre --stop              tear down all tunnels, keep config (used by systemd)
+  gre --watchdog          check tunnels and re-apply dead ones (used by systemd timer)
+  gre --version           print version
+  gre --help              this help
+
+All mutating commands ask for confirmation unless --yes is passed.
 EOF
 }
 
@@ -929,7 +1550,31 @@ case "${1:-}" in
     --stop)            require_root; stop_all ;;
     --watchdog)        require_root; watchdog_run ;;
     watchdog)          watchdog_menu "${2:-status}" ;;
-    --status|status)   show_status ;;
+    --status|status)
+        case "${2:-}" in
+            "")      show_status ;;
+            --json)  show_status_json ;;
+            *)       err "Unknown option: $2"; err "Usage: gre status [--json]"; exit 1 ;;
+        esac ;;
+    node)
+        case "${2:-}" in
+            list)    cli_node_list "${@:3}" ;;
+            add)     cli_node_add "${@:3}" ;;
+            remove)  cli_node_remove "${@:3}" ;;
+            --help|-h)
+                cat <<'EOF'
+Usage:
+  gre node list [--json]
+  gre node add --name NAME --ip IRAN_IP [--idx N] [--key K] [--yes]
+  gre node remove --name NAME [--yes]
+EOF
+                ;;
+            *)       err "Usage: gre node <list|add|remove> ...  (see: gre node --help)"; exit 1 ;;
+        esac ;;
+    iran-setup)        cli_iran_setup "${@:2}" ;;
+    doctor)            doctor ;;
+    export)            cli_export "${@:2}" ;;
+    import)            cli_import "${@:2}" ;;
     update)            self_update ;;
     --version|-v)      echo "gre-manager v$VERSION" ;;
     --help|-h)         usage ;;

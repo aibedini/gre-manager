@@ -38,6 +38,10 @@ flowchart TD
 - **Self-update** — `gre update` pulls the latest release from GitHub (with a syntax check before replacing).
 - **Legacy cleanup** — one menu option removes everything the old `vatanhost/gre` script left behind.
 - **Status & diagnostics** — per-node ping tests, tunnel list, NAT rules, service state.
+- **Non-interactive CLI** — every setup step can be scripted (`gre node add`, `gre iran-setup`, …) for Ansible & co.
+- **JSON status** — `gre status --json` for monitoring and automation (pure bash, no `jq` needed).
+- **Doctor** — `gre doctor` runs health checks (tunnels, NAT rules, firewall, systemd, port conflicts) and exits non-zero on failure.
+- **Backup & restore** — `gre export` / `gre import` move the whole configuration between servers as a single tar.gz.
 
 ## Install
 
@@ -95,11 +99,38 @@ sudo gre
 | -------------- | -------------------------------------------------------- |
 | `gre`          | Interactive menu                                         |
 | `gre --status` | Show roles, tunnels, NAT rules, per-node ping, service   |
+| `gre status --json` | Same as `--status`, but machine-readable JSON       |
+| `gre doctor`   | Diagnostics: PASS/WARN/FAIL per check, non-zero exit on FAIL |
+| `gre node list [--json]` | List configured Iran nodes (FOREIGN)            |
+| `gre node add` | Add an Iran node (FOREIGN): `--name NAME --ip IRAN_IP [--idx N] [--key K] [--yes]` |
+| `gre node remove` | Remove an Iran node (FOREIGN): `--name NAME [--yes]`  |
+| `gre iran-setup` | Non-interactive Iran setup: `--foreign-ip IP [--iran-ip IP] [--name NAME] [--idx N] [--key K] [--wan IFACE] [--tcp-ports LIST] [--udp-ports LIST] [--mss-clamp on\|off] [--yes]` |
+| `gre export [path]` | Back up `/etc/multi-gre` to a tar.gz (mode 600)     |
+| `gre import <file>` | Restore a backup created by `gre export`            |
 | `gre update`   | Self-update to the latest version                        |
 | `gre watchdog` | Watchdog timer: `enable` / `disable` / `status`          |
 | `gre --apply`  | Bring up all configured tunnels (used by systemd)        |
 | `gre --stop`   | Tear down all tunnels, keep config (used by systemd)     |
 | `gre --version`| Print version                                            |
+
+All mutating commands ask for confirmation unless `--yes` is passed.
+
+### Automation example
+
+```bash
+# FOREIGN server (run 'sudo gre' -> option 2 once first for the initial setup):
+gre node add --name ir01 --ip 5.6.7.8 --yes          # idx/key default to 1/1001
+gre node list --json
+
+# IRAN server:
+gre iran-setup --foreign-ip 1.2.3.4 --name ir01 --idx 1 --key 1001 \
+    --tcp-ports 80,443,8443 --udp-ports 443 --yes
+
+# Monitoring / config management:
+gre status --json
+gre doctor                                           # exit code != 0 if anything FAILs
+gre export /root/gre-backup.tar.gz --yes
+```
 
 ## How it works
 
