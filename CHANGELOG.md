@@ -4,6 +4,23 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-08-01
+
+### Added
+- **`gre purge` — scorched-earth cleanup** (menu option 13, CLI `gre purge [--yes]`):
+  removes EVERYTHING GRE-related from the server, including artifacts left by
+  older gre-manager versions or other tools:
+  - every GRE/GRETAP tunnel, even ones not present in the config (`vatan-m2`,
+    hand-made tunnels, old `gre-*` interfaces)
+  - every iptables rule in `filter`/`nat`/`mangle` mentioning multi-gre, GRE
+    interfaces, proto 47, `10.200.0.0/16` or `132.168.30.0/30`, plus the legacy
+    vatanhost broad rules (unscoped MASQUERADE, broad ICMP DROP)
+  - all systemd units (`multi-gre.service`, `multi-gre-watchdog.*`)
+  - `/etc/multi-gre`, the sysctl file, audit log, bash completion, and the
+    `gre` / `multi-gre-manager` commands themselves
+  - requires an explicit confirmation (or `--yes`) with a full warning about
+    what will be touched
+
 ## [1.4.0] - 2026-08-01
 
 ### Added
@@ -130,3 +147,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [1.2.0]: https://github.com/aibedini/gre-manager/releases/tag/v1.2.0
 [1.3.0]: https://github.com/aibedini/gre-manager/releases/tag/v1.3.0
 [1.4.0]: https://github.com/aibedini/gre-manager/releases/tag/v1.4.0
+[1.5.0]: https://github.com/aibedini/gre-manager/releases/tag/v1.5.0

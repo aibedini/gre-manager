@@ -89,6 +89,7 @@ sudo gre
  10) Clean up original vatanhost gre.sh (vatan-m2)
  11) Update gre-manager to the latest version
  12) Uninstall from this server
+ 13) PURGE: remove EVERYTHING GRE (danger)
   0) Exit
   ═════════════════════════════════════════════════════════════
 ```
@@ -128,6 +129,7 @@ or with `gre watchdog interval N` / `gre watchdog disable`.
 | `gre import <file>` | Restore a backup created by `gre export`            |
 | `gre update`   | Self-update to the latest version                        |
 | `gre watchdog` | Watchdog: `enable` / `disable` / `status` / `interval <1-60>` |
+| `gre purge` | Remove EVERYTHING GRE-related from the server (incl. old versions' artifacts); `--yes` skips confirmation |
 | `gre --apply`  | Bring up all configured tunnels (used by systemd)        |
 | `gre --stop`   | Tear down all tunnels, keep config (used by systemd)     |
 | `gre --version`| Print version                                            |
@@ -172,10 +174,24 @@ gre export /root/gre-backup.tar.gz --yes
 ## Uninstall
 
 ```bash
-sudo gre   # -> option 7
+sudo gre   # -> option 12 (Uninstall)
 ```
 
 Removes tunnels, NAT rules, the systemd service, the sysctl file, `/etc/multi-gre` and the `gre` command itself.
+
+### Full purge (scorched earth)
+
+To remove **everything GRE-related** — including tunnels and rules left by older
+gre-manager versions, the legacy vatanhost script, or hand-made tunnels:
+
+```bash
+sudo gre purge        # asks for confirmation; menu option 13 does the same
+sudo gre purge --yes  # non-interactive
+```
+
+This deletes every GRE/GRETAP tunnel, every iptables rule mentioning GRE artifacts
+(`multi-gre`, GRE interfaces, proto 47, `10.200.0.0/16`, `132.168.30.0/30`), the
+systemd units, all config, and the `gre` command itself.
 
 ## Versioning
 

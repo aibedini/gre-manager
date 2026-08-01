@@ -7,7 +7,7 @@ _gre() {
     COMPREPLY=()
 
     if (( COMP_CWORD == 1 )); then
-        cmds="node iran-setup doctor export import watchdog status update --status --apply --stop --version --help"
+        cmds="node iran-setup doctor export import watchdog status update purge --status --apply --stop --version --help"
         COMPREPLY=( $(compgen -W "$cmds" -- "$cur") )
         return 0
     fi

@@ -45,7 +45,7 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are sourced dynamically by design
 set -uo pipefail
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 
 GITHUB_REPO="aibedini/gre-manager"
 RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/gre-manager.sh"
@@ -1055,6 +1055,109 @@ self_update() {
     exit 0
 }
 
+# ------------------------------------------------------------- purge (scorched earth)
+purge_tunnels() { # delete EVERY gre/gretap tunnel, not just configured ones
+    local name=""
+    ip -o link show type gre 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | \
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        ip link set "$name" down 2>/dev/null || true
+        if ip tunnel del "$name" 2>/dev/null; then
+            ok "Removed GRE tunnel: $name"
+        fi
+    done
+    ip -o link show type gretap 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1 | \
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        ip link set "$name" down 2>/dev/null || true
+        if ip tunnel del "$name" 2>/dev/null; then
+            ok "Removed GRETAP tunnel: $name"
+        fi
+    done
+}
+
+purge_iptables() { # delete every rule mentioning GRE artifacts in filter/nat/mangle
+    local table line spec chain
+    local -a parts=()
+    for table in filter nat mangle; do
+        iptables -t "$table" -S 2>/dev/null | \
+        grep -E 'multi-gre|vatan|gre-|-p gre |10\.200\.|132\.168\.30\.' | \
+        while IFS= read -r line; do
+            case "$line" in
+                -A\ *)
+                    spec="${line#-A }"
+                    chain="${spec%% *}"
+                    read -ra parts <<< "$spec"
+                    if iptables -t "$table" -D "${parts[@]}" 2>/dev/null; then
+                        ok "Removed rule [$table]: $line"
+                    fi
+                    ;;
+            esac
+        done
+    done
+}
+
+purge_all() { # gre purge [--yes]
+    require_root
+    local YES=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --yes|-y)  YES=1; shift ;;
+            --help|-h) echo "Usage: gre purge [--yes]"; return 0 ;;
+            *)         err "Unknown option: $1"; err "Usage: gre purge [--yes]"; return 1 ;;
+        esac
+    done
+
+    echo
+    warn "PURGE — this removes EVERYTHING GRE-related from THIS server:"
+    warn "  - ALL GRE/GRETAP tunnels (even ones NOT created by gre-manager, incl. vatan-m2)"
+    warn "  - every iptables rule mentioning multi-gre, GRE interfaces, proto 47,"
+    warn "    10.200.0.0/16 or 132.168.30.0/30 (tables: filter, nat, mangle)"
+    warn "  - the legacy vatanhost broad rules (unscoped MASQUERADE + broad ICMP DROP)"
+    warn "  - systemd units: multi-gre.service, multi-gre-watchdog.service/timer"
+    warn "  - /etc/multi-gre, the sysctl file, the audit log, bash completion"
+    warn "  - the 'gre' and 'multi-gre-manager' commands themselves"
+    warn "If other software on this server uses GRE or identical broad rules, it WILL be affected."
+    warn "This cannot be undone."
+    if (( ! YES )); then
+        confirm "Really PURGE everything GRE from this server?" || { info "Aborted."; return; }
+    fi
+
+    echo
+    info "Step 1/5: stopping configured tunnels and rules..."
+    stop_all
+
+    info "Step 2/5: removing ALL GRE tunnels (including foreign/legacy ones)..."
+    purge_tunnels
+
+    info "Step 3/5: sweeping iptables (filter, nat, mangle)..."
+    purge_iptables
+    # legacy vatanhost broad rules that carry no GRE identifier
+    ipt_del_report nat POSTROUTING -j MASQUERADE
+    ipt_del_report filter INPUT -p icmp -j DROP
+
+    info "Step 4/5: removing systemd units..."
+    systemctl disable --now multi-gre.service multi-gre-watchdog.timer multi-gre-watchdog.service >/dev/null 2>&1 || true
+    rm -f "$SERVICE_FILE" "$WATCHDOG_TIMER_FILE" "$WATCHDOG_SERVICE_FILE"
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl reset-failed 2>/dev/null || true
+    ok "systemd units removed"
+
+    info "Step 5/5: removing files, config and commands..."
+    rm -f "$SYSCTL_FILE"
+    rm -rf "$CONF_DIR"
+    rm -f /etc/bash_completion.d/gre
+    rm -f "$AUDIT_LOG"
+    rm -f /usr/local/sbin/multi-gre-manager.sh
+    rm -f "$INSTALL_PATH"
+    ok "Files removed"
+
+    echo
+    ok "PURGE complete — nothing GRE-related from gre-manager (any version) remains."
+    info "Verify with:  ip tunnel show   |   iptables -S | grep -i gre   |   iptables -t nat -S | grep -E '10.200|132.168'"
+    info "Note: net.ipv4.ip_forward stays enabled until reboot (harmless)."
+}
+
 # ------------------------------------------------------------- CLI: node mgmt
 cli_node_list() { # gre node list [--json]
     local json=0
@@ -1672,6 +1775,7 @@ EOF
     echo   " 10) Clean up original vatanhost gre.sh (vatan-m2)"
     echo   " 11) Update gre-manager to the latest version"
     echo   " 12) Uninstall from this server"
+    printf ' %s13) PURGE: remove EVERYTHING GRE (danger)%s\n' "$C_RED" "$C_RESET"
     echo   "  0) Exit"
     echo   "  ═════════════════════════════════════════════════════════════"
 }
@@ -1752,6 +1856,7 @@ main_menu() {
             10) legacy_cleanup ;;
             11) self_update ;;
             12) uninstall ;;
+            13) purge_all ;;
             0)  trap - INT; echo "Bye."; exit 0 ;;
             *)  warn "Invalid selection." ;;
         esac
@@ -1783,6 +1888,9 @@ Usage:
   gre import <file> [--yes]
                           restore a backup created by 'gre export'
   gre watchdog            watchdog: enable|disable|status|interval <1-60>
+  gre purge [--yes]       remove EVERYTHING GRE-related from this server
+                          (all GRE tunnels, all related iptables rules,
+                          systemd units, configs, old versions' artifacts)
   gre update              self-update to the latest version
   gre --apply             bring up all configured tunnels (used by systemd)
   gre --stop              tear down all tunnels, keep config (used by systemd)
@@ -1825,6 +1933,7 @@ EOF
     export)            cli_export "${@:2}" ;;
     import)            cli_import "${@:2}" ;;
     update)            self_update ;;
+    purge)             purge_all "${@:2}" ;;
     --version|-v)      echo "gre-manager v$VERSION" ;;
     --help|-h)         usage ;;
     "")                main_menu ;;
