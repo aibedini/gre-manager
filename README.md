@@ -31,7 +31,7 @@ flowchart TD
 - **Multi-node** — each Iran server gets its own tunnel name, `/30` subnet and GRE key; up to 254 nodes.
 - **Port forwarding** — forward only the TCP/UDP ports you choose from each Iran public IP to the foreign server (multiport + ranges, SSH port 22 protected by an explicit confirmation).
 - **systemd persistence** — tunnels and NAT rules are re-applied automatically after reboot (`multi-gre.service`).
-- **Watchdog** — a systemd timer re-checks every tunnel every minute and revives dead ones (`journalctl -t gre-watchdog`).
+- **Watchdog** — a systemd timer re-checks every tunnel and revives dead ones (`journalctl -t gre-watchdog`); the check interval comes from **your** acceptable-downtime answer at setup and can be changed or cancelled anytime.
 - **Firewall hardening** — optional GRE (proto 47) whitelist on the foreign server: only known Iran node IPs can connect.
 - **MSS clamping** — optional TCPMSS clamp on the tunnel to avoid broken-PMTU stalls.
 - **Audit log** — every change is appended to `/var/log/gre-manager.log`.
@@ -71,21 +71,32 @@ sudo gre
  / / __/ /_/ / /_/ /  / /|_/ / _ `/ _ \/ _ `/ _ `/ -_) __/
  \____/_/ |_/_____/  /_/  /_/\_,_/_//_/\_,_/\_, /\__/_/
                                            /____/
-  Multi-GRE Tunnel Manager  v1.0.0  ·  github.com/aibedini/gre-manager
-  ---------------------------------------------------------------
-  Role: FOREIGN   Tunnels up: 3   Service: enabled
-  ---------------------------------------------------------------
+  Multi-GRE Tunnel Manager  v1.4.0  ·  github.com/aibedini/gre-manager
+  ═════════════════════════════════════════════════════════════
+  Role: FOREIGN   Tunnels: ● 3 up   Watchdog: ● ON · every 1m
+  ── Tunnels ─────────────────────────────────────────────────
   1) Configure this server as an IRAN node
   2) Configure this server as FOREIGN / add an Iran node
-  3) Remove an Iran node from FOREIGN
+  3) Remove an Iran node from FOREIGN                  [3 nodes]
   4) Restart all configured tunnels
   5) Stop all configured tunnels
-  6) Show status
-  7) Uninstall from this server
-  8) Clean up original vatanhost gre.sh (vatan-m2)
-  9) Update gre-manager to the latest version
+  ── Monitoring ──────────────────────────────────────────────
+  6) Status & health
+  7) Auto-heal watchdog                                ● ON · every 1m
+  8) Doctor (diagnostics)
+  ── Maintenance ─────────────────────────────────────────────
+  9) Backup / restore (export / import)
+ 10) Clean up original vatanhost gre.sh (vatan-m2)
+ 11) Update gre-manager to the latest version
+ 12) Uninstall from this server
   0) Exit
+  ═════════════════════════════════════════════════════════════
 ```
+
+During setup you are asked **how many minutes of tunnel downtime are acceptable** —
+the watchdog check interval is derived from your answer (`tolerance / 2`), and `0`
+disables auto-heal. You can change or cancel it anytime from menu option **7**
+or with `gre watchdog interval N` / `gre watchdog disable`.
 
 ## Quick start
 
@@ -112,11 +123,11 @@ sudo gre
 | `gre node list [--json]` | List configured Iran nodes (FOREIGN)            |
 | `gre node add` | Add an Iran node (FOREIGN): `--name NAME --ip IRAN_IP [--idx N] [--key K] [--yes]` |
 | `gre node remove` | Remove an Iran node (FOREIGN): `--name NAME [--yes]`  |
-| `gre iran-setup` | Non-interactive Iran setup: `--foreign-ip IP [--iran-ip IP] [--name NAME] [--idx N] [--key K] [--wan IFACE] [--tcp-ports LIST] [--udp-ports LIST] [--mss-clamp on\|off] [--yes]` |
+| `gre iran-setup` | Non-interactive Iran setup: `--foreign-ip IP [--iran-ip IP] [--name NAME] [--idx N] [--key K] [--wan IFACE] [--tcp-ports LIST] [--udp-ports LIST] [--mss-clamp on\|off] [--downtime MIN] [--yes]` |
 | `gre export [path]` | Back up `/etc/multi-gre` to a tar.gz (mode 600)     |
 | `gre import <file>` | Restore a backup created by `gre export`            |
 | `gre update`   | Self-update to the latest version                        |
-| `gre watchdog` | Watchdog timer: `enable` / `disable` / `status`          |
+| `gre watchdog` | Watchdog: `enable` / `disable` / `status` / `interval <1-60>` |
 | `gre --apply`  | Bring up all configured tunnels (used by systemd)        |
 | `gre --stop`   | Tear down all tunnels, keep config (used by systemd)     |
 | `gre --version`| Print version                                            |

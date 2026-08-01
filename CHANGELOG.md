@@ -4,6 +4,29 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-08-01
+
+### Added
+- **Downtime tolerance question during setup**: the installer now asks how many
+  minutes of tunnel downtime are acceptable and derives the watchdog check
+  interval from the answer (interval = tolerance / 2, min 1 min; `0` disables
+  auto-heal). Stored in `/etc/multi-gre/global.conf`.
+- **Watchdog settings menu** (menu option 7): view state, change the downtime
+  tolerance, enable or disable the watchdog at any time — cancellable whenever
+  the user wants. CLI: `gre watchdog interval <1-60>` plus the existing
+  `enable|disable|status`.
+- **WARP-Manager-inspired menu UX**: grouped sections (Tunnels / Monitoring /
+  Maintenance), live state indicators (`● ON` / `○ OFF`) for tunnels and the
+  watchdog directly in the menu, node counter, new interactive submenus for
+  Watchdog and Backup/restore, and Ctrl+C now returns to the menu instead of
+  killing the program.
+- **Installer progress bars** (`install.sh`), styled step-by-step output.
+- `gre iran-setup --downtime MIN` flag for non-interactive setups.
+
+### Changed
+- Doctor and Backup/restore are now reachable from the interactive menu
+  (options 8 and 9).
+
 ## [1.3.0] - 2026-07-31
 
 ### Added
@@ -106,3 +129,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [1.1.0]: https://github.com/aibedini/gre-manager/releases/tag/v1.1.0
 [1.2.0]: https://github.com/aibedini/gre-manager/releases/tag/v1.2.0
 [1.3.0]: https://github.com/aibedini/gre-manager/releases/tag/v1.3.0
+[1.4.0]: https://github.com/aibedini/gre-manager/releases/tag/v1.4.0

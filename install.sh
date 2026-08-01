@@ -17,24 +17,50 @@ INSTALL_PATH="/usr/local/sbin/gre"
 COMPLETION_SRC="https://raw.githubusercontent.com/${REPO}/main/completion/gre.bash"
 COMPLETION_DIR="/etc/bash_completion.d"
 
+if [[ -t 1 ]]; then
+    C_CYAN="$(tput setaf 6 2>/dev/null || true)"
+    C_GREEN="$(tput setaf 2 2>/dev/null || true)"
+    C_BOLD="$(tput bold 2>/dev/null || true)"
+    C_RESET="$(tput sgr0 2>/dev/null || true)"
+else
+    C_CYAN=""; C_GREEN=""; C_BOLD=""; C_RESET=""
+fi
+
+progress() { # progress "label" percent
+    local label="$1" pct="$2" width=32 filled i
+    filled=$(( pct * width / 100 ))
+    printf '\r  %-28s %s[' "$label" "$C_CYAN"
+    for (( i = 0; i < filled; i++ )); do printf '#'; done
+    for (( i = filled; i < width; i++ )); do printf '-'; done
+    printf ']%s %3d%%%s' "$C_RESET" "$pct" "$C_RESET"
+    (( pct >= 100 )) && echo
+    return 0
+}
+
 if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
     echo "[x] Please run as root:  curl -fsSL .../install.sh | sudo bash" >&2
     exit 1
 fi
 
+echo
+printf '%s%s  Multi-GRE Tunnel Manager — installer%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET"
+echo "  github.com/${REPO}"
+echo
+
+progress "Checking dependencies" 10
 if ! command -v curl >/dev/null 2>&1; then
-    echo "[*] curl not found, trying to install it..."
     if command -v apt-get >/dev/null 2>&1; then
         apt-get update -qq && apt-get install -y -qq curl
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y curl
+        dnf install -y curl >/dev/null
     elif command -v yum >/dev/null 2>&1; then
-        yum install -y curl
+        yum install -y curl >/dev/null
     else
-        echo "[x] curl is required and no supported package manager was found." >&2
+        echo; echo "[x] curl is required and no supported package manager was found." >&2
         exit 1
     fi
 fi
+progress "Checking dependencies" 25
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -45,8 +71,8 @@ install_from_release() {
         | grep -m1 '"tag_name"' | cut -d'"' -f4)"
     [[ -n "$tag" ]] || return 1
 
-    echo "[*] Latest release: $tag"
-    curl -fsSL "https://github.com/${REPO}/releases/download/${tag}/gre"        -o "$TMP/gre"       || return 1
+    echo "  Latest release: ${C_BOLD}$tag${C_RESET}"
+    curl -fsSL "https://github.com/${REPO}/releases/download/${tag}/gre"        -o "$TMP/gre"        || return 1
     curl -fsSL "https://github.com/${REPO}/releases/download/${tag}/gre.sha256" -o "$TMP/gre.sha256" || return 1
 
     if command -v sha256sum >/dev/null 2>&1; then
@@ -54,37 +80,44 @@ install_from_release() {
             echo "[x] Checksum verification FAILED — refusing to install." >&2
             return 1
         }
-        echo "[+] SHA-256 checksum verified"
-    else
-        echo "[!] sha256sum not available; skipping checksum verification" >&2
+        return 0
     fi
+    echo "[!] sha256sum not available; skipping checksum verification" >&2
     return 0
 }
 
 if [[ "${GRE_EDGE:-0}" == "1" ]]; then
-    echo "[!] GRE_EDGE=1 — installing bleeding-edge main branch (no checksum)..."
+    echo "  ${C_BOLD}GRE_EDGE=1${C_RESET} — bleeding-edge main branch (no checksum)"
+    progress "Downloading gre-manager" 50
     curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/gre-manager.sh" -o "$TMP/gre"
+    progress "Downloading gre-manager" 60
 else
-    if ! install_from_release; then
+    progress "Downloading gre-manager" 40
+    if install_from_release; then
+        progress "Downloading gre-manager" 55
+        progress "Verifying SHA-256 checksum" 70
+    else
         echo "[!] Release install unavailable; falling back to main branch (no checksum)." >&2
         curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/gre-manager.sh" -o "$TMP/gre"
     fi
+    progress "Verifying SHA-256 checksum" 75
 fi
 
-bash -n "$TMP/gre" 2>/dev/null || { echo "[x] Downloaded script failed syntax check." >&2; exit 1; }
+bash -n "$TMP/gre" 2>/dev/null || { echo; echo "[x] Downloaded script failed syntax check." >&2; exit 1; }
 
+progress "Installing gre command" 85
 cp "$TMP/gre" "$INSTALL_PATH"
 chmod +x "$INSTALL_PATH"
 
 # bash completion (best effort)
 if [[ -d "$COMPLETION_DIR" ]]; then
-    curl -fsSL "$COMPLETION_SRC" -o "$COMPLETION_DIR/gre" 2>/dev/null \
-        && echo "[+] bash completion installed ($COMPLETION_DIR/gre)" || true
+    curl -fsSL "$COMPLETION_SRC" -o "$COMPLETION_DIR/gre" 2>/dev/null || true
 fi
+progress "Installing gre command" 100
 
 VER="$(grep -m1 -E '^VERSION=' "$INSTALL_PATH" | cut -d'"' -f2)"
 echo
-echo "[+] Installed gre-manager v${VER:-unknown} -> $INSTALL_PATH"
+printf '  %s[+] gre-manager v%s installed%s -> %s\n' "$C_GREEN" "${VER:-unknown}" "$C_RESET" "$INSTALL_PATH"
 echo
-echo "    Run it with:   sudo gre"
+printf '  %sRun it with:%s   sudo gre\n' "$C_BOLD" "$C_RESET"
 echo

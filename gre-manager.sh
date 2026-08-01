@@ -45,13 +45,14 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are sourced dynamically by design
 set -uo pipefail
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 
 GITHUB_REPO="aibedini/gre-manager"
 RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/gre-manager.sh"
 
 CONF_DIR="/etc/multi-gre"
 NODES_DIR="$CONF_DIR/nodes"
+GLOBAL_CONF="$CONF_DIR/global.conf"
 FOREIGN_CONF="$CONF_DIR/foreign.conf"
 IRAN_CONF="$CONF_DIR/iran.conf"
 SYSCTL_FILE="/etc/sysctl.d/99-multi-gre.conf"
@@ -231,6 +232,60 @@ service_state() {
 
 watchdog_state() {
     systemctl is-active multi-gre-watchdog.timer 2>/dev/null || echo "inactive"
+}
+
+# ------------------------------------------------------------- global config
+# /etc/multi-gre/global.conf: DOWNTIME_TOLERANCE_MIN, WATCHDOG_INTERVAL_MIN, WATCHDOG_ENABLED
+load_global_conf() { # sets WD_ENABLED / WD_INTERVAL_MIN / WD_TOLERANCE_MIN (with defaults)
+    WD_ENABLED=1
+    WD_INTERVAL_MIN=1
+    WD_TOLERANCE_MIN=2
+    [[ -f "$GLOBAL_CONF" ]] || return 0
+    local v=""
+    v="$(grep -E '^WATCHDOG_ENABLED=' "$GLOBAL_CONF" | cut -d= -f2)"
+    [[ "$v" == "0" || "$v" == "1" ]] && WD_ENABLED="$v"
+    v="$(grep -E '^WATCHDOG_INTERVAL_MIN=' "$GLOBAL_CONF" | cut -d= -f2)"
+    [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 )) && WD_INTERVAL_MIN="$v"
+    v="$(grep -E '^DOWNTIME_TOLERANCE_MIN=' "$GLOBAL_CONF" | cut -d= -f2)"
+    [[ "$v" =~ ^[0-9]+$ ]] && WD_TOLERANCE_MIN="$v"
+    return 0
+}
+
+write_global_conf() { # write_global_conf enabled interval_min tolerance_min
+    mkdir -p "$CONF_DIR"
+    cat > "$GLOBAL_CONF" <<EOF
+WATCHDOG_ENABLED=$1
+WATCHDOG_INTERVAL_MIN=$2
+DOWNTIME_TOLERANCE_MIN=$3
+EOF
+    chmod 600 "$GLOBAL_CONF"
+}
+
+# ------------------------------------------------------------- UI helpers
+dot_on()  { printf '%s●%s' "$C_GREEN"  "$C_RESET"; }
+dot_off() { printf '%s○%s' "$C_RED"    "$C_RESET"; }
+dot_mid() { printf '%s◐%s' "$C_YELLOW" "$C_RESET"; }
+
+node_count() {
+    local n=0 f
+    for f in "$NODES_DIR"/*.conf; do
+        [[ -e "$f" ]] || continue
+        n=$(( n + 1 ))
+    done
+    printf '%s' "$n"
+}
+
+progress_bar() { # progress_bar "label" percent
+    local label="$1" pct="$2" width=32 filled i
+    (( pct < 0 )) && pct=0
+    (( pct > 100 )) && pct=100
+    filled=$(( pct * width / 100 ))
+    printf '\r  %-30s %s[' "$label" "$C_CYAN"
+    for (( i = 0; i < filled; i++ )); do printf '#'; done
+    for (( i = filled; i < width; i++ )); do printf '-'; done
+    printf ']%s %3d%%' "$C_RESET" "$pct"
+    (( pct >= 100 )) && echo
+    return 0
 }
 
 # ------------------------------------------------------------- ip/iptables helpers
@@ -457,7 +512,8 @@ watchdog_run() { # called by systemd timer; logs to the journal via logger
     return 0
 }
 
-install_watchdog() {
+write_watchdog_units() { # write_watchdog_units interval_min
+    local interval="${1:-1}"
     cat > "$WATCHDOG_SERVICE_FILE" <<EOF
 [Unit]
 Description=Multi-GRE tunnel watchdog (gre-manager)
@@ -472,15 +528,21 @@ Description=Multi-GRE tunnel watchdog timer
 
 [Timer]
 OnBootSec=1min
-OnUnitActiveSec=1min
+OnUnitActiveSec=${interval}min
 AccuracySec=10s
 
 [Install]
 WantedBy=timers.target
 EOF
     systemctl daemon-reload
+}
+
+install_watchdog() {
+    load_global_conf
+    write_watchdog_units "$WD_INTERVAL_MIN"
     systemctl enable --now multi-gre-watchdog.timer >/dev/null 2>&1 || true
-    ok "Watchdog timer enabled (checks tunnels every minute)"
+    ok "Watchdog enabled (checks every ${WD_INTERVAL_MIN} min, downtime tolerance ~${WD_TOLERANCE_MIN} min)"
+    info "Change or disable anytime: menu -> Watchdog, or 'gre watchdog interval N' / 'gre watchdog disable'"
 }
 
 remove_watchdog() {
@@ -489,16 +551,75 @@ remove_watchdog() {
     systemctl daemon-reload 2>/dev/null || true
 }
 
-watchdog_menu() { # gre watchdog enable|disable|status
+# apply_watchdog_config enabled interval_min tolerance_min — persist + apply live
+apply_watchdog_config() {
+    local enabled="$1" interval="$2" tol="$3"
+    write_global_conf "$enabled" "$interval" "$tol"
+    if [[ "$enabled" == "1" ]]; then
+        write_watchdog_units "$interval"
+        systemctl enable --now multi-gre-watchdog.timer >/dev/null 2>&1 || true
+        systemctl restart multi-gre-watchdog.timer >/dev/null 2>&1 || true
+        ok "Watchdog enabled: checks every ${interval} min (downtime tolerance ~${tol} min)"
+    else
+        remove_watchdog
+        ok "Watchdog disabled. Re-enable anytime: menu -> Watchdog, or 'gre watchdog enable'"
+    fi
+    audit_log "watchdog-config enabled=$enabled interval=${interval}m tolerance=${tol}m"
+}
+
+ask_downtime_tolerance() { # sets ASKED_ENABLED / ASKED_INTERVAL / ASKED_TOL
+    echo
+    info "Auto-heal watchdog"
+    info "If a tunnel dies, the watchdog revives it automatically."
+    info "How many minutes of tunnel downtime are acceptable for you? (0 = disable auto-heal)"
+    local tol=""
+    ask tol "Downtime tolerance in minutes" "2"
+    if ! [[ "$tol" =~ ^[0-9]+$ ]]; then
+        warn "Not a number; using the default of 2 minutes."
+        tol=2
+    fi
+    ASKED_TOL="$tol"
+    if (( tol == 0 )); then
+        ASKED_ENABLED=0
+        ASKED_INTERVAL=1
+        info "Auto-heal disabled — you can re-enable it anytime from the menu (Watchdog)."
+    else
+        ASKED_ENABLED=1
+        ASKED_INTERVAL=$(( tol / 2 ))
+        (( ASKED_INTERVAL < 1 )) && ASKED_INTERVAL=1
+        info "Watchdog will check every ${ASKED_INTERVAL} min so real downtime stays under ~${tol} min."
+        info "Change or cancel anytime: menu -> Watchdog."
+    fi
+}
+
+watchdog_menu() { # gre watchdog [enable|disable|status|interval N]
     require_root
     case "${1:-status}" in
-        enable)  install_watchdog ;;
-        disable) remove_watchdog; ok "Watchdog disabled" ;;
+        enable)
+            load_global_conf
+            apply_watchdog_config 1 "$WD_INTERVAL_MIN" "$WD_TOLERANCE_MIN"
+            ;;
+        disable)
+            load_global_conf
+            apply_watchdog_config 0 "$WD_INTERVAL_MIN" "$WD_TOLERANCE_MIN"
+            ;;
+        interval)
+            local n="${2:-}"
+            [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= 60 )) || {
+                err "Usage: gre watchdog interval <1-60>   (check interval in minutes)"
+                return 1
+            }
+            load_global_conf
+            apply_watchdog_config 1 "$n" "$(( n * 2 ))"
+            ;;
         status)
-            echo "watchdog timer: $(watchdog_state)"
+            load_global_conf
+            echo "watchdog timer:      $(watchdog_state)"
+            echo "check interval:      every ${WD_INTERVAL_MIN} min"
+            echo "downtime tolerance:  ~${WD_TOLERANCE_MIN} min"
             systemctl list-timers multi-gre-watchdog.timer --no-pager 2>/dev/null || true
             ;;
-        *) err "Usage: gre watchdog [enable|disable|status]"; return 1 ;;
+        *) err "Usage: gre watchdog [enable|disable|status|interval <1-60>]"; return 1 ;;
     esac
 }
 
@@ -528,7 +649,13 @@ EOF
     systemctl daemon-reload
     systemctl enable multi-gre.service >/dev/null 2>&1 || true
     ok "systemd service 'multi-gre.service' installed and enabled (survives reboot)"
-    install_watchdog
+    load_global_conf
+    if [[ "$WD_ENABLED" == "1" ]]; then
+        install_watchdog
+    else
+        remove_watchdog
+        info "Watchdog stays disabled (your choice). Enable anytime: 'gre watchdog enable'"
+    fi
 }
 
 # ------------------------------------------------------------- menu actions
@@ -581,6 +708,8 @@ setup_iran() {
         mss_clamp="1"
     fi
 
+    ask_downtime_tolerance
+
     valid_ip "$IRAN_IP"    || { err "Invalid Iran IP: $IRAN_IP";       return 1; }
     valid_ip "$FOREIGN_IP" || { err "Invalid foreign IP: $FOREIGN_IP"; return 1; }
     valid_name "$NAME"     || { err "Invalid node name: $NAME";        return 1; }
@@ -612,10 +741,11 @@ UDP_PORTS=$UDP_PORTS
 MSS_CLAMP=$mss_clamp
 EOF
     chmod 600 "$IRAN_CONF"
+    write_global_conf "$ASKED_ENABLED" "$ASKED_INTERVAL" "$ASKED_TOL"
 
     apply_iran || { err "Failed to bring the tunnel up. Check the IPs and that GRE (proto 47) is not blocked."; return 1; }
     install_service
-    audit_log "iran-setup name=$NAME foreign=$FOREIGN_IP idx=$IDX key=$KEY tcp='$TCP_PORTS' udp='$UDP_PORTS' mss=$mss_clamp"
+    audit_log "iran-setup name=$NAME foreign=$FOREIGN_IP idx=$IDX key=$KEY tcp='$TCP_PORTS' udp='$UDP_PORTS' mss=$mss_clamp tolerance=${ASKED_TOL}m"
 
     echo
     ok "IRAN node '$NAME' configured."
@@ -643,14 +773,18 @@ setup_foreign() {
         if confirm "Drop inbound ICMP (ping) on this server? (tunnel subnets stay pingable)"; then
             icmp_drop="1"
         fi
+
+        ask_downtime_tolerance
+
         cat > "$FOREIGN_CONF" <<EOF
 FOREIGN_IP=$FOREIGN_IP
 ICMP_DROP=$icmp_drop
 GRE_WHITELIST=$gre_whitelist
 EOF
         chmod 600 "$FOREIGN_CONF"
+        write_global_conf "$ASKED_ENABLED" "$ASKED_INTERVAL" "$ASKED_TOL"
         install_service
-        audit_log "foreign-setup ip=$FOREIGN_IP icmp_drop=$icmp_drop gre_whitelist=$gre_whitelist"
+        audit_log "foreign-setup ip=$FOREIGN_IP icmp_drop=$icmp_drop gre_whitelist=$gre_whitelist tolerance=${ASKED_TOL}m"
     fi
     # shellcheck disable=SC1090
     source "$FOREIGN_CONF"
@@ -1089,7 +1223,7 @@ cli_node_remove() { # gre node remove --name NAME [--yes]
 cli_iran_setup() { # gre iran-setup --foreign-ip IP [options]
     require_root
     local FOREIGN_IP="" IRAN_IP="" NAME="ir01" IDX="1" KEY="" WAN_IF="" \
-          TCP_PORTS="" UDP_PORTS="" MSS="on" YES=0
+          TCP_PORTS="" UDP_PORTS="" MSS="on" YES=0 DOWNTIME="2"
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --foreign-ip) [[ -n "${2:-}" ]] || { err "Missing value for --foreign-ip"; return 1; }; FOREIGN_IP="$2"; shift 2 ;;
@@ -1101,8 +1235,9 @@ cli_iran_setup() { # gre iran-setup --foreign-ip IP [options]
             --tcp-ports)  [[ -n "${2:-}" ]] || { err "Missing value for --tcp-ports"; return 1; }; TCP_PORTS="$2"; shift 2 ;;
             --udp-ports)  [[ -n "${2:-}" ]] || { err "Missing value for --udp-ports"; return 1; }; UDP_PORTS="$2"; shift 2 ;;
             --mss-clamp)  [[ "${2:-}" == "on" || "${2:-}" == "off" ]] || { err "--mss-clamp must be 'on' or 'off'"; return 1; }; MSS="$2"; shift 2 ;;
+            --downtime)   [[ "${2:-}" =~ ^[0-9]+$ ]] || { err "--downtime must be minutes (0 = disable auto-heal)"; return 1; }; DOWNTIME="$2"; shift 2 ;;
             --yes|-y)     YES=1; shift ;;
-            --help|-h)    echo "Usage: gre iran-setup --foreign-ip IP [--iran-ip IP] [--name NAME] [--idx N] [--key K] [--wan IFACE] [--tcp-ports LIST] [--udp-ports LIST] [--mss-clamp on|off] [--yes]"; return 0 ;;
+            --help|-h)    echo "Usage: gre iran-setup --foreign-ip IP [--iran-ip IP] [--name NAME] [--idx N] [--key K] [--wan IFACE] [--tcp-ports LIST] [--udp-ports LIST] [--mss-clamp on|off] [--downtime MIN] [--yes]"; return 0 ;;
             *)            err "Unknown option: $1"
                           err "Usage: gre iran-setup --foreign-ip IP [--iran-ip IP] [--name NAME] [--idx N] [--key K] [--wan IFACE] [--tcp-ports LIST] [--udp-ports LIST] [--mss-clamp on|off] [--yes]"
                           return 1 ;;
@@ -1168,9 +1303,14 @@ MSS_CLAMP=$mss_clamp
 EOF
     chmod 600 "$IRAN_CONF"
 
+    local dt_enabled=1 dt_interval=$(( DOWNTIME / 2 ))
+    (( DOWNTIME == 0 )) && dt_enabled=0
+    (( dt_interval < 1 )) && dt_interval=1
+    write_global_conf "$dt_enabled" "$dt_interval" "$DOWNTIME"
+
     apply_iran || { err "Failed to bring the tunnel up. Check the IPs and that GRE (proto 47) is not blocked."; return 1; }
     install_service
-    audit_log "iran-setup name=$NAME foreign=$FOREIGN_IP idx=$IDX key=$KEY tcp='$TCP_PORTS' udp='$UDP_PORTS' mss=$mss_clamp"
+    audit_log "iran-setup name=$NAME foreign=$FOREIGN_IP idx=$IDX key=$KEY tcp='$TCP_PORTS' udp='$UDP_PORTS' mss=$mss_clamp tolerance=${DOWNTIME}m"
 
     echo
     ok "IRAN node '$NAME' configured."
@@ -1489,6 +1629,20 @@ banner() {
     elif [[ -f "$IRAN_CONF" ]]; then
         roles="IRAN"
     fi
+
+    load_global_conf
+    local wstate; wstate="$(watchdog_state)"
+    local tcount; tcount="$(tunnel_count)"
+    local ncount; ncount="$(node_count)"
+
+    local tun_dot wdot wlabel
+    if (( tcount > 0 )); then tun_dot="$(dot_on)"; else tun_dot="$(dot_off)"; fi
+    if [[ "$wstate" == "active" ]]; then
+        wdot="$(dot_on)";  wlabel="ON · every ${WD_INTERVAL_MIN}m"
+    else
+        wdot="$(dot_off)"; wlabel="OFF"
+    fi
+
     echo
     printf '%s%s' "$C_BOLD" "$C_CYAN"
     cat <<'EOF'
@@ -1500,42 +1654,106 @@ banner() {
 EOF
     printf '%s' "$C_RESET"
     echo   "  Multi-GRE Tunnel Manager  ${C_BOLD}v${VERSION}${C_RESET}  ·  github.com/${GITHUB_REPO}"
-    echo   "  ---------------------------------------------------------------"
-    printf '  Role: %s%s%s   Tunnels up: %s%s%s   Watchdog: %s%s%s\n' \
-        "$C_GREEN" "$roles" "$C_RESET" \
-        "$C_GREEN" "$(tunnel_count)" "$C_RESET" \
-        "$C_GREEN" "$(watchdog_state)" "$C_RESET"
-    echo   "  ---------------------------------------------------------------"
+    echo   "  ═════════════════════════════════════════════════════════════"
+    printf '  Role: %s%s%s   Tunnels: %s %s up   Watchdog: %s %s\n' \
+        "$C_GREEN" "$roles" "$C_RESET" "$tun_dot" "$tcount" "$wdot" "$wlabel"
+    echo   "  ── Tunnels ─────────────────────────────────────────────────"
     echo   "  1) Configure this server as an IRAN node"
     echo   "  2) Configure this server as FOREIGN / add an Iran node"
-    echo   "  3) Remove an Iran node from FOREIGN"
+    printf '  3) Remove an Iran node from FOREIGN                  [%s nodes]\n' "$ncount"
     echo   "  4) Restart all configured tunnels"
     echo   "  5) Stop all configured tunnels"
-    echo   "  6) Show status"
-    echo   "  7) Uninstall from this server"
-    echo   "  8) Clean up original vatanhost gre.sh (vatan-m2)"
-    echo   "  9) Update gre-manager to the latest version"
+    echo   "  ── Monitoring ──────────────────────────────────────────────"
+    echo   "  6) Status & health"
+    printf '  7) Auto-heal watchdog                                %s %s\n' "$wdot" "$wlabel"
+    echo   "  8) Doctor (diagnostics)"
+    echo   "  ── Maintenance ─────────────────────────────────────────────"
+    echo   "  9) Backup / restore (export / import)"
+    echo   " 10) Clean up original vatanhost gre.sh (vatan-m2)"
+    echo   " 11) Update gre-manager to the latest version"
+    echo   " 12) Uninstall from this server"
     echo   "  0) Exit"
+    echo   "  ═════════════════════════════════════════════════════════════"
+}
+
+watchdog_settings_menu() {
+    require_root
+    local c=""
+    while true; do
+        load_global_conf
+        local st; st="$(watchdog_state)"
+        echo
+        echo   "  ── Auto-heal watchdog ────────────────────────────────────"
+        if [[ "$st" == "active" ]]; then
+            printf '  State: %s ON    check every %s min    downtime tolerance ~%s min\n' \
+                "$(dot_on)" "$WD_INTERVAL_MIN" "$WD_TOLERANCE_MIN"
+        else
+            printf '  State: %s OFF\n' "$(dot_off)"
+        fi
+        echo   "  ────────────────────────────────────────────────────────────"
+        echo   "  1) Change downtime tolerance"
+        echo   "  2) Enable watchdog"
+        echo   "  3) Disable watchdog"
+        echo   "  0) Back"
+        read -rp "  Select: " c
+        case "$c" in
+            1) ask_downtime_tolerance
+               apply_watchdog_config "$ASKED_ENABLED" "$ASKED_INTERVAL" "$ASKED_TOL" ;;
+            2) apply_watchdog_config 1 "$WD_INTERVAL_MIN" "$WD_TOLERANCE_MIN" ;;
+            3) apply_watchdog_config 0 "$WD_INTERVAL_MIN" "$WD_TOLERANCE_MIN" ;;
+            0) return ;;
+            *) warn "Invalid selection." ;;
+        esac
+    done
+}
+
+backup_restore_menu() {
+    require_root
+    local c="" bpath=""
+    while true; do
+        echo
+        echo   "  ── Backup / restore ──────────────────────────────────────"
+        echo   "  1) Export config (tar.gz of /etc/multi-gre)"
+        echo   "  2) Import config from a backup file"
+        echo   "  0) Back"
+        read -rp "  Select: " c
+        case "$c" in
+            1)
+                ask bpath "Backup file path (empty = ./gre-backup-<timestamp>.tar.gz)" ""
+                if [[ -n "$bpath" ]]; then cli_export "$bpath"; else cli_export; fi
+                ;;
+            2)
+                ask bpath "Backup file to import (empty = cancel)" ""
+                if [[ -n "$bpath" ]]; then cli_import "$bpath"; else info "Cancelled."; fi
+                ;;
+            0) return ;;
+            *) warn "Invalid selection." ;;
+        esac
+    done
 }
 
 main_menu() {
     require_root
+    trap 'echo; warn "Interrupted — back to the menu."' INT
     local choice=""
     while true; do
         banner
-        read -rp "Select: " choice
+        read -rp "  Select: " choice
         case "$choice" in
-            1) setup_iran ;;
-            2) setup_foreign ;;
-            3) remove_node ;;
-            4) restart_all ;;
-            5) stop_menu ;;
-            6) show_status ;;
-            7) uninstall ;;
-            8) legacy_cleanup ;;
-            9) self_update ;;
-            0) echo "Bye."; exit 0 ;;
-            *) warn "Invalid selection." ;;
+            1)  setup_iran ;;
+            2)  setup_foreign ;;
+            3)  remove_node ;;
+            4)  restart_all ;;
+            5)  stop_menu ;;
+            6)  show_status ;;
+            7)  watchdog_settings_menu ;;
+            8)  doctor ;;
+            9)  backup_restore_menu ;;
+            10) legacy_cleanup ;;
+            11) self_update ;;
+            12) uninstall ;;
+            0)  trap - INT; echo "Bye."; exit 0 ;;
+            *)  warn "Invalid selection." ;;
         esac
         echo
     done
@@ -1556,13 +1774,15 @@ Usage:
                           remove an Iran node from FOREIGN
   gre iran-setup --foreign-ip IP [--iran-ip IP] [--name NAME] [--idx N]
                  [--key K] [--wan IFACE] [--tcp-ports LIST] [--udp-ports LIST]
-                 [--mss-clamp on|off] [--yes]
+                 [--mss-clamp on|off] [--downtime MIN] [--yes]
                           configure this server as an IRAN node (non-interactive)
+                          --downtime MIN: acceptable tunnel downtime in minutes
+                          (0 disables the auto-heal watchdog; default 2)
   gre export [path] [--yes]
                           back up /etc/multi-gre (default: ./gre-backup-<timestamp>.tar.gz)
   gre import <file> [--yes]
                           restore a backup created by 'gre export'
-  gre watchdog            watchdog timer: enable|disable|status
+  gre watchdog            watchdog: enable|disable|status|interval <1-60>
   gre update              self-update to the latest version
   gre --apply             bring up all configured tunnels (used by systemd)
   gre --stop              tear down all tunnels, keep config (used by systemd)
@@ -1578,7 +1798,7 @@ case "${1:-}" in
     --apply)           require_root; apply_all ;;
     --stop)            require_root; stop_all ;;
     --watchdog)        require_root; watchdog_run ;;
-    watchdog)          watchdog_menu "${2:-status}" ;;
+    watchdog)          watchdog_menu "${2:-status}" "${3:-}" ;;
     --status|status)
         case "${2:-}" in
             "")      show_status ;;

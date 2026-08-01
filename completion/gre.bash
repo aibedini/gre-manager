@@ -21,10 +21,10 @@ _gre() {
             fi
             ;;
         iran-setup)
-            COMPREPLY=( $(compgen -W "--foreign-ip --iran-ip --name --idx --key --wan --tcp-ports --udp-ports --mss-clamp --yes" -- "$cur") )
+            COMPREPLY=( $(compgen -W "--foreign-ip --iran-ip --name --idx --key --wan --tcp-ports --udp-ports --mss-clamp --downtime --yes" -- "$cur") )
             ;;
         watchdog)
-            COMPREPLY=( $(compgen -W "enable disable status" -- "$cur") )
+            COMPREPLY=( $(compgen -W "enable disable status interval" -- "$cur") )
             ;;
         status|--status)
             COMPREPLY=( $(compgen -W "--json" -- "$cur") )
