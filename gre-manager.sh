@@ -13,10 +13,11 @@
 #     into the tunnel towards the foreign server + SNAT on the tunnel.
 #   - FOREIGN side: one GRE tunnel per Iran node. Services (e.g. Xray)
 #     listen on 0.0.0.0 and are reachable through every tunnel.
-#   - Persistence via a oneshot systemd unit that re-applies config at boot.
+#   - Persistence via a oneshot systemd unit that re-applies config at boot,
+#     plus a watchdog timer that re-applies dead tunnels every minute.
 #
 # State:
-#   /etc/multi-gre/foreign.conf      FOREIGN_IP=..., ICMP_DROP=0|1
+#   /etc/multi-gre/foreign.conf      FOREIGN_IP=..., ICMP_DROP=0|1, GRE_WHITELIST=0|1
 #   /etc/multi-gre/iran.conf         single-file config on an Iran node
 #   /etc/multi-gre/nodes/<name>.conf one file per Iran node (foreign side)
 #
@@ -24,14 +25,16 @@
 #   gre                 interactive menu
 #   gre --apply         bring up everything that is configured   (used by systemd)
 #   gre --stop          tear everything down (config is kept)    (used by systemd)
+#   gre --watchdog      check tunnels, re-apply dead ones        (used by systemd timer)
 #   gre --status        show status
+#   gre watchdog        watchdog timer: enable|disable|status
 #   gre update          self-update to the latest version from GitHub
 #   gre --version       print version
 #   gre --help          usage
 #
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 GITHUB_REPO="aibedini/gre-manager"
 RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/gre-manager.sh"
@@ -42,7 +45,10 @@ FOREIGN_CONF="$CONF_DIR/foreign.conf"
 IRAN_CONF="$CONF_DIR/iran.conf"
 SYSCTL_FILE="/etc/sysctl.d/99-multi-gre.conf"
 SERVICE_FILE="/etc/systemd/system/multi-gre.service"
+WATCHDOG_SERVICE_FILE="/etc/systemd/system/multi-gre-watchdog.service"
+WATCHDOG_TIMER_FILE="/etc/systemd/system/multi-gre-watchdog.timer"
 INSTALL_PATH="/usr/local/sbin/gre"
+AUDIT_LOG="/var/log/gre-manager.log"
 SUBNET_BASE="10.200"
 TUN_MTU=1476
 
@@ -63,6 +69,11 @@ ok()   { printf '%s[+]%s %s\n'  "$C_GREEN"  "$C_RESET" "$*"; }
 warn() { printf '%s[!]%s %s\n'  "$C_YELLOW" "$C_RESET" "$*"; }
 err()  { printf '%s[x]%s %s\n'  "$C_RED"    "$C_RESET" "$*" >&2; }
 
+audit_log() { # append a line to the audit log (never fails the caller)
+    printf '%s user=%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "$(whoami 2>/dev/null || echo '?')" "$*" >> "$AUDIT_LOG" 2>/dev/null || true
+}
+
 require_root() {
     if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
         err "This script must be run as root (use: sudo gre)."
@@ -70,10 +81,16 @@ require_root() {
     fi
 }
 
-confirm() { # confirm "question"  -> 0 on yes
+confirm() { # confirm "question"  -> 0 on yes (default: NO)
     local ans
     read -rp "$1 [y/N]: " ans
     [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
+}
+
+confirm_yes() { # confirm_yes "question" -> 0 on yes (default: YES)
+    local ans
+    read -rp "$1 [Y/n]: " ans
+    [[ -z "$ans" || "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
 }
 
 ask() { # ask VAR "prompt" ["default"]
@@ -166,6 +183,10 @@ service_state() {
     systemctl is-enabled multi-gre.service 2>/dev/null || echo "disabled"
 }
 
+watchdog_state() {
+    systemctl is-active multi-gre-watchdog.timer 2>/dev/null || echo "inactive"
+}
+
 # ------------------------------------------------------------- ip/iptables helpers
 tun_exists() { ip link show "$1" >/dev/null 2>&1; }
 
@@ -230,20 +251,42 @@ apply_foreign_node() { # node-conf-file
 
 apply_foreign() {
     [[ -f "$FOREIGN_CONF" ]] || return 0
-    local f
+    local f NAME="" IRAN_IP="" IDX="" KEY="" TUN=""
     for f in "$NODES_DIR"/*.conf; do
         [[ -e "$f" ]] || continue
         apply_foreign_node "$f"
     done
+
+    # --- firewall hardening: only allow GRE (proto 47) from known Iran node IPs
+    if [[ "${GRE_WHITELIST:-0}" == "1" ]]; then
+        # remove the catch-all first so new ACCEPTs are inserted BEFORE it
+        ipt_del filter INPUT -p gre -m comment --comment "multi-gre-block" -j DROP
+        for f in "$NODES_DIR"/*.conf; do
+            [[ -e "$f" ]] || continue
+            NAME=""; IRAN_IP=""; IDX=""; KEY=""; TUN=""
+            source "$f"
+            ipt_add filter INPUT -p gre -s "$IRAN_IP" \
+                -m comment --comment "multi-gre-node-$NAME" -j ACCEPT
+        done
+        ipt_add filter INPUT -p gre -m comment --comment "multi-gre-block" -j DROP
+    fi
+
+    # --- optional ICMP drop (tunnel subnets stay pingable for the watchdog)
     if [[ "${ICMP_DROP:-0}" == "1" ]]; then
-        ipt_add filter INPUT -p icmp -j DROP
-        ok "Inbound ICMP (ping) is dropped"
+        # migrate/remove any old un-commented rule from v1.0.0
+        ipt_del filter INPUT -p icmp -j DROP
+        ipt_del filter INPUT -p icmp -m comment --comment "multi-gre-icmp-block" -j DROP
+        ipt_add filter INPUT -p icmp -s "${SUBNET_BASE}.0.0/16" \
+            -m comment --comment "multi-gre-tunnel-icmp" -j ACCEPT
+        ipt_add filter INPUT -p icmp -m comment --comment "multi-gre-icmp-block" -j DROP
+        ok "Inbound ICMP (ping) is dropped (tunnel subnets stay pingable)"
     fi
 }
 
 apply_iran() {
     [[ -f "$IRAN_CONF" ]] || return 0
-    local NAME="" FOREIGN_IP="" IRAN_IP="" WAN_IF="" IDX="" KEY="" TUN="" TCP_PORTS="" UDP_PORTS=""
+    local NAME="" FOREIGN_IP="" IRAN_IP="" WAN_IF="" IDX="" KEY="" TUN="" \
+          TCP_PORTS="" UDP_PORTS="" MSS_CLAMP=""
     source "$IRAN_CONF"
     local peer="${SUBNET_BASE}.${IDX}.1"
     local self="${SUBNET_BASE}.${IDX}.2"
@@ -264,6 +307,13 @@ apply_iran() {
     if [[ -n "$TCP_PORTS" || -n "$UDP_PORTS" ]]; then
         ipt_add nat POSTROUTING -o "$TUN" -d "$peer" -j SNAT --to-source "$self"
     fi
+
+    # --- TCP MSS clamping on the tunnel (avoids broken-PMTU stalls)
+    if [[ "${MSS_CLAMP:-0}" == "1" ]]; then
+        ipt_add mangle POSTROUTING -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
+            -j TCPMSS --clamp-mss-to-pmtu
+        ok "TCP MSS clamping enabled on $TUN"
+    fi
 }
 
 apply_all() {
@@ -282,15 +332,28 @@ stop_foreign() {
         source "$f"
         [[ -n "$TUN" ]] && delete_tunnel "$TUN"
     done
-    if [[ "${ICMP_DROP:-0}" == "1" ]]; then
-        ipt_del filter INPUT -p icmp -j DROP
-        info "ICMP DROP rule removed"
-    fi
+
+    # GRE whitelist rules
+    for f in "$NODES_DIR"/*.conf; do
+        [[ -e "$f" ]] || continue
+        NAME=""; IRAN_IP=""; IDX=""; KEY=""; TUN=""
+        source "$f"
+        ipt_del filter INPUT -p gre -s "$IRAN_IP" \
+            -m comment --comment "multi-gre-node-$NAME" -j ACCEPT
+    done
+    ipt_del filter INPUT -p gre -m comment --comment "multi-gre-block" -j DROP
+
+    # ICMP rules (commented v1.1.0 style + plain v1.0.0 style)
+    ipt_del filter INPUT -p icmp -s "${SUBNET_BASE}.0.0/16" \
+        -m comment --comment "multi-gre-tunnel-icmp" -j ACCEPT
+    ipt_del filter INPUT -p icmp -m comment --comment "multi-gre-icmp-block" -j DROP
+    ipt_del filter INPUT -p icmp -j DROP
 }
 
 stop_iran() {
     [[ -f "$IRAN_CONF" ]] || return 0
-    local NAME="" FOREIGN_IP="" IRAN_IP="" WAN_IF="" IDX="" KEY="" TUN="" TCP_PORTS="" UDP_PORTS=""
+    local NAME="" FOREIGN_IP="" IRAN_IP="" WAN_IF="" IDX="" KEY="" TUN="" \
+          TCP_PORTS="" UDP_PORTS="" MSS_CLAMP=""
     source "$IRAN_CONF"
     local peer="${SUBNET_BASE}.${IDX}.1"
     local self="${SUBNET_BASE}.${IDX}.2"
@@ -306,6 +369,8 @@ stop_iran() {
     if [[ -n "$TCP_PORTS" || -n "$UDP_PORTS" ]]; then
         ipt_del nat POSTROUTING -o "$TUN" -d "$peer" -j SNAT --to-source "$self"
     fi
+    ipt_del mangle POSTROUTING -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
+        -j TCPMSS --clamp-mss-to-pmtu
     [[ -n "$TUN" ]] && delete_tunnel "$TUN"
 }
 
@@ -314,6 +379,81 @@ stop_all() {
     [[ -f "$FOREIGN_CONF" ]] && source "$FOREIGN_CONF"
     stop_foreign
     stop_iran
+}
+
+# ------------------------------------------------------------- watchdog
+watchdog_run() { # called by systemd timer; logs to the journal via logger
+    local restarted=0 f
+    if [[ -f "$FOREIGN_CONF" ]]; then
+        # shellcheck disable=SC1090
+        source "$FOREIGN_CONF"
+        local NAME="" IRAN_IP="" IDX="" KEY="" TUN=""
+        for f in "$NODES_DIR"/*.conf; do
+            [[ -e "$f" ]] || continue
+            NAME=""; IRAN_IP=""; IDX=""; KEY=""; TUN=""
+            source "$f"
+            if ! tun_exists "$TUN" || ! ping -c 2 -W 2 "${SUBNET_BASE}.${IDX}.2" >/dev/null 2>&1; then
+                logger -t gre-watchdog "tunnel $TUN (node $NAME) missing or unreachable; re-applying"
+                apply_foreign_node "$f" && restarted=$(( restarted + 1 ))
+            fi
+        done
+    fi
+    if [[ -f "$IRAN_CONF" ]]; then
+        local NAME="" FOREIGN_IP="" IRAN_IP="" WAN_IF="" IDX="" KEY="" TUN="" \
+              TCP_PORTS="" UDP_PORTS="" MSS_CLAMP=""
+        source "$IRAN_CONF"
+        if ! tun_exists "$TUN" || ! ping -c 2 -W 2 "${SUBNET_BASE}.${IDX}.1" >/dev/null 2>&1; then
+            logger -t gre-watchdog "tunnel $TUN missing or unreachable; re-applying"
+            apply_iran && restarted=$(( restarted + 1 ))
+        fi
+    fi
+    (( restarted > 0 )) && logger -t gre-watchdog "re-applied $restarted tunnel(s)"
+    return 0
+}
+
+install_watchdog() {
+    cat > "$WATCHDOG_SERVICE_FILE" <<EOF
+[Unit]
+Description=Multi-GRE tunnel watchdog (gre-manager)
+
+[Service]
+Type=oneshot
+ExecStart=$INSTALL_PATH --watchdog
+EOF
+    cat > "$WATCHDOG_TIMER_FILE" <<EOF
+[Unit]
+Description=Multi-GRE tunnel watchdog timer
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now multi-gre-watchdog.timer >/dev/null 2>&1 || true
+    ok "Watchdog timer enabled (checks tunnels every minute)"
+}
+
+remove_watchdog() {
+    systemctl disable --now multi-gre-watchdog.timer >/dev/null 2>&1 || true
+    rm -f "$WATCHDOG_TIMER_FILE" "$WATCHDOG_SERVICE_FILE"
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+watchdog_menu() { # gre watchdog enable|disable|status
+    require_root
+    case "${1:-status}" in
+        enable)  install_watchdog ;;
+        disable) remove_watchdog; ok "Watchdog disabled" ;;
+        status)
+            echo "watchdog timer: $(watchdog_state)"
+            systemctl list-timers multi-gre-watchdog.timer --no-pager 2>/dev/null || true
+            ;;
+        *) err "Usage: gre watchdog [enable|disable|status]"; return 1 ;;
+    esac
 }
 
 # ------------------------------------------------------------- persistence
@@ -342,6 +482,7 @@ EOF
     systemctl daemon-reload
     systemctl enable multi-gre.service >/dev/null 2>&1 || true
     ok "systemd service 'multi-gre.service' installed and enabled (survives reboot)"
+    install_watchdog
 }
 
 # ------------------------------------------------------------- menu actions
@@ -389,6 +530,11 @@ setup_iran() {
     ask TCP_PORTS  "TCP ports (e.g. 80,443,8443)" ""
     ask UDP_PORTS  "UDP ports (e.g. 443,8443)" ""
 
+    local mss_clamp="0"
+    if confirm_yes "Enable TCP MSS clamping on the tunnel? (recommended)"; then
+        mss_clamp="1"
+    fi
+
     valid_ip "$IRAN_IP"    || { err "Invalid Iran IP: $IRAN_IP";       return 1; }
     valid_ip "$FOREIGN_IP" || { err "Invalid foreign IP: $FOREIGN_IP"; return 1; }
     valid_name "$NAME"     || { err "Invalid node name: $NAME";        return 1; }
@@ -414,10 +560,13 @@ KEY=$KEY
 TUN=gre-$NAME
 TCP_PORTS=$TCP_PORTS
 UDP_PORTS=$UDP_PORTS
+MSS_CLAMP=$mss_clamp
 EOF
+    chmod 600 "$IRAN_CONF"
 
     apply_iran || { err "Failed to bring the tunnel up. Check the IPs and that GRE (proto 47) is not blocked."; return 1; }
     install_service
+    audit_log "iran-setup name=$NAME foreign=$FOREIGN_IP idx=$IDX key=$KEY tcp='$TCP_PORTS' udp='$UDP_PORTS' mss=$mss_clamp"
 
     echo
     ok "IRAN node '$NAME' configured."
@@ -438,15 +587,21 @@ setup_foreign() {
         ask FOREIGN_IP "Public IP of THIS foreign server" "$detected_ip"
         valid_ip "$FOREIGN_IP" || { err "Invalid IP: $FOREIGN_IP"; return 1; }
 
-        local icmp_drop="0"
-        if confirm "Drop inbound ICMP (ping) on this server?"; then
+        local icmp_drop="0" gre_whitelist="0"
+        if confirm_yes "Restrict GRE (proto 47) to known Iran node IPs? (recommended)"; then
+            gre_whitelist="1"
+        fi
+        if confirm "Drop inbound ICMP (ping) on this server? (tunnel subnets stay pingable)"; then
             icmp_drop="1"
         fi
         cat > "$FOREIGN_CONF" <<EOF
 FOREIGN_IP=$FOREIGN_IP
 ICMP_DROP=$icmp_drop
+GRE_WHITELIST=$gre_whitelist
 EOF
+        chmod 600 "$FOREIGN_CONF"
         install_service
+        audit_log "foreign-setup ip=$FOREIGN_IP icmp_drop=$icmp_drop gre_whitelist=$gre_whitelist"
     fi
     # shellcheck disable=SC1090
     source "$FOREIGN_CONF"
@@ -486,12 +641,21 @@ IDX=$IDX
 KEY=$KEY
 TUN=gre-$NAME
 EOF
+    chmod 600 "$NODES_DIR/$NAME.conf"
 
     apply_foreign_node "$NODES_DIR/$NAME.conf" || {
         err "Failed to create the tunnel."
         rm -f "$NODES_DIR/$NAME.conf"
         return 1
     }
+    # refresh firewall hardening so the new node's ACCEPT lands before the block rule
+    if [[ "${GRE_WHITELIST:-0}" == "1" ]]; then
+        ipt_del filter INPUT -p gre -m comment --comment "multi-gre-block" -j DROP
+        ipt_add filter INPUT -p gre -s "$IRAN_IP" \
+            -m comment --comment "multi-gre-node-$NAME" -j ACCEPT
+        ipt_add filter INPUT -p gre -m comment --comment "multi-gre-block" -j DROP
+    fi
+    audit_log "node-add name=$NAME iran_ip=$IRAN_IP idx=$IDX key=$KEY"
 
     echo
     ok "Node '$NAME' added on FOREIGN."
@@ -531,7 +695,10 @@ remove_node() {
     source "$f"
     confirm "Remove node '$NAME' (tunnel $TUN)?" || { info "Cancelled."; return; }
     delete_tunnel "$TUN"
+    ipt_del filter INPUT -p gre -s "$IRAN_IP" \
+        -m comment --comment "multi-gre-node-$NAME" -j ACCEPT
     rm -f "$f"
+    audit_log "node-remove name=$NAME iran_ip=$IRAN_IP idx=$IDX"
     ok "Node '$NAME' removed."
     info "On the IRAN server itself, run menu option 7 (Uninstall) to clean up that side."
 }
@@ -541,6 +708,7 @@ restart_all() {
     info "Restarting all configured tunnels..."
     stop_all
     apply_all
+    audit_log "restart-all"
     ok "Done."
 }
 
@@ -548,6 +716,7 @@ stop_menu() {
     require_root
     info "Stopping all configured tunnels (config is kept, service stays enabled)..."
     stop_all
+    audit_log "stop-all"
     ok "Done."
 }
 
@@ -588,24 +757,26 @@ show_status() {
         done
     fi
     echo
-    info "systemd service:"
-    echo "  enabled: $(service_state)"
-    systemctl is-active multi-gre.service 2>/dev/null | sed 's/^/  active:  /' || true
+    info "systemd:"
+    echo "  service:  $(service_state)"
+    echo "  watchdog: $(watchdog_state)"
 }
 
 uninstall() {
     require_root
     warn "This removes ALL multi-gre configuration from THIS server:"
-    warn "tunnels, NAT rules, systemd service, sysctl file and $CONF_DIR."
+    warn "tunnels, NAT rules, systemd service + watchdog, sysctl file and $CONF_DIR."
     confirm "Continue with uninstall?" || { info "Aborted."; return; }
 
     stop_all
     systemctl disable multi-gre.service >/dev/null 2>&1 || true
     rm -f "$SERVICE_FILE"
+    remove_watchdog
     systemctl daemon-reload 2>/dev/null || true
     rm -f "$SYSCTL_FILE"
     rm -rf "$CONF_DIR"
     rm -f "$INSTALL_PATH"
+    audit_log "uninstall"
     ok "Uninstalled."
     info "Note: net.ipv4.ip_forward stays enabled until reboot (harmless)."
     info "If the original vatanhost gre.sh was also used on this server, run menu option 8 too."
@@ -632,6 +803,7 @@ legacy_cleanup() {
     ipt_del_report filter INPUT -p icmp -j DROP
 
     echo
+    audit_log "legacy-cleanup"
     ok "Legacy cleanup finished."
     info "Verify with:  ip tunnel show   |   iptables -t nat -S   |   iptables -S INPUT"
 }
@@ -667,6 +839,7 @@ self_update() {
     cp "$tmp" "$INSTALL_PATH"
     chmod +x "$INSTALL_PATH"
     rm -f "$tmp"
+    audit_log "self-update from=$VERSION to=$remote_ver"
     ok "Updated: v$VERSION -> v$remote_ver"
     info "Run 'gre' again to use the new version."
     exit 0
@@ -694,10 +867,10 @@ EOF
     printf '%s' "$C_RESET"
     echo   "  Multi-GRE Tunnel Manager  ${C_BOLD}v${VERSION}${C_RESET}  ·  github.com/${GITHUB_REPO}"
     echo   "  ---------------------------------------------------------------"
-    printf '  Role: %s%s%s   Tunnels up: %s%s%s   Service: %s%s%s\n' \
+    printf '  Role: %s%s%s   Tunnels up: %s%s%s   Watchdog: %s%s%s\n' \
         "$C_GREEN" "$roles" "$C_RESET" \
         "$C_GREEN" "$(tunnel_count)" "$C_RESET" \
-        "$C_GREEN" "$(service_state)" "$C_RESET"
+        "$C_GREEN" "$(watchdog_state)" "$C_RESET"
     echo   "  ---------------------------------------------------------------"
     echo   "  1) Configure this server as an IRAN node"
     echo   "  2) Configure this server as FOREIGN / add an Iran node"
@@ -742,6 +915,8 @@ Usage:
   gre              interactive menu
   gre --apply      bring up all configured tunnels (used by systemd)
   gre --stop       tear down all tunnels, keep config (used by systemd)
+  gre --watchdog   check tunnels and re-apply dead ones (used by systemd timer)
+  gre watchdog     watchdog timer: enable|disable|status
   gre --status     show status
   gre update       self-update to the latest version
   gre --version    print version
@@ -752,6 +927,8 @@ EOF
 case "${1:-}" in
     --apply)           require_root; apply_all ;;
     --stop)            require_root; stop_all ;;
+    --watchdog)        require_root; watchdog_run ;;
+    watchdog)          watchdog_menu "${2:-status}" ;;
     --status|status)   show_status ;;
     update)            self_update ;;
     --version|-v)      echo "gre-manager v$VERSION" ;;

@@ -30,6 +30,10 @@ flowchart TD
 - **Multi-node** — each Iran server gets its own tunnel name, `/30` subnet and GRE key; up to 254 nodes.
 - **Port forwarding** — forward only the TCP/UDP ports you choose from each Iran public IP to the foreign server (multiport + ranges, SSH port 22 protected by an explicit confirmation).
 - **systemd persistence** — tunnels and NAT rules are re-applied automatically after reboot (`multi-gre.service`).
+- **Watchdog** — a systemd timer re-checks every tunnel every minute and revives dead ones (`journalctl -t gre-watchdog`).
+- **Firewall hardening** — optional GRE (proto 47) whitelist on the foreign server: only known Iran node IPs can connect.
+- **MSS clamping** — optional TCPMSS clamp on the tunnel to avoid broken-PMTU stalls.
+- **Audit log** — every change is appended to `/var/log/gre-manager.log`.
 - **Idempotent & safe** — re-running any action never duplicates iptables rules; deletions check existence first.
 - **Self-update** — `gre update` pulls the latest release from GitHub (with a syntax check before replacing).
 - **Legacy cleanup** — one menu option removes everything the old `vatanhost/gre` script left behind.
@@ -92,6 +96,7 @@ sudo gre
 | `gre`          | Interactive menu                                         |
 | `gre --status` | Show roles, tunnels, NAT rules, per-node ping, service   |
 | `gre update`   | Self-update to the latest version                        |
+| `gre watchdog` | Watchdog timer: `enable` / `disable` / `status`          |
 | `gre --apply`  | Bring up all configured tunnels (used by systemd)        |
 | `gre --stop`   | Tear down all tunnels, keep config (used by systemd)     |
 | `gre --version`| Print version                                            |
