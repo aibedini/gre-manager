@@ -1,6 +1,7 @@
 # Multi-GRE Tunnel Manager
 
 <p>
+  <a href="https://github.com/aibedini/gre-manager/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/aibedini/gre-manager/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/aibedini/gre-manager/releases"><img alt="Version" src="https://img.shields.io/github/v/release/aibedini/gre-manager?display_name=tag"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-green.svg"></a>
   <img alt="Platform" src="https://img.shields.io/badge/platform-Linux-blue">
@@ -49,6 +50,13 @@ On **every** server (foreign and all Iran nodes):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/aibedini/gre-manager/main/install.sh | sudo bash
+```
+
+The installer downloads the latest **pinned release** and verifies its **SHA-256 checksum**
+before installing (`gre` + bash completion). For the bleeding-edge main branch instead:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/aibedini/gre-manager/main/install.sh | sudo GRE_EDGE=1 bash
 ```
 
 Then run:

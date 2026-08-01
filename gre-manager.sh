@@ -41,9 +41,11 @@
 #   gre --version       print version
 #   gre --help          usage
 #
+# shellcheck shell=bash
+# shellcheck disable=SC1090  # config files under /etc/multi-gre are sourced dynamically by design
 set -uo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 GITHUB_REPO="aibedini/gre-manager"
 RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/gre-manager.sh"
@@ -860,34 +862,61 @@ self_update() {
     command -v curl >/dev/null 2>&1 || { err "curl is required for update."; return 1; }
     info "Checking for updates ($GITHUB_REPO)..."
     local tmp
-    tmp="$(mktemp)" || { err "mktemp failed"; return 1; }
-    if ! curl -fsSL "$RAW_URL" -o "$tmp"; then
-        err "Download failed. Check your internet connection."
-        rm -f "$tmp"
-        return 1
+    tmp="$(mktemp -d)" || { err "mktemp failed"; return 1; }
+
+    local remote_ver="" verified="no"
+    # Preferred: latest pinned GitHub release, verified against its SHA-256 checksum.
+    local tag=""
+    tag="$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null \
+        | grep -m1 '"tag_name"' | cut -d'"' -f4)"
+    if [[ -n "$tag" ]] \
+        && curl -fsSL "https://github.com/${GITHUB_REPO}/releases/download/${tag}/gre" \
+            -o "$tmp/gre" 2>/dev/null \
+        && curl -fsSL "https://github.com/${GITHUB_REPO}/releases/download/${tag}/gre.sha256" \
+            -o "$tmp/gre.sha256" 2>/dev/null; then
+        if command -v sha256sum >/dev/null 2>&1; then
+            if (cd "$tmp" && sha256sum -c gre.sha256 >/dev/null 2>&1); then
+                verified="yes"
+            else
+                err "Checksum verification FAILED for release $tag; refusing to update."
+                rm -rf "$tmp"
+                return 1
+            fi
+        else
+            warn "sha256sum not available; installing release $tag without checksum verification."
+        fi
+        remote_ver="$(grep -m1 -E '^VERSION=' "$tmp/gre" | cut -d'"' -f2)"
+    else
+        # Fallback: raw main branch (no checksum possible)
+        warn "Release assets unavailable; falling back to the main branch (no checksum)."
+        if ! curl -fsSL "$RAW_URL" -o "$tmp/gre"; then
+            err "Download failed. Check your internet connection."
+            rm -rf "$tmp"
+            return 1
+        fi
+        remote_ver="$(grep -m1 -E '^VERSION=' "$tmp/gre" | cut -d'"' -f2)"
     fi
-    local remote_ver=""
-    remote_ver="$(grep -m1 -E '^VERSION=' "$tmp" | cut -d'"' -f2)"
+
     if [[ -z "$remote_ver" ]]; then
         err "Could not parse the remote version."
-        rm -f "$tmp"
+        rm -rf "$tmp"
         return 1
     fi
     if [[ "$remote_ver" == "$VERSION" ]]; then
         ok "Already up to date (v$VERSION)."
-        rm -f "$tmp"
+        rm -rf "$tmp"
         return 0
     fi
-    if ! bash -n "$tmp" 2>/dev/null; then
+    if ! bash -n "$tmp/gre" 2>/dev/null; then
         err "Downloaded file failed the syntax check; refusing to install."
-        rm -f "$tmp"
+        rm -rf "$tmp"
         return 1
     fi
-    cp "$tmp" "$INSTALL_PATH"
+    cp "$tmp/gre" "$INSTALL_PATH"
     chmod +x "$INSTALL_PATH"
-    rm -f "$tmp"
-    audit_log "self-update from=$VERSION to=$remote_ver"
-    ok "Updated: v$VERSION -> v$remote_ver"
+    rm -rf "$tmp"
+    audit_log "self-update from=$VERSION to=$remote_ver checksum=$verified"
+    ok "Updated: v$VERSION -> v$remote_ver (checksum verified: $verified)"
     info "Run 'gre' again to use the new version."
     exit 0
 }

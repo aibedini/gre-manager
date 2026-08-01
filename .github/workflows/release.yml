@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build release artifacts (pinned script + checksum)
+        run: |
+          set -e
+          cp gre-manager.sh gre
+          chmod +x gre
+          sha256sum gre > gre.sha256
+          echo "--- artifacts ---"
+          ls -la gre gre.sha256
+          cat gre.sha256
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            gre
+            gre.sha256
+          generate_release_notes: true

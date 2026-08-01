@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint-and-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: ShellCheck
+        run: shellcheck -S warning gre-manager.sh install.sh
+
+      - name: Bash syntax check
+        run: bash -n gre-manager.sh && bash -n install.sh
+
+      - name: Smoke tests (non-root commands)
+        run: |
+          bash gre-manager.sh --version
+          bash gre-manager.sh --help
+          bash gre-manager.sh node 2>&1 | grep -qi usage || true
+
+      - name: Version consistency (VERSION file == script == CHANGELOG)
+        run: |
+          set -e
+          V_FILE="$(cat VERSION | tr -d '[:space:]')"
+          V_SCRIPT="$(grep -m1 -E '^VERSION=' gre-manager.sh | cut -d'\"' -f2)"
+          [ "$V_FILE" = "$V_SCRIPT" ] || { echo "VERSION file ($V_FILE) != script ($V_SCRIPT)"; exit 1; }
+          grep -q "^## \[$V_SCRIPT\]" CHANGELOG.md || { echo "CHANGELOG has no section for $V_SCRIPT"; exit 1; }
