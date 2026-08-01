@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# test stub for systemctl — state inferred from unit files under $TEST_ROOT.
+# Like real systemctl, is-enabled/is-active of a missing unit prints nothing
+# to stdout and exits non-zero.
+TR="${TEST_ROOT:?}"
+case "${1:-}" in
+  is-enabled)
+    if [[ -f "$TR/etc/systemd/system/multi-gre.service" ]]; then echo "enabled"; exit 0; fi
+    exit 1 ;;
+  is-active)
+    if [[ "${2:-}" == *watchdog* && -f "$TR/etc/systemd/system/multi-gre-watchdog.timer" ]]; then
+      echo "active"; exit 0
+    fi
+    exit 1 ;;
+  list-timers) exit 0 ;;
+  *) exit 0 ;;
+esac

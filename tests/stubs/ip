@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# test stub for ip(8) — state kept under $TEST_ROOT/state
+ST="${TEST_ROOT:?}/state"
+mkdir -p "$ST/tunnels"
+touch "$ST/addrs"
+
+while [[ "${1:-}" == -* ]]; do shift; done
+obj="${1:-}"; sub="${2:-}"
+
+case "$obj" in
+  tunnel)
+    case "$sub" in
+      add)
+        echo "$*" > "$ST/tunnels/$3"
+        exit 0 ;;
+      del)
+        rm -f "$ST/tunnels/$3"
+        awk -v d="$3" '$NF != d' "$ST/addrs" > "$ST/addrs.tmp" 2>/dev/null || true
+        mv "$ST/addrs.tmp" "$ST/addrs"
+        exit 0 ;;
+      show)
+        for t in "$ST/tunnels"/*; do
+          [[ -e "$t" ]] || continue
+          echo "$(basename "$t"): gre/ip remote 203.0.113.10 local 198.51.100.20 ttl 255"
+        done
+        exit 0 ;;
+    esac ;;
+  link)
+    case "$sub" in
+      show)
+        if [[ "${3:-}" == "type" ]]; then
+          [[ "${4:-}" == "gre" ]] || exit 0
+          i=2
+          for t in "$ST/tunnels"/*; do
+            [[ -e "$t" ]] || continue
+            echo "$i: $(basename "$t"): <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1476"
+            i=$((i+1))
+          done
+          exit 0
+        fi
+        if [[ -n "${3:-}" ]]; then
+          [[ "$3" == "lo" || "$3" == "eth0" || -f "$ST/tunnels/$3" ]] && exit 0
+          exit 1
+        fi
+        exit 0 ;;
+      set) exit 0 ;;
+    esac ;;
+  addr)
+    case "$sub" in
+      add)
+        echo "$3 $5" >> "$ST/addrs"
+        exit 0 ;;
+      show)
+        dev=""
+        [[ "${3:-}" == "dev" ]] && dev="${4:-}"
+        if [[ -z "$dev" || "$dev" == "lo" ]]; then echo '1: lo    inet 127.0.0.1/8 scope host lo'; fi
+        if [[ -z "$dev" || "$dev" == "eth0" ]]; then echo '2: eth0    inet 198.51.100.20/24 scope global eth0'; fi
+        n=10
+        while read -r a d; do
+          [[ -n "$a" ]] || continue
+          [[ -n "$dev" && "$d" != "$dev" ]] && continue
+          echo "$n: $d    inet $a scope global $d"
+          n=$((n+1))
+        done < "$ST/addrs"
+        exit 0 ;;
+    esac ;;
+  route)
+    if [[ "$sub" == "show" && "${3:-}" == "default" ]]; then
+      echo "default via 192.0.2.1 dev eth0"
+    elif [[ "$sub" == "get" ]]; then
+      echo "${3:-1.1.1.1} via 192.0.2.1 dev eth0 src 198.51.100.20"
+    elif [[ "$sub" == "show" ]]; then
+      echo "default via 192.0.2.1 dev eth0"
+      echo "192.0.2.0/24 dev eth0 proto kernel scope link src 192.0.2.10"
+    fi
+    exit 0 ;;
+esac
+exit 0

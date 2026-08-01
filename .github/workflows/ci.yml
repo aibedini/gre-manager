@@ -15,10 +15,13 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
 
       - name: ShellCheck
-        run: shellcheck -S warning gre-manager.sh install.sh
+        run: shellcheck -S warning gre-manager.sh install.sh tests/run.sh tests/stubs/*
 
       - name: Bash syntax check
-        run: bash -n gre-manager.sh && bash -n install.sh
+        run: bash -n gre-manager.sh && bash -n install.sh && bash -n tests/run.sh
+
+      - name: Test suite (multi-peer, migration, regression)
+        run: bash tests/run.sh
 
       - name: Smoke tests (non-root commands)
         run: |

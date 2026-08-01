@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# test stub for logger — appends to $TEST_ROOT/state/logger.log
+ST="${TEST_ROOT:?}/state"
+mkdir -p "$ST"
+echo "$*" >> "$ST/logger.log"
+exit 0

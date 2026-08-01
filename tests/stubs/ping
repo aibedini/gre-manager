@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# test stub for ping — succeeds when the target is the counterpart of a live
+# tunnel address, unless listed in $TEST_ROOT/state/dead
+ST="${TEST_ROOT:?}/state"
+target="${*: -1}"
+if [[ -f "$ST/dead" ]] && grep -qxF "$target" "$ST/dead"; then
+  echo "2 packets transmitted, 0 received, 100% packet loss"
+  exit 1
+fi
+if [[ -f "$ST/addrs" ]]; then
+  while read -r a _; do
+    [[ -n "$a" ]] || continue
+    ip="${a%%/*}"
+    case "$ip" in
+      *.1) peer="${ip%.1}.2" ;;
+      *.2) peer="${ip%.2}.1" ;;
+      *)   continue ;;
+    esac
+    if [[ "$peer" == "$target" ]]; then
+      echo "2 packets transmitted, 2 received, 0% packet loss"
+      exit 0
+    fi
+  done < "$ST/addrs"
+fi
+echo "2 packets transmitted, 0 received, 100% packet loss"
+exit 1

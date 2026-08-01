@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# test stub for iptables(8) — state kept under $TEST_ROOT/state
+ST="${TEST_ROOT:?}/state"
+mkdir -p "$ST"
+table="filter"
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -t) table="$2"; shift 2 ;;
+    *)  args+=("$1"); shift ;;
+  esac
+done
+f="$ST/iptables.$table"
+touch "$f"
+op="${args[0]:-}"
+rule="${args[*]:1}"
+
+case "$op" in
+  -C) grep -qxF "$rule" "$f" ;;
+  -A) grep -qxF "$rule" "$f" || echo "$rule" >> "$f"; exit 0 ;;
+  -D)
+    if grep -qxF "$rule" "$f"; then
+      grep -vxF "$rule" "$f" > "$f.tmp" || true
+      mv "$f.tmp" "$f"
+      exit 0
+    fi
+    exit 1 ;;
+  -S)
+    while IFS= read -r l; do
+      [[ -n "$l" ]] && echo "-A $l"
+    done < "$f"
+    exit 0 ;;
+  *) exit 0 ;;
+esac

@@ -4,6 +4,68 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-08-01
+
+### Added
+- **Multi-foreign support (IRAN side)** — one Iran server can now connect to
+  **multiple foreign servers** at once. Each foreign is an independent peer
+  with its own tunnel, `/30` subnet, GRE key, forwarded ports and health
+  state. Peer configs live in `/etc/multi-gre/foreigns/<name>.conf`;
+  `/etc/multi-gre/iran.conf` becomes a manifest (`SCHEMA_VERSION=2`).
+- **Per-peer subnets** — tunnel addresses become `<subnet-base>.<idx>.1/.2`
+  with an automatic pool of `10.200`–`10.254` (first peer and migrated legacy
+  configs keep `10.200`). Duplicate `(SUBNET_BASE, IDX)` pairs, peer names and
+  tunnel names are rejected before anything is written or applied.
+- **New Iran CLI**:
+  - `gre iran peer list [--json]`
+  - `gre iran peer add --name NAME --foreign-ip IP [--iran-ip IP]
+    [--subnet-base A.B] [--idx N] [--key K] [--wan IFACE] [--tcp-ports LIST]
+    [--udp-ports LIST] [--mss-clamp on|off] [--yes]` (re-running with
+    identical values is idempotent; different values are rejected)
+  - `gre iran peer remove --name NAME [--yes]` (touches only that peer)
+  - `gre iran peer apply --name NAME`
+- **Port splitting between foreigns** — every (protocol, port) tuple belongs
+  to exactly one peer; overlaps (including range overlaps like `80:90` vs
+  `85`) are rejected with an error naming the conflicting peer. TCP and UDP
+  are independent (the same port number may go to different peers on
+  different protocols). No shared-port failover/load-balancing yet (v2.1+).
+- **Foreign-side `--subnet-base`** — `gre node add` and `gre iran-setup`
+  accept `--subnet-base`; node confs store `SUBNET_BASE` (default `10.200`
+  when absent) and the pairing output prints the full `gre iran peer add`
+  command for the Iran side.
+- **Automatic v1→v2 migration** — a legacy v1 `iran.conf` is converted to an
+  equivalent peer (`SUBNET_BASE=10.200`) plus manifest on the first
+  operational command; the original is kept as `iran.conf.v1.bak` (mode 0600)
+  for rollback. Migration is atomic and idempotent; an inconsistent mixed
+  old+new layout aborts instead of silently overwriting.
+- **JSON schema v2** — `gre status --json` now reports `"schema_version": 2`
+  and an `iran_peers[]` array (name, foreign IP, subnet base, idx, key,
+  tunnel, ports, reachability). A deprecated legacy `iran` field is still
+  emitted for single-peer setups; new consumers must read `iran_peers`.
+- **Per-peer watchdog & doctor** — the watchdog pings every peer and
+  re-applies only dead ones (log lines name the peer, tunnel and foreign IP);
+  doctor checks every peer and reports duplicate subnet/tunnel and port
+  overlaps as FAIL.
+- **Test suite + CI** — new bash test harness (`tests/run.sh`, stubbed
+  `ip`/`iptables`/`systemctl`/`ping`/… with redirected config roots, runs on
+  Linux and Git Bash) covering migration, idempotency, port/subnet collision
+  rejection, peer isolation, watchdog, doctor, JSON, export/import and
+  foreign-side regression; CI runs it on every push/PR.
+
+### Changed
+- **Menu option 1** is now a peers flow — "Foreigns connected to this Iran
+  (add / manage peers)" with list/add/remove; the banner shows
+  `IRAN (peers: N/M up)`. Peer iptables rules carry per-peer comments
+  (`multi-gre-iran-<name>-*`) so exact removal is possible; `gre purge`
+  patterns match the new comments.
+- `gre iran-setup` stays for backward compatibility: it creates the first
+  peer on an empty server and refuses to overwrite on multi-peer servers
+  (pointing to `gre iran peer add`). Accepts `--subnet-base`.
+- `gre node remove` now tells the user to remove the matching peer on the
+  Iran side instead of uninstalling.
+- Export/import handle both v1 and v2 layouts (v1 archives migrate on
+  import); ambiguous mixed archives are rejected.
+
 ## [1.5.0] - 2026-08-01
 
 ### Added
@@ -148,3 +210,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [1.3.0]: https://github.com/aibedini/gre-manager/releases/tag/v1.3.0
 [1.4.0]: https://github.com/aibedini/gre-manager/releases/tag/v1.4.0
 [1.5.0]: https://github.com/aibedini/gre-manager/releases/tag/v1.5.0
+[2.0.0]: https://github.com/aibedini/gre-manager/releases/tag/v2.0.0

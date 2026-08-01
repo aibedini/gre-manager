@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# test stub for ss — no local listeners
+exit 0
