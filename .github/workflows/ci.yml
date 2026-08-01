@@ -30,6 +30,6 @@ jobs:
         run: |
           set -e
           V_FILE="$(cat VERSION | tr -d '[:space:]')"
-          V_SCRIPT="$(grep -m1 -E '^VERSION=' gre-manager.sh | cut -d'\"' -f2)"
+          V_SCRIPT="$(grep -m1 -E '^VERSION=' gre-manager.sh | cut -d'"' -f2)"
           [ "$V_FILE" = "$V_SCRIPT" ] || { echo "VERSION file ($V_FILE) != script ($V_SCRIPT)"; exit 1; }
           grep -q "^## \[$V_SCRIPT\]" CHANGELOG.md || { echo "CHANGELOG has no section for $V_SCRIPT"; exit 1; }
