@@ -13,6 +13,8 @@ with per-node and per-peer isolation, selective port forwarding (split between f
 watchdog, and systemd persistence — all through a single `gre` command. Interactive menu for humans,
 non-interactive CLI for automation.
 
+> **راهنمای قدم‌به‌قدم فارسی:** [docs/GUIDE.fa.md](docs/GUIDE.fa.md) — نصب از صفر تا چند-خارج، با خروجی نمونه و عیب‌یابی.
+
 ```mermaid
 flowchart TD
     F1["FOREIGN server de1<br/>(Xray / services listen on 0.0.0.0)"]
@@ -415,6 +417,8 @@ See [CHANGELOG.md](CHANGELOG.md) and the [releases page](https://github.com/aibe
 ---
 
 ## راهنمای فارسی
+
+> 📖 **[راهنمای کامل قدم‌به‌قدم (توصیه می‌شود)](docs/GUIDE.fa.md)** — از نصب تا چند ایران و چند خارج، با خروجی نمونه، تست و عیب‌یابی.
 
 این ابزار چند سرور **ایران** را از طریق تونل GRE به چند سرور **خارج** وصل می‌کند؛ یعنی هم روی هر سرور خارج چند نود ایران جا می‌شود، هم **هر سرور ایران می‌تواند هم‌زمان به چند سرور خارج وصل باشد** (multi-foreign — از ورژن ۲). هر تونل، ساب‌نت و کلید GRE اختصاصی خودش را دارد.
 
