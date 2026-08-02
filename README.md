@@ -69,7 +69,9 @@ server still accepts many Iran nodes — a full many-to-many topology.
 - **Idempotent & safe** — re-running any action never duplicates iptables rules; deletions check existence first. Peer rules carry per-peer comments (`multi-gre-iran-<name>-*`) so removal is exact.
 
 **Security**
-- **GRE whitelist (firewall hardening)** — on the foreign server, only known Iran node IPs may speak GRE (proto 47); everything else is dropped.
+- **GRE whitelist (firewall hardening)** — on the foreign server, only known Iran node IPs may speak GRE (proto 47); everything else is dropped. Setup warns first if other (unmanaged) GRE tunnels exist that would be blocked.
+- **Coexistence checks** — `gre doctor` detects GRE tunnels not managed by gre-manager and warns instead of touching them; per-peer iptables comments keep every rule attributable and removable.
+- **Pairing fingerprint** — `gre status` prints an identical `pair: IRAN_IP <-> FOREIGN_IP · SUBNET.IDX.0/30 · key N` line on both sides of a tunnel so you can verify which two ends are linked (same name on both sides recommended, not required).
 - **Checksum-verified installs** — installer and `gre update` verify the release SHA-256 before touching your system.
 - **Config permissions** — all files under `/etc/multi-gre/` are mode `0600`.
 - **Audit log** — every change is appended to `/var/log/gre-manager.log`.

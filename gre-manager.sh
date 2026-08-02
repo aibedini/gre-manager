@@ -60,7 +60,7 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are validated then sourced by design
 set -uo pipefail
 
-VERSION="2.0.1"
+VERSION="2.1.0"
 
 GITHUB_REPO="aibedini/gre-manager"
 RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/gre-manager.sh"
@@ -559,6 +559,33 @@ node_count() {
         n=$(( n + 1 ))
     done
     printf '%s' "$n"
+}
+
+# ------------------------------------------------------------- coexistence helpers
+gre_tunnel_names() { # all GRE/GRETAP tunnel names on this server (except gre0/gretap0 fallbacks)
+    ip -o link show type gre    2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1
+    ip -o link show type gretap 2>/dev/null | awk -F': ' '{print $2}' | cut -d'@' -f1
+}
+
+managed_tunnel_names() { # tunnels managed by us (foreign nodes + iran peers)
+    local f TUN=""
+    for f in "$NODES_DIR"/*.conf "$FOREIGNS_DIR"/*.conf; do
+        [[ -e "$f" ]] || continue
+        TUN="$(grep -E '^TUN=' "$f" | cut -d= -f2)"
+        [[ -n "$TUN" ]] && printf '%s\n' "$TUN"
+    done
+}
+
+unmanaged_gre_tunnels() { # GRE tunnels present but NOT created by gre-manager
+    local t
+    gre_tunnel_names | while IFS= read -r t; do
+        [[ -n "$t" && "$t" != "gre0" && "$t" != "gretap0" && "$t" != "erspan0" ]] || continue
+        managed_tunnel_names | grep -qx "$t" || printf '%s\n' "$t"
+    done
+}
+
+pair_fingerprint() { # pair_fingerprint IRAN_IP FOREIGN_IP SUBNET_BASE IDX KEY — identical on both sides
+    printf '%s <-> %s · %s.%s.0/30 · key %s' "$1" "$2" "$3" "$4" "$5"
 }
 
 progress_bar() { # progress_bar "label" percent
@@ -1309,6 +1336,12 @@ setup_foreign() {
         valid_ip "$FOREIGN_IP" || { err "Invalid IP: $FOREIGN_IP"; return 1; }
 
         local icmp_drop="0" gre_whitelist="0"
+        local other_tuns=""
+        other_tuns="$(unmanaged_gre_tunnels | tr '\n' ' ')"
+        if [[ -n "${other_tuns// /}" ]]; then
+            warn "Other GRE tunnels already exist on this server: $other_tuns"
+            warn "If you enable the GRE whitelist, those tunnels will be BLOCKED (their peer IPs are not whitelisted)."
+        fi
         if confirm_yes "Restrict GRE (proto 47) to known Iran node IPs? (recommended)"; then
             gre_whitelist="1"
         fi
@@ -1478,6 +1511,7 @@ show_status() {
             printf '  - %s: foreign %s, subnet %s.%s.0/30, tunnel %s, tcp [%s] udp [%s], %s\n' \
                 "$NAME" "$FOREIGN_IP" "$SUBNET_BASE" "$IDX" "$TUN" \
                 "${TCP_PORTS:-none}" "${UDP_PORTS:-none}" "$reach"
+            printf '    pair: %s\n' "$(pair_fingerprint "$IRAN_IP" "$FOREIGN_IP" "$SUBNET_BASE" "$IDX" "$KEY")"
         done
         (( found )) || echo "  (none — add one: gre iran peer add)"
         echo
@@ -1486,12 +1520,15 @@ show_status() {
         echo
     fi
     if [[ -f "$FOREIGN_CONF" ]]; then
-        local f NAME="" IRAN_IP="" IDX="" KEY="" TUN="" SUBNET_BASE="$DEFAULT_SUBNET_BASE"
+        local f NAME="" IRAN_IP="" IDX="" KEY="" TUN="" SUBNET_BASE="$DEFAULT_SUBNET_BASE" FOREIGN_IP=""
+        # shellcheck disable=SC1090
+        source "$FOREIGN_CONF"
         for f in "$NODES_DIR"/*.conf; do
             [[ -e "$f" ]] || continue
             NAME=""; IRAN_IP=""; IDX=""; KEY=""; TUN=""; SUBNET_BASE="$DEFAULT_SUBNET_BASE"
             source "$f"
             echo
+            printf '  pair: %s\n' "$(pair_fingerprint "$IRAN_IP" "$FOREIGN_IP" "$SUBNET_BASE" "$IDX" "$KEY")"
             info "Node $NAME: ping Iran end (${SUBNET_BASE}.${IDX}.2):"
             ping -c 2 -W 2 "${SUBNET_BASE}.${IDX}.2" 2>&1 | tail -n 2 | sed 's/^/  /' || true
         done
@@ -2456,6 +2493,19 @@ doctor() { # gre doctor — diagnostics; exits non-zero if any check FAILs
             done
         fi
     fi
+
+    # --- coexistence: GRE tunnels not managed by gre-manager
+    local ut="" ut_found=0
+    while IFS= read -r ut; do
+        [[ -n "$ut" ]] || continue
+        ut_found=1
+        if (( is_foreign )) && [[ "${GRE_WHITELIST:-0}" == "1" ]]; then
+            d_warn "unmanaged GRE tunnel '$ut' exists — it is BLOCKED by the GRE whitelist (its peer IP is not whitelisted)"
+        else
+            d_warn "unmanaged GRE tunnel '$ut' exists (not created by gre-manager; left untouched)"
+        fi
+    done < <(unmanaged_gre_tunnels)
+    (( ut_found == 0 )) && d_pass "no unmanaged GRE tunnels (no coexistence conflicts)"
 
     # --- systemd
     if [[ "$(service_state)" == "enabled" ]]; then

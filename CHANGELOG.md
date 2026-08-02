@@ -4,6 +4,21 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-08-02
+
+### Added
+- **Coexistence with other GRE tunnels**: during FOREIGN setup, if GRE tunnels
+  not managed by gre-manager already exist, enabling the GRE whitelist now
+  prints an explicit warning that those tunnels will be blocked.
+- **Doctor coexistence check**: `gre doctor` detects unmanaged GRE tunnels —
+  reports them as WARN (and warns they are blocked when the GRE whitelist is
+  active), so gre-manager never silently kills or fights another tool's tunnel.
+- **Pairing fingerprint in status**: `gre status` prints an identical
+  `pair: IRAN_IP <-> FOREIGN_IP · SUBNET.IDX.0/30 · key N` line on both sides
+  of a tunnel, so operators can visually confirm which Iran node is linked to
+  which foreign peer (matching names on both sides is recommended but not
+  required — the link is established by IP + subnet base + index + key).
+
 ## [2.0.1] - 2026-08-02
 
 ### Fixed
@@ -224,3 +239,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [1.5.0]: https://github.com/aibedini/gre-manager/releases/tag/v1.5.0
 [2.0.0]: https://github.com/aibedini/gre-manager/releases/tag/v2.0.0
 [2.0.1]: https://github.com/aibedini/gre-manager/releases/tag/v2.0.1
+[2.1.0]: https://github.com/aibedini/gre-manager/releases/tag/v2.1.0
