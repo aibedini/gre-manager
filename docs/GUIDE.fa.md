@@ -131,15 +131,20 @@ Downtime tolerance in minutes [2]:
 
 ### ۳.۲ — ثبت سرور ایران اول
 
-بلافاصله ادامه می‌دهد:
+بلافاصله ادامه می‌دهد. اول لیست نودهای فعلی را نشان می‌دهد (بار اول خالی است) و بعد سؤال‌ها را می‌پرسد:
 
 ```
+[*] Current Iran nodes on this FOREIGN:
+  (none yet — this will be the first node)
+
 [*] Add a new IRAN node
 Node name (e.g. ir01) [ir01]:                     ← Enter
 Public IP of the Iran server: 5.6.7.8             ← IP ایران ۱
 Tunnel index (1-254) [1]:                         ← Enter
 GRE key [1001]:                                   ← Enter
 ```
+
+> از این به بعد هر بار که گزینهٔ ۲ را بزنید، **قبل از سؤال‌ها لیست همهٔ نودهای موجود را می‌بینید** — همیشه اول چک کنید نود قبلی ثبت شده یا نه.
 
 خروجی موفق — **این بلوک را کپی کنید و نگه دارید، مرحلهٔ بعد لازم است:**
 

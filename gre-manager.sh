@@ -60,7 +60,7 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are validated then sourced by design
 set -uo pipefail
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 
 GITHUB_REPO="aibedini/gre-manager"
 RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/gre-manager.sh"
@@ -1363,6 +1363,22 @@ EOF
     fi
     # shellcheck disable=SC1090
     source "$FOREIGN_CONF"
+
+    echo
+    info "Current Iran nodes on this FOREIGN:"
+    local cf="" cn=0 cbase=""
+    for cf in "$NODES_DIR"/*.conf; do
+        [[ -e "$cf" ]] || continue
+        cn=$(( cn + 1 ))
+        cbase="$(grep -E '^SUBNET_BASE=' "$cf" | cut -d= -f2)"
+        printf '  - %s  (iran %s · %s.%s.0/30 · key %s)\n' \
+            "$(grep -E '^NAME=' "$cf" | cut -d= -f2)" \
+            "$(grep -E '^IRAN_IP=' "$cf" | cut -d= -f2)" \
+            "${cbase:-$DEFAULT_SUBNET_BASE}" \
+            "$(grep -E '^IDX=' "$cf" | cut -d= -f2)" \
+            "$(grep -E '^KEY=' "$cf" | cut -d= -f2)"
+    done
+    (( cn == 0 )) && echo "  (none yet — this will be the first node)"
 
     echo
     info "Add a new IRAN node"

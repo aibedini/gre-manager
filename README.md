@@ -183,7 +183,7 @@ Addressing plan (automatic — subnet base, index and key are suggested for you)
 | Option | What it does |
 | ------ | ------------ |
 | **1** | Configure this server as IRAN: list peers, add a peer (interactive; asks IPs, name, subnet base, index, key, ports, MSS clamp, downtime tolerance), remove a peer. On a fresh server a "Start here" hint points to options 1 (Iran) and 2 (Foreign) |
-| **2** | Configure this server as FOREIGN (first run) / add another Iran node (subsequent runs) |
+| **2** | Configure this server as FOREIGN (first run) / add another Iran node (subsequent runs) — always lists the current nodes before the add prompts |
 | **3** | Remove one Iran node from FOREIGN (tunnel + firewall rule + config) |
 | **4** | Restart all configured tunnels (stop + apply, idempotent) |
 | **5** | Stop all tunnels but keep config (they return after reboot or menu 4) |
