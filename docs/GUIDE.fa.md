@@ -93,7 +93,9 @@ sudo gre
 sudo gre
 ```
 
-منو را می‌بینید. گزینهٔ **`2`** را بزنید (Configure this server as FOREIGN / add an Iran node).
+منو را می‌بینید. روی سرور تازه یک خط راهنما هم می‌بینید: `Start here → this server is in IRAN? press 1 · is it the FOREIGN server? press 2` — یعنی **سرور ایران = گزینهٔ 1، سرور خارج = گزینهٔ 2**.
+
+چون این سرور **خارج** است، گزینهٔ **`2`** را بزنید (Configure this server as FOREIGN / add an Iran node).
 
 ### ۳.۱ — سؤال‌های اولین اجرا (فقط بار اول پرسیده می‌شود)
 
@@ -163,7 +165,7 @@ GRE key [1001]:                                   ← Enter
 sudo gre
 ```
 
-گزینهٔ **`1`** را بزنید و با مقادیر بلوک مرحلهٔ قبل جواب دهید:
+گزینهٔ **`1`** را بزنید (Configure this server as IRAN) و با مقادیر بلوک مرحلهٔ قبل جواب دهید:
 
 ```
 [*] IRAN node setup

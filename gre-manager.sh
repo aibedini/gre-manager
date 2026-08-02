@@ -60,7 +60,7 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are validated then sourced by design
 set -uo pipefail
 
-VERSION="2.0.0"
+VERSION="2.0.1"
 
 GITHUB_REPO="aibedini/gre-manager"
 RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/gre-manager.sh"
@@ -2644,8 +2644,12 @@ EOF
     echo   "  ═════════════════════════════════════════════════════════════"
     printf '  Role: %s%s%s   Tunnels: %s %s up   Watchdog: %s %s\n' \
         "$C_GREEN" "$roles" "$C_RESET" "$tun_dot" "$tcount" "$wdot" "$wlabel"
+    if [[ "$roles" == "not configured" ]]; then
+        printf '  %sStart here → this server is in IRAN? press 1 · is it the FOREIGN server? press 2%s\n' \
+            "$C_YELLOW" "$C_RESET"
+    fi
     echo   "  ── Tunnels ─────────────────────────────────────────────────"
-    echo   "  1) Foreigns connected to this Iran (add / manage peers)"
+    echo   "  1) Configure this server as IRAN (add / manage foreign peers)"
     echo   "  2) Configure this server as FOREIGN / add an Iran node"
     printf '  3) Remove an Iran node from FOREIGN                  [%s nodes]\n' "$ncount"
     echo   "  4) Restart all configured tunnels"

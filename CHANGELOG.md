@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-08-02
+
+### Fixed
+- **Installer progress bars**: the "Downloading gre-manager" bar jumped from
+  40% to the next step without completing and the "Latest release" line was
+  printed mid-bar; every stage now completes its own bar to 100% in order
+  (download → checksum → install).
+- **Menu clarity**: menu option 1 was renamed from the confusing
+  "Foreigns connected to this Iran" to "Configure this server as IRAN
+  (add / manage foreign peers)", and a fresh server now shows a
+  `Start here → IRAN? press 1 · FOREIGN? press 2` hint under the status line.
+
 ## [2.0.0] - 2026-08-01
 
 ### Added
@@ -211,3 +223,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [1.4.0]: https://github.com/aibedini/gre-manager/releases/tag/v1.4.0
 [1.5.0]: https://github.com/aibedini/gre-manager/releases/tag/v1.5.0
 [2.0.0]: https://github.com/aibedini/gre-manager/releases/tag/v2.0.0
+[2.0.1]: https://github.com/aibedini/gre-manager/releases/tag/v2.0.1

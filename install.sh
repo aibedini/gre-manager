@@ -60,52 +60,52 @@ if ! command -v curl >/dev/null 2>&1; then
         exit 1
     fi
 fi
-progress "Checking dependencies" 25
+progress "Checking dependencies" 100
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-install_from_release() {
+download_release() { # downloads latest pinned release assets into $TMP; prints the tag first
     local tag
     tag="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
         | grep -m1 '"tag_name"' | cut -d'"' -f4)"
     [[ -n "$tag" ]] || return 1
-
     echo "  Latest release: ${C_BOLD}$tag${C_RESET}"
     curl -fsSL "https://github.com/${REPO}/releases/download/${tag}/gre"        -o "$TMP/gre"        || return 1
     curl -fsSL "https://github.com/${REPO}/releases/download/${tag}/gre.sha256" -o "$TMP/gre.sha256" || return 1
+    return 0
+}
 
-    if command -v sha256sum >/dev/null 2>&1; then
-        (cd "$TMP" && sha256sum -c gre.sha256 >/dev/null) || {
-            echo "[x] Checksum verification FAILED — refusing to install." >&2
-            return 1
-        }
+verify_checksum() {
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        echo "  [!] sha256sum not available; skipping checksum verification" >&2
         return 0
     fi
-    echo "[!] sha256sum not available; skipping checksum verification" >&2
+    (cd "$TMP" && sha256sum -c gre.sha256 >/dev/null) || {
+        echo "[x] Checksum verification FAILED — refusing to install." >&2
+        return 1
+    }
     return 0
 }
 
 if [[ "${GRE_EDGE:-0}" == "1" ]]; then
     echo "  ${C_BOLD}GRE_EDGE=1${C_RESET} — bleeding-edge main branch (no checksum)"
-    progress "Downloading gre-manager" 50
     curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/gre-manager.sh" -o "$TMP/gre"
-    progress "Downloading gre-manager" 60
+    progress "Downloading gre-manager (edge)" 100
 else
-    progress "Downloading gre-manager" 40
-    if install_from_release; then
-        progress "Downloading gre-manager" 55
-        progress "Verifying SHA-256 checksum" 70
+    if download_release; then
+        progress "Downloading gre-manager" 100
+        verify_checksum || exit 1
+        progress "Verifying SHA-256 checksum" 100
     else
-        echo "[!] Release install unavailable; falling back to main branch (no checksum)." >&2
+        echo "  [!] Release install unavailable; falling back to main branch (no checksum)." >&2
         curl -fsSL "https://raw.githubusercontent.com/${REPO}/main/gre-manager.sh" -o "$TMP/gre"
+        progress "Downloading gre-manager (main)" 100
     fi
-    progress "Verifying SHA-256 checksum" 75
 fi
 
 bash -n "$TMP/gre" 2>/dev/null || { echo; echo "[x] Downloaded script failed syntax check." >&2; exit 1; }
 
-progress "Installing gre command" 85
 cp "$TMP/gre" "$INSTALL_PATH"
 chmod +x "$INSTALL_PATH"
 

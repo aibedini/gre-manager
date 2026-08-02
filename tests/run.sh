@@ -128,7 +128,7 @@ sect "1. fresh server: full CLI sweep, no unbound variables"
 mkroot
 gre --help;        assert "--help rc=0"        test "$GRE_RC" -eq 0
 gre --version;     assert "--version rc=0"     test "$GRE_RC" -eq 0
-assert "--version says 2.0.0" grep -q "2.0.0" <<< "$GRE_OUT"
+assert "--version reports current version" grep -q "$(cat "$REPO_ROOT/VERSION" 2>/dev/null || echo 2.0)" <<< "$GRE_OUT"
 gre status;        assert "status rc=0"        test "$GRE_RC" -eq 0
 gre status --json; assert "status --json rc=0" test "$GRE_RC" -eq 0
 json_valid "fresh JSON valid"

@@ -124,11 +124,11 @@ sudo gre
  / / __/ /_/ / /_/ /  / /|_/ / _ `/ _ \/ _ `/ _ `/ -_) __/
  \____/_/ |_/_____/  /_/  /_/\_,_/_//_/\_,_/\_, /\__/_/
                                            /____/
-  Multi-GRE Tunnel Manager  v2.0.0  ·  github.com/aibedini/gre-manager
+  Multi-GRE Tunnel Manager  v2.0.1  ·  github.com/aibedini/gre-manager
   ═════════════════════════════════════════════════════════════
   Role: IRAN (peers: 2/2 up)   Tunnels: ● 2 up   Watchdog: ● ON · every 1m
   ── Tunnels ─────────────────────────────────────────────────
-  1) Foreigns connected to this Iran (add / manage peers)
+  1) Configure this server as IRAN (add / manage foreign peers)
   2) Configure this server as FOREIGN / add an Iran node
   3) Remove an Iran node from FOREIGN                  [0 nodes]
   4) Restart all configured tunnels
@@ -180,7 +180,7 @@ Addressing plan (automatic — subnet base, index and key are suggested for you)
 
 | Option | What it does |
 | ------ | ------------ |
-| **1** | Foreigns connected to this Iran: list peers, add a peer (interactive; asks IPs, name, subnet base, index, key, ports, MSS clamp, downtime tolerance), remove a peer |
+| **1** | Configure this server as IRAN: list peers, add a peer (interactive; asks IPs, name, subnet base, index, key, ports, MSS clamp, downtime tolerance), remove a peer. On a fresh server a "Start here" hint points to options 1 (Iran) and 2 (Foreign) |
 | **2** | Configure this server as FOREIGN (first run) / add another Iran node (subsequent runs) |
 | **3** | Remove one Iran node from FOREIGN (tunnel + firewall rule + config) |
 | **4** | Restart all configured tunnels (stop + apply, idempotent) |
