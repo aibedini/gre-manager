@@ -60,7 +60,7 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are validated then sourced by design
 set -uo pipefail
 
-VERSION="2.2.0"
+VERSION="2.2.1"
 
 GITHUB_REPO="aibedini/gre-manager"
 RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/gre-manager.sh"
@@ -2289,6 +2289,13 @@ d_fail() { DOC_FAIL=$(( ${DOC_FAIL:-0} + 1 )); printf '%s[FAIL]%s %s\n' "$C_RED"
 
 # Per-peer doctor helpers; use NAME/WAN_IF/IRAN_IP/TUN/peer/MSS_CLAMP and the
 # port lists from the caller's scope (set by load_peer_conf).
+doctor_gre_filtered_hint() { # doctor_gre_filtered_hint REMOTE_PUBLIC_IP — printed after a failed tunnel ping
+    info "      cause: the far side is down, or GRE (protocol 47) is filtered — often only one-way — by a datacenter."
+    info "      proof: run 'tcpdump -n proto 47' on BOTH servers while pinging the tunnel peer."
+    info "      The direction showing no packets is the filtered one (remote public IP: $1)."
+    info "      Note: plain 'ping $1' (ICMP) can still work while proto 47 is blocked — they are different protocols."
+}
+
 doctor_peer_dnat() { # doctor_peer_dnat PROTO LIST
     local proto="$1" plist="$2"
     [[ -z "$plist" ]] && return 0
@@ -2416,6 +2423,7 @@ doctor() { # gre doctor — diagnostics; exits non-zero if any check FAILs
                     d_pass "[$NAME] tunnel peer $peer answers ping"
                 else
                     d_fail "[$NAME] tunnel peer $peer does not answer ping"
+                    doctor_gre_filtered_hint "$FOREIGN_IP"
                 fi
             fi
             doctor_peer_dnat tcp "$TCP_PORTS"
@@ -2487,6 +2495,7 @@ doctor() { # gre doctor — diagnostics; exits non-zero if any check FAILs
                 d_pass "node $NAME (${SUBNET_BASE}.${IDX}.2) answers ping"
             else
                 d_fail "node $NAME (${SUBNET_BASE}.${IDX}.2) does not answer ping"
+                doctor_gre_filtered_hint "$IRAN_IP"
             fi
         done
         (( node_count == 0 )) && d_warn "FOREIGN is configured but has no Iran nodes yet"
