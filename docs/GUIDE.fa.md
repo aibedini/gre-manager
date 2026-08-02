@@ -72,7 +72,7 @@ curl -fsSL https://raw.githubusercontent.com/aibedini/gre-manager/main/install.s
   Verifying SHA-256 checksum   [################################] 75%
   Installing gre command       [################################] 100%
 
-  [+] gre-manager v2.0.0 installed -> /usr/local/sbin/gre
+  [+] gre-manager v2.1.0 installed -> /usr/local/sbin/gre
 ```
 
 از این لحظه روی هر سرور فقط کافی است بنویسید:
@@ -111,6 +111,8 @@ Restrict GRE (proto 47) to known Iran node IPs? (recommended) [Y/n]:
 ```
 
 **Enter (بله)** — با این کار فقط IP سرورهای ایرانِ شما اجازهٔ اتصال GRE به این سرور را دارند.
+
+> اگر روی این سرور از قبل تونل GRE دیگری (مال ابزار دیگر) وجود داشته باشد، قبل از این سؤال هشدار می‌گیرید که آن تونل‌ها بلاک می‌شوند — در آن صورت یا whitelist را رد کنید یا اول وضعیت آن تونل‌ها را مشخص کنید.
 
 ```
 Drop inbound ICMP (ping) on this server? (tunnel subnets stay pingable) [y/N]:
@@ -232,6 +234,13 @@ sudo gre doctor
 
 ```bash
 sudo gre status          # یا sudo gre status --json برای مانیتورینگ
+```
+
+در خروجی status، زیر هر peer/nod یک خط **اثر انگشت جفت** می‌بینید که روی هر دو سرور دقیقاً یکسان است — با مقایسهٔ آن مطمئن می‌شوید دو سر تونل درست به هم وصل‌اند:
+
+```
+  - ir01: foreign 1.2.3.4, subnet 10.200.1.0/30, tunnel gre-ir01, tcp [443], udp [443], reachable
+    pair: 5.6.7.8 <-> 1.2.3.4 · 10.200.1.0/30 · key 1001
 ```
 
 **تست واقعی سرویس:** اگر Xray روی خارج روی پورت 443 گوش می‌دهد، حالا کانفیگ کلاینت را روی IP **ایران** (`5.6.7.8`) و پورت 443 بزنید — باید وصل شود.
@@ -358,6 +367,8 @@ sudo gre iran peer remove --name nl1        # فقط همان peer پاک می�
 | واچداگ مدام تونل را ری‌است می‌کند | peer واقعاً down است یا ICMP داخل تونل بسته است | `journalctl -t gre-watchdog` را ببینید؛ سمت مقابل را چک کنید |
 | بعد از آپدیت رفتار عجیب | کانفیگ قدیمی | مهاجرت خودکار انجام می‌شود و بکاپ در `/etc/multi-gre/iran.conf.v1.bak` است |
 | `port overlap` هنگام peer add | همان پورت را به دو خارج داده‌اید | هر پورت فقط به یک خارج؛ پورت‌ها را تقسیم کنید |
+| کانفیگ وصل می‌شود ولی IP خروجی اشتباه است (مثلاً ایران نشان می‌دهد) | مشکل از تونل نیست — outbound پیش‌فرض xray/پنل روی خارج ترافیک را به زنجیرهٔ دیگری می‌فرستد (بقایای reverse tunnel) | روی خارج، outbound آن inbound را `direct/freedom` کنید (routing rule) |
+| تونل GRE دیگری روی همان سرور از کار افتاده | whitelist پروتکل GRE ما آن را بلاک کرده | `sudo gre doctor` را ببینید (WARN تونل unmanaged)؛ یا whitelist را خاموش کنید یا آن تونل را به gre-manager بسپارید |
 | چک نهایی | — | خروجی `sudo gre doctor` و `sudo gre status --json` را نگه دارید |
 
 ---

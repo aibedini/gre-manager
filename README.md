@@ -105,7 +105,7 @@ installs the `gre` command to `/usr/local/sbin/gre` plus bash completion, and sh
   Verifying SHA-256 checksum   [################################] 75%
   Installing gre command       [################################] 100%
 
-  [+] gre-manager v2.0.0 installed -> /usr/local/sbin/gre
+  [+] gre-manager v2.1.0 installed -> /usr/local/sbin/gre
 ```
 
 For the bleeding-edge main branch instead (no checksum):
@@ -126,7 +126,7 @@ sudo gre
  / / __/ /_/ / /_/ /  / /|_/ / _ `/ _ \/ _ `/ _ `/ -_) __/
  \____/_/ |_/_____/  /_/  /_/\_,_/_//_/\_,_/\_, /\__/_/
                                            /____/
-  Multi-GRE Tunnel Manager  v2.0.1  ·  github.com/aibedini/gre-manager
+  Multi-GRE Tunnel Manager  v2.1.0  ·  github.com/aibedini/gre-manager
   ═════════════════════════════════════════════════════════════
   Role: IRAN (peers: 2/2 up)   Tunnels: ● 2 up   Watchdog: ● ON · every 1m
   ── Tunnels ─────────────────────────────────────────────────
@@ -187,7 +187,7 @@ Addressing plan (automatic — subnet base, index and key are suggested for you)
 | **3** | Remove one Iran node from FOREIGN (tunnel + firewall rule + config) |
 | **4** | Restart all configured tunnels (stop + apply, idempotent) |
 | **5** | Stop all tunnels but keep config (they return after reboot or menu 4) |
-| **6** | Status: roles, tunnels, addresses, NAT rules, live ping per node/peer, systemd states |
+| **6** | Status: roles, tunnels, addresses, NAT rules, live ping per node/peer, pairing fingerprints, systemd states |
 | **7** | Watchdog submenu: live state, change downtime tolerance, enable, disable |
 | **8** | Doctor: PASS/WARN/FAIL diagnostics with non-zero exit on failure |
 | **9** | Backup/restore submenu: export config to tar.gz, import it back |
