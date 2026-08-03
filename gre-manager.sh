@@ -60,7 +60,7 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are validated then sourced by design
 set -uo pipefail
 
-VERSION="2.4.0"
+VERSION="2.5.0"
 
 GITHUB_REPO="aibedini/gre-manager"
 RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/gre-manager.sh"
@@ -427,6 +427,45 @@ next_free_peer_idx() { # next_free_peer_idx BASE
             printf '%s' "$i"
             return 0
         fi
+    done
+    return 1
+}
+
+port_covered_in_list() { # port_covered_in_list PORT "items with possible a-b ranges"
+    local cand="$1" item a b
+    for item in $2; do
+        if [[ "$item" == *-* ]]; then
+            a="${item%%-*}"; b="${item##*-}"
+            (( a <= cand && cand <= b )) && return 0
+        elif [[ "$item" == "$cand" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Suggest a service port that collides with nothing: not in any other peer's
+# same-protocol port list (singles and ranges), not listened on locally, != 22.
+suggest_free_port() { # suggest_free_port PROTO(tcp|udp) [START]
+    local proto="$1" cand="${2:-3001}"
+    local used=" " f plist=""
+    for f in "$FOREIGNS_DIR"/*.conf; do
+        [[ -e "$f" ]] || continue
+        if [[ "$proto" == "tcp" ]]; then
+            plist="$(grep -E '^TCP_PORTS=' "$f" | cut -d= -f2)"
+        else
+            plist="$(grep -E '^UDP_PORTS=' "$f" | cut -d= -f2)"
+        fi
+        [[ -n "$plist" ]] || continue
+        plist="${plist//:/-}"      # ranges 8000:8010 -> 8000-8010
+        used+="${plist//,/ } "
+    done
+    while (( cand <= 65000 )); do
+        if (( cand != 22 )) && ! port_covered_in_list "$cand" "$used" && ! port_in_use "$proto" "$cand"; then
+            printf '%s' "$cand"
+            return 0
+        fi
+        cand=$(( cand + 1 ))
     done
     return 1
 }
@@ -1171,8 +1210,11 @@ interactive_add_iran_peer() { # interactive_add_iran_peer FIRST(0|1)
     echo
     info "Enter the service ports on this Iran server that should be forwarded to THIS foreign."
     info "Comma separated, ranges allowed with ':', max 15 entries. Leave empty for none."
-    ask TCP_PORTS  "TCP ports (e.g. 80,443,8443)" ""
-    ask UDP_PORTS  "UDP ports (e.g. 443,8443)" ""
+    local sug_tcp="" sug_udp=""
+    sug_tcp="$(suggest_free_port tcp)" || sug_tcp=""
+    sug_udp="$(suggest_free_port udp)" || sug_udp=""
+    ask TCP_PORTS  "TCP ports (suggested free: $sug_tcp)" "$sug_tcp"
+    ask UDP_PORTS  "UDP ports (suggested free: $sug_udp)" "$sug_udp"
 
     if confirm_yes "Enable TCP MSS clamping on the tunnel? (recommended)"; then
         MSS_CLAMP="1"

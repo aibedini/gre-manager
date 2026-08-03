@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-08-03
+
+### Added
+- **Smart defaults in the interactive peer-add wizard**: the TCP/UDP port
+  prompts now suggest a port that collides with nothing — skipping every port
+  and range already used by other peers (per protocol) and any locally
+  listened-on port, starting from 3001. Subnet base, index and GRE key were
+  already auto-suggested (next free in pool); now all four values can be
+  accepted with Enter end-to-end. Test added: full wizard run asserts the
+  suggested base/ports are the expected non-colliding ones.
+
 ## [2.4.0] - 2026-08-03
 
 ### Added
@@ -312,3 +323,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [2.2.3]: https://github.com/aibedini/gre-manager/releases/tag/v2.2.3
 [2.3.0]: https://github.com/aibedini/gre-manager/releases/tag/v2.3.0
 [2.4.0]: https://github.com/aibedini/gre-manager/releases/tag/v2.4.0
+[2.5.0]: https://github.com/aibedini/gre-manager/releases/tag/v2.5.0

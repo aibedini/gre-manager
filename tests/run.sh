@@ -557,6 +557,33 @@ assert "v1 --stop did not migrate" bash -c "! test -f '$R/etc/multi-gre/iran.con
 rm -rf "$R"
 
 # ======================================================================
+sect "15. interactive peer-add wizard suggests non-colliding values"
+mkroot
+mkdir -p "$R/etc/multi-gre/foreigns"
+printf 'SCHEMA_VERSION=2\nROLE_IRAN=1\n' > "$R/etc/multi-gre/iran.conf"
+cat > "$R/etc/multi-gre/foreigns/de1.conf" <<'EOF'
+NAME=de1
+FOREIGN_IP=203.0.113.10
+IRAN_IP=198.51.100.20
+WAN_IF=eth0
+SUBNET_BASE=10.200
+IDX=1
+KEY=1001
+TUN=gre-de1
+TCP_PORTS=3001
+UDP_PORTS=3001
+MSS_CLAMP=1
+EOF
+# menu -> option 1 (peers) -> 1 (add) -> answers (all defaults except foreign ip + name) -> back -> exit
+printf '1\n1\n\n203.0.113.55\nnl1\n\n\n\n\n\n\n\n0\n0\n' | { TEST_ROOT="$R" PATH="$STUBS:$PATH" bash "$SUT" > "$R/wizard.out" 2>&1; }
+assert "wizard rc=0" test "$?" -eq 0
+assert "wizard wrote peer conf" test -f "$R/etc/multi-gre/foreigns/nl1.conf"
+assert "wizard suggested next base 10.201" grep -qx "SUBNET_BASE=10.201" "$R/etc/multi-gre/foreigns/nl1.conf"
+assert "wizard suggested free tcp port 3002" grep -qx "TCP_PORTS=3002" "$R/etc/multi-gre/foreigns/nl1.conf"
+assert "wizard suggested free udp port 3002" grep -qx "UDP_PORTS=3002" "$R/etc/multi-gre/foreigns/nl1.conf"
+rm -rf "$R"
+
+# ======================================================================
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]
