@@ -1,0 +1,294 @@
+{
+  "communities": {
+    "0": [
+      "gre_manager_ask",
+      "gre_manager_ask_downtime_tolerance",
+      "gre_manager_audit_log",
+      "gre_manager_backup_restore_menu",
+      "gre_manager_cli_export",
+      "gre_manager_cli_iran_peer_remove",
+      "gre_manager_cli_node_remove",
+      "gre_manager_confirm",
+      "gre_manager_delete_tunnel",
+      "gre_manager_info",
+      "gre_manager_ipt_del",
+      "gre_manager_ipt_del_report",
+      "gre_manager_iran_peers_menu",
+      "gre_manager_legacy_cleanup",
+      "gre_manager_main_menu",
+      "gre_manager_menu_iran_peer_remove",
+      "gre_manager_ok",
+      "gre_manager_purge_all",
+      "gre_manager_purge_iptables",
+      "gre_manager_purge_tunnels",
+      "gre_manager_remove_node",
+      "gre_manager_require_root",
+      "gre_manager_restart_all",
+      "gre_manager_self_update",
+      "gre_manager_stop_all",
+      "gre_manager_stop_foreign",
+      "gre_manager_stop_iran",
+      "gre_manager_stop_iran_peer",
+      "gre_manager_stop_menu",
+      "gre_manager_uninstall",
+      "gre_manager_warn",
+      "gre_manager_watchdog_settings_menu"
+    ],
+    "1": [
+      "gre_manager",
+      "gre_manager_detect_public_ip",
+      "gre_manager_detect_wan_iface",
+      "gre_manager_dot_mid",
+      "gre_manager_dot_off",
+      "gre_manager_dot_on",
+      "gre_manager_enable_ip_forward",
+      "gre_manager_foreign_node_bases",
+      "gre_manager_next_free_idx",
+      "gre_manager_next_free_peer_idx",
+      "gre_manager_next_free_subnet_base",
+      "gre_manager_node_count",
+      "gre_manager_pair_fingerprint",
+      "gre_manager_peer_count",
+      "gre_manager_progress_bar",
+      "gre_manager_service_state",
+      "gre_manager_tunnel_count",
+      "gre_manager_usage",
+      "gre_manager_watchdog_state"
+    ],
+    "2": [
+      "c_users_mahna_gre_navid_gre_manager_gre_manager_sh__entry",
+      "gre_manager_apply_all",
+      "gre_manager_apply_iran",
+      "gre_manager_apply_iran_peer",
+      "gre_manager_cli_import",
+      "gre_manager_cli_iran_peer_apply",
+      "gre_manager_cli_iran_peer_list",
+      "gre_manager_cli_node_list",
+      "gre_manager_err",
+      "gre_manager_iran_peers_json",
+      "gre_manager_load_peer_conf",
+      "gre_manager_menu_iran_peer_apply",
+      "gre_manager_migrate_legacy_iran_conf",
+      "gre_manager_show_status",
+      "gre_manager_show_status_json",
+      "gre_manager_validate_conf_file",
+      "gre_manager_watchdog_menu",
+      "gre_manager_watchdog_run"
+    ],
+    "3": [
+      "c_users_mahna_gre_navid_gre_manager_tests_run_sh__entry",
+      "tests_run",
+      "tests_run_add_de1",
+      "tests_run_add_nl1",
+      "tests_run_add_uk1",
+      "tests_run_assert",
+      "tests_run_assert_not",
+      "tests_run_bad",
+      "tests_run_build_sut",
+      "tests_run_gre",
+      "tests_run_json_check",
+      "tests_run_json_valid",
+      "tests_run_mkroot",
+      "tests_run_nat_has",
+      "tests_run_ok",
+      "tests_run_sect",
+      "tests_run_tun_there",
+      "tests_run_v1_fixture"
+    ],
+    "4": [
+      "gre_manager_apply_watchdog_config",
+      "gre_manager_check_peer_collisions",
+      "gre_manager_cli_iran_peer_add",
+      "gre_manager_cli_iran_setup",
+      "gre_manager_create_iran_peer",
+      "gre_manager_install_service",
+      "gre_manager_install_watchdog",
+      "gre_manager_interactive_add_iran_peer",
+      "gre_manager_peer_exists",
+      "gre_manager_port_list_covers_22",
+      "gre_manager_remove_watchdog",
+      "gre_manager_subnet_route_conflict",
+      "gre_manager_warn_port_conflicts",
+      "gre_manager_write_global_conf",
+      "gre_manager_write_iran_manifest",
+      "gre_manager_write_watchdog_units"
+    ],
+    "5": [
+      "gre_manager_apply_foreign",
+      "gre_manager_apply_foreign_node",
+      "gre_manager_cli_node_add",
+      "gre_manager_confirm_yes",
+      "gre_manager_ipt_add",
+      "gre_manager_node_idx_taken",
+      "gre_manager_setup_foreign",
+      "gre_manager_valid_iface",
+      "gre_manager_valid_ip",
+      "gre_manager_valid_name",
+      "gre_manager_valid_port_list",
+      "gre_manager_valid_subnet_base",
+      "gre_manager_validate_peer_values"
+    ],
+    "6": [
+      "gre_manager_d_fail",
+      "gre_manager_d_pass",
+      "gre_manager_d_warn",
+      "gre_manager_doctor",
+      "gre_manager_doctor_gre_filtered_hint",
+      "gre_manager_doctor_peer_dnat",
+      "gre_manager_doctor_peer_mss",
+      "gre_manager_doctor_peer_snat",
+      "gre_manager_port_in_use",
+      "gre_manager_port_lists_overlap"
+    ],
+    "7": [
+      "c_users_mahna_gre_navid_gre_manager_install_sh__entry",
+      "install",
+      "install_download_release",
+      "install_progress",
+      "install_verify_checksum"
+    ],
+    "8": [
+      "gre_manager_banner",
+      "gre_manager_create_tunnel",
+      "gre_manager_iran_conf_is_legacy",
+      "gre_manager_load_global_conf",
+      "gre_manager_tun_exists"
+    ],
+    "9": [
+      "c_users_mahna_gre_navid_gre_manager_completion_gre_bash__entry",
+      "completion_gre",
+      "completion_gre_gre"
+    ],
+    "10": [
+      "gre_manager_gre_tunnel_names",
+      "gre_manager_managed_tunnel_names",
+      "gre_manager_unmanaged_gre_tunnels"
+    ]
+  },
+  "cohesion": {
+    "0": 0.22782258064516128,
+    "1": 0.10526315789473684,
+    "2": 0.27450980392156865,
+    "3": 0.2679738562091503,
+    "4": 0.225,
+    "5": 0.2564102564102564,
+    "6": 0.4,
+    "7": 0.7,
+    "8": 0.4,
+    "9": 0.6666666666666666,
+    "10": 0.6666666666666666
+  },
+  "gods": [
+    {
+      "id": "gre_manager_ok",
+      "label": "ok()",
+      "degree": 32
+    },
+    {
+      "id": "gre_manager_info",
+      "label": "info()",
+      "degree": 31
+    },
+    {
+      "id": "gre_manager_err",
+      "label": "err()",
+      "degree": 27
+    },
+    {
+      "id": "c_users_mahna_gre_navid_gre_manager_gre_manager_sh__entry",
+      "label": "gre-manager.sh script",
+      "degree": 24
+    },
+    {
+      "id": "gre_manager_require_root",
+      "label": "require_root()",
+      "degree": 24
+    },
+    {
+      "id": "gre_manager_migrate_legacy_iran_conf",
+      "label": "migrate_legacy_iran_conf()",
+      "degree": 22
+    },
+    {
+      "id": "gre_manager_setup_foreign",
+      "label": "setup_foreign()",
+      "degree": 21
+    },
+    {
+      "id": "gre_manager_audit_log",
+      "label": "audit_log()",
+      "degree": 20
+    },
+    {
+      "id": "gre_manager_interactive_add_iran_peer",
+      "label": "interactive_add_iran_peer()",
+      "degree": 20
+    },
+    {
+      "id": "gre_manager_warn",
+      "label": "warn()",
+      "degree": 19
+    }
+  ],
+  "surprises": [
+    {
+      "source": "gre-manager.sh script",
+      "target": "cli_export()",
+      "source_files": [
+        "gre-manager.sh",
+        "gre-manager.sh"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "note": "Bridges community 2 \u2192 community 0"
+    },
+    {
+      "source": "gre-manager.sh script",
+      "target": "cli_iran_peer_add()",
+      "source_files": [
+        "gre-manager.sh",
+        "gre-manager.sh"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "note": "Bridges community 2 \u2192 community 4"
+    },
+    {
+      "source": "gre-manager.sh script",
+      "target": "cli_node_add()",
+      "source_files": [
+        "gre-manager.sh",
+        "gre-manager.sh"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "note": "Bridges community 2 \u2192 community 5"
+    },
+    {
+      "source": "gre-manager.sh script",
+      "target": "doctor()",
+      "source_files": [
+        "gre-manager.sh",
+        "gre-manager.sh"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "note": "Bridges community 2 \u2192 community 6"
+    },
+    {
+      "source": "gre-manager.sh script",
+      "target": "usage()",
+      "source_files": [
+        "gre-manager.sh",
+        "gre-manager.sh"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "calls",
+      "note": "Bridges community 2 \u2192 community 1"
+    }
+  ],
+  "tokens": {
+    "input": 0,
+    "output": 0
+  }
+}

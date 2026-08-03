@@ -1,0 +1,57 @@
+{
+  "completion/gre.bash": {
+    "mtime": 1785603314.0957677,
+    "ast_hash": "3975e7d71c9535d0526a611b41554a83",
+    "semantic_hash": "3975e7d71c9535d0526a611b41554a83"
+  },
+  "gre-manager.sh": {
+    "mtime": 1785665778.4800346,
+    "ast_hash": "540e090940c115bb2f6410f366673b91",
+    "semantic_hash": "540e090940c115bb2f6410f366673b91"
+  },
+  "install.sh": {
+    "mtime": 1785652395.9819808,
+    "ast_hash": "0509db6e2e56f81e94df485a1db650d2",
+    "semantic_hash": "0509db6e2e56f81e94df485a1db650d2"
+  },
+  "tests/run.sh": {
+    "mtime": 1785653394.6802888,
+    "ast_hash": "0a6b222ab7e6246bf3fc279dde4595ca",
+    "semantic_hash": "0a6b222ab7e6246bf3fc279dde4595ca"
+  },
+  "tests/stubs/ip": {
+    "mtime": 1785605318.8361042,
+    "ast_hash": "7fc167ca0a0e26a1440f1d0626b201c9",
+    "semantic_hash": "7fc167ca0a0e26a1440f1d0626b201c9"
+  },
+  "tests/stubs/iptables": {
+    "mtime": 1785605318.8410442,
+    "ast_hash": "a3a53286b895107719c69cd4b1938049",
+    "semantic_hash": "a3a53286b895107719c69cd4b1938049"
+  },
+  "tests/stubs/logger": {
+    "mtime": 1785605318.8710227,
+    "ast_hash": "6e78dfb8a2a2ad7401478526ad008626",
+    "semantic_hash": "6e78dfb8a2a2ad7401478526ad008626"
+  },
+  "tests/stubs/ping": {
+    "mtime": 1785605318.8535995,
+    "ast_hash": "c9ae4c7ecaed460d06b552de12d96028",
+    "semantic_hash": "c9ae4c7ecaed460d06b552de12d96028"
+  },
+  "tests/stubs/ss": {
+    "mtime": 1785605318.8586023,
+    "ast_hash": "7592dc8ab2179c7498da1ef0b47cea88",
+    "semantic_hash": "7592dc8ab2179c7498da1ef0b47cea88"
+  },
+  "tests/stubs/sysctl": {
+    "mtime": 1785605318.864513,
+    "ast_hash": "a74e8f190e02159ed4a3ce6642001d0b",
+    "semantic_hash": "a74e8f190e02159ed4a3ce6642001d0b"
+  },
+  "tests/stubs/systemctl": {
+    "mtime": 1785605318.849073,
+    "ast_hash": "d62694560e02e955aaa4649bf0195182",
+    "semantic_hash": "d62694560e02e955aaa4649bf0195182"
+  }
+}
