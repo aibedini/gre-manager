@@ -4,6 +4,16 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.3] - 2026-08-03
+
+### Fixed
+- **`gre update` resilience**: the GitHub releases API and release-asset
+  downloads are flaky from some networks (intermittent throttling), which made
+  updates silently fall back to the unchecksummed main branch. Both steps now
+  retry once with a short pause, print a distinct message for API vs. asset
+  failure, and only fall back after retries are exhausted. Timeouts added to
+  all update curl calls.
+
 ## [2.2.2] - 2026-08-03
 
 ### Fixed
@@ -273,3 +283,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [2.2.0]: https://github.com/aibedini/gre-manager/releases/tag/v2.2.0
 [2.2.1]: https://github.com/aibedini/gre-manager/releases/tag/v2.2.1
 [2.2.2]: https://github.com/aibedini/gre-manager/releases/tag/v2.2.2
+[2.2.3]: https://github.com/aibedini/gre-manager/releases/tag/v2.2.3

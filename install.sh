@@ -66,14 +66,24 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 download_release() { # downloads latest pinned release assets into $TMP; prints the tag first
-    local tag
-    tag="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
-        | grep -m1 '"tag_name"' | cut -d'"' -f4)"
+    local tag="" attempt
+    for attempt in 1 2; do
+        tag="$(curl -fsSL --max-time 20 "https://api.github.com/repos/${REPO}/releases/latest" \
+            | grep -m1 '"tag_name"' | cut -d'"' -f4)"
+        [[ -n "$tag" ]] && break
+        (( attempt == 1 )) && sleep 3
+    done
     [[ -n "$tag" ]] || return 1
     echo "  Latest release: ${C_BOLD}$tag${C_RESET}"
-    curl -fsSL "https://github.com/${REPO}/releases/download/${tag}/gre"        -o "$TMP/gre"        || return 1
-    curl -fsSL "https://github.com/${REPO}/releases/download/${tag}/gre.sha256" -o "$TMP/gre.sha256" || return 1
-    return 0
+    for attempt in 1 2; do
+        if curl -fsSL --max-time 60 "https://github.com/${REPO}/releases/download/${tag}/gre"        -o "$TMP/gre" \
+        && curl -fsSL --max-time 60 "https://github.com/${REPO}/releases/download/${tag}/gre.sha256" -o "$TMP/gre.sha256" \
+        && [[ -s "$TMP/gre" && -s "$TMP/gre.sha256" ]]; then
+            return 0
+        fi
+        (( attempt == 1 )) && sleep 3
+    done
+    return 1
 }
 
 verify_checksum() {

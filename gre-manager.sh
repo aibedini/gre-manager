@@ -60,7 +60,7 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are validated then sourced by design
 set -uo pipefail
 
-VERSION="2.2.2"
+VERSION="2.2.3"
 
 GITHUB_REPO="aibedini/gre-manager"
 RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/gre-manager.sh"
@@ -1616,14 +1616,27 @@ self_update() {
 
     local remote_ver="" verified="no"
     # Preferred: latest pinned GitHub release, verified against its SHA-256 checksum.
-    local tag=""
-    tag="$(curl -fsSL "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null \
-        | grep -m1 '"tag_name"' | cut -d'"' -f4)"
-    if [[ -n "$tag" ]] \
-        && curl -fsSL "https://github.com/${GITHUB_REPO}/releases/download/${tag}/gre" \
+    # GitHub connectivity from some networks is flaky — retry each step once.
+    local tag="" attempt="" dl_ok=0
+    for attempt in 1 2; do
+        tag="$(curl -fsSL --max-time 20 "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null \
+            | grep -m1 '"tag_name"' | cut -d'"' -f4)"
+        if [[ -z "$tag" ]]; then
+            (( attempt == 1 )) && info "GitHub API unreachable (rate limit or network); retrying..." && sleep 3
+            continue
+        fi
+        if curl -fsSL --max-time 60 "https://github.com/${GITHUB_REPO}/releases/download/${tag}/gre" \
             -o "$tmp/gre" 2>/dev/null \
-        && curl -fsSL "https://github.com/${GITHUB_REPO}/releases/download/${tag}/gre.sha256" \
-            -o "$tmp/gre.sha256" 2>/dev/null; then
+        && curl -fsSL --max-time 60 "https://github.com/${GITHUB_REPO}/releases/download/${tag}/gre.sha256" \
+            -o "$tmp/gre.sha256" 2>/dev/null \
+        && [[ -s "$tmp/gre" && -s "$tmp/gre.sha256" ]]; then
+            dl_ok=1
+            break
+        fi
+        (( attempt == 1 )) && info "Release asset download failed; retrying..." && sleep 3
+    done
+
+    if [[ "$dl_ok" == "1" ]]; then
         if command -v sha256sum >/dev/null 2>&1; then
             if (cd "$tmp" && sha256sum -c gre.sha256 >/dev/null 2>&1); then
                 verified="yes"
@@ -1638,8 +1651,8 @@ self_update() {
         remote_ver="$(grep -m1 -E '^VERSION=' "$tmp/gre" | cut -d'"' -f2)"
     else
         # Fallback: raw main branch (no checksum possible)
-        warn "Release assets unavailable; falling back to the main branch (no checksum)."
-        if ! curl -fsSL "$RAW_URL" -o "$tmp/gre"; then
+        warn "Release assets unavailable after retries; falling back to the main branch (no checksum)."
+        if ! curl -fsSL --max-time 60 "$RAW_URL" -o "$tmp/gre"; then
             err "Download failed. Check your internet connection."
             rm -rf "$tmp"
             return 1
