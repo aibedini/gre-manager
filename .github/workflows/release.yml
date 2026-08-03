@@ -19,9 +19,10 @@ jobs:
           cp gre-manager.sh gre
           chmod +x gre
           sha256sum gre > gre.sha256
+          tar czf gre-hub.tar.gz hub/
+          sha256sum gre-hub.tar.gz > gre-hub.tar.gz.sha256
           echo "--- artifacts ---"
-          ls -la gre gre.sha256
-          cat gre.sha256
+          ls -la gre gre.sha256 gre-hub.tar.gz gre-hub.tar.gz.sha256
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
@@ -29,4 +30,6 @@ jobs:
           files: |
             gre
             gre.sha256
+            gre-hub.tar.gz
+            gre-hub.tar.gz.sha256
           generate_release_notes: true

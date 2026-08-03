@@ -60,7 +60,7 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are validated then sourced by design
 set -uo pipefail
 
-VERSION="2.2.3"
+VERSION="2.3.0"
 
 GITHUB_REPO="aibedini/gre-manager"
 RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/gre-manager.sh"
@@ -1684,6 +1684,189 @@ self_update() {
     exit 0
 }
 
+# ------------------------------------------------------------- gre-hub (web dashboard)
+HUB_DIR="/opt/gre-hub"
+HUB_SERVICE_FILE="/etc/systemd/system/gre-hub.service"
+HUB_PORT_DEFAULT=3939
+
+hub_status_text() {
+    if [[ ! -d "$HUB_DIR" ]]; then
+        echo "not installed"
+        return 0
+    fi
+    local st en
+    st="$(systemctl is-active gre-hub.service 2>/dev/null || echo inactive)"
+    en="$(systemctl is-enabled gre-hub.service 2>/dev/null || echo disabled)"
+    echo "installed ($st, $en, $HUB_DIR, port $HUB_PORT_DEFAULT)"
+}
+
+hub_ensure_node() {
+    local major=0
+    if command -v node >/dev/null 2>&1; then
+        major="$(node -v 2>/dev/null | sed 's/^v//;s/\..*//')"
+    fi
+    if [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 18 )); then
+        ok "Node.js $(node -v) found"
+        return 0
+    fi
+    info "Node.js >= 18 is required; installing Node.js 22 (NodeSource)..."
+    if command -v apt-get >/dev/null 2>&1; then
+        curl -fsSL --max-time 90 https://deb.nodesource.com/setup_22.x | bash - || return 1
+        apt-get install -y nodejs || return 1
+    elif command -v dnf >/dev/null 2>&1; then
+        curl -fsSL --max-time 90 https://rpm.nodesource.com/setup_22.x | bash - || return 1
+        dnf install -y nodejs || return 1
+    elif command -v yum >/dev/null 2>&1; then
+        curl -fsSL --max-time 90 https://rpm.nodesource.com/setup_22.x | bash - || return 1
+        yum install -y nodejs || return 1
+    else
+        err "No supported package manager found; install Node.js >= 18 manually."
+        return 1
+    fi
+    ok "Node.js $(node -v) installed"
+}
+
+hub_download() { # hub_download DEST_TGZ — tag-pinned asset, then latest release, then main tarball
+    local dest="$1" t="" u="" attempt=""
+    local -a urls=("https://github.com/${GITHUB_REPO}/releases/download/v${VERSION}/gre-hub.tar.gz")
+    t="$(curl -fsSL --max-time 20 "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null \
+        | grep -m1 '"tag_name"' | cut -d'"' -f4)"
+    [[ -n "$t" && "$t" != "v$VERSION" ]] && \
+        urls+=("https://github.com/${GITHUB_REPO}/releases/download/${t}/gre-hub.tar.gz")
+    urls+=("https://github.com/${GITHUB_REPO}/archive/refs/heads/main.tar.gz")
+    for u in "${urls[@]}"; do
+        for attempt in 1 2; do
+            info "Downloading: $u"
+            if curl -fsSL --max-time 90 "$u" -o "$dest" 2>/dev/null && [[ -s "$dest" ]]; then
+                return 0
+            fi
+            sleep 2
+        done
+    done
+    return 1
+}
+
+hub_install() {
+    require_root
+    command -v curl >/dev/null 2>&1 || { err "curl is required."; return 1; }
+    command -v ssh-keygen >/dev/null 2>&1 || warn "ssh-keygen not found (usually in openssh-client) — hub SSH keys need it."
+    hub_ensure_node || return 1
+
+    local tmp=""
+    tmp="$(mktemp -d)" || { err "mktemp failed"; return 1; }
+    if ! hub_download "$tmp/hub.tar.gz"; then
+        err "Could not download the gre-hub package."
+        rm -rf "$tmp"; return 1
+    fi
+    mkdir -p "$tmp/x"
+    tar xzf "$tmp/hub.tar.gz" -C "$tmp/x" || { err "Could not extract the package."; rm -rf "$tmp"; return 1; }
+    # release asset contains hub/; main tarball contains gre-manager-main/hub/
+    local src=""
+    [[ -f "$tmp/x/hub/package.json" ]] && src="$tmp/x/hub"
+    if [[ -z "$src" ]]; then
+        src="$(dirname "$(find "$tmp/x" -maxdepth 3 -path '*/hub/package.json' | head -1)")"
+    fi
+    [[ -n "$src" && -f "$src/package.json" ]] || { err "hub package not found in the archive."; rm -rf "$tmp"; return 1; }
+    mkdir -p "$HUB_DIR"
+    cp -a "$src/." "$HUB_DIR/"
+    rm -rf "$tmp"
+
+    info "Installing dependencies (npm)..."
+    if ! (cd "$HUB_DIR" && npm install --omit=dev --no-audit --no-fund); then
+        warn "npm install failed; installing build tools and retrying..."
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get install -y build-essential python3
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y gcc-c++ make python3
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y gcc-c++ make python3
+        fi
+        (cd "$HUB_DIR" && npm install --omit=dev --no-audit --no-fund) || { err "npm install failed."; return 1; }
+    fi
+
+    cat > "$HUB_SERVICE_FILE" <<EOF
+[Unit]
+Description=gre-hub web dashboard (gre-manager)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$HUB_DIR
+Environment=PORT=$HUB_PORT_DEFAULT HUB_HOST=127.0.0.1
+ExecStart=$(command -v node) server/index.js
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now gre-hub.service >/dev/null 2>&1 || true
+    audit_log "hub-install dir=$HUB_DIR"
+
+    echo
+    ok "gre-hub is installed and running."
+    info "On this server:   http://127.0.0.1:$HUB_PORT_DEFAULT"
+    info "From your PC:     ssh -L $HUB_PORT_DEFAULT:127.0.0.1:$HUB_PORT_DEFAULT root@<this-server-ip>"
+    info "                  then open http://127.0.0.1:$HUB_PORT_DEFAULT"
+    info "First visit: create the hub password, then enable 2FA in Settings."
+    info "Manage: gre hub [status|start|stop|restart|uninstall]"
+}
+
+hub_menu() { # gre hub [install|status|start|stop|restart|uninstall]
+    require_root
+    case "${1:-status}" in
+        install|reinstall) hub_install ;;
+        status)
+            echo "gre-hub: $(hub_status_text)"
+            if [[ -d "$HUB_DIR" ]]; then
+                systemctl status gre-hub.service --no-pager 2>/dev/null | head -n 5 || true
+            fi
+            ;;
+        start)   systemctl start gre-hub.service   && ok "gre-hub started" ;;
+        stop)    systemctl stop gre-hub.service    && ok "gre-hub stopped" ;;
+        restart) systemctl restart gre-hub.service && ok "gre-hub restarted" ;;
+        uninstall)
+            warn "This removes the gre-hub service and $HUB_DIR (including dashboard data)."
+            confirm "Continue with gre-hub uninstall?" || { info "Aborted."; return; }
+            systemctl disable --now gre-hub.service >/dev/null 2>&1 || true
+            rm -f "$HUB_SERVICE_FILE"
+            systemctl daemon-reload 2>/dev/null || true
+            rm -rf "$HUB_DIR"
+            audit_log "hub-uninstall"
+            ok "gre-hub removed."
+            ;;
+        *) err "Usage: gre hub [install|status|start|stop|restart|uninstall]"; return 1 ;;
+    esac
+}
+
+hub_settings_menu() {
+    require_root
+    local c=""
+    while true; do
+        echo
+        echo   "  ── gre-hub dashboard ─────────────────────────────────────"
+        printf '  Status: %s\n' "$(hub_status_text)"
+        echo   "  1) Install / reinstall"
+        echo   "  2) Start"
+        echo   "  3) Stop"
+        echo   "  4) Restart"
+        echo   "  5) Uninstall"
+        echo   "  0) Back"
+        read -rp "  Select: " c
+        case "$c" in
+            1) hub_install ;;
+            2) hub_menu start ;;
+            3) hub_menu stop ;;
+            4) hub_menu restart ;;
+            5) hub_menu uninstall ;;
+            0) return ;;
+            *) warn "Invalid selection." ;;
+        esac
+    done
+}
+
 # ------------------------------------------------------------- purge (scorched earth)
 purge_tunnels() { # delete EVERY gre/gretap tunnel, not just configured ones
     local name=""
@@ -2758,6 +2941,7 @@ EOF
     echo   " 11) Update gre-manager to the latest version"
     echo   " 12) Uninstall from this server"
     printf ' %s13) PURGE: remove EVERYTHING GRE (danger)%s\n' "$C_RED" "$C_RESET"
+    echo   " 14) gre-hub dashboard (web UI: install / manage)"
     echo   "  0) Exit"
     echo   "  ═════════════════════════════════════════════════════════════"
 }
@@ -2839,6 +3023,7 @@ main_menu() {
             11) self_update ;;
             12) uninstall ;;
             13) purge_all ;;
+            14) hub_settings_menu ;;
             0)  trap - INT; echo "Bye."; exit 0 ;;
             *)  warn "Invalid selection." ;;
         esac
@@ -2885,6 +3070,7 @@ Usage:
   gre purge [--yes]       remove EVERYTHING GRE-related from this server
                           (all GRE tunnels, all related iptables rules,
                           systemd units, configs, old versions' artifacts)
+  gre hub                 gre-hub web dashboard: install|status|start|stop|restart|uninstall
   gre update              self-update to the latest version
   gre --apply             bring up all configured tunnels (used by systemd)
   gre --stop              tear down all tunnels, keep config (used by systemd)
@@ -2962,6 +3148,7 @@ EOF
     import)            cli_import "${@:2}" ;;
     update)            self_update ;;
     purge)             purge_all "${@:2}" ;;
+    hub)               hub_menu "${2:-status}" ;;
     --version|-v)      echo "gre-manager v$VERSION" ;;
     --help|-h)         usage ;;
     "")                main_menu ;;

@@ -7,7 +7,7 @@ _gre() {
     COMPREPLY=()
 
     if (( COMP_CWORD == 1 )); then
-        cmds="node iran iran-setup doctor export import watchdog status update purge --status --apply --stop --version --help"
+        cmds="node iran iran-setup doctor export import watchdog status update purge hub --status --apply --stop --version --help"
         COMPREPLY=( $(compgen -W "$cmds" -- "$cur") )
         return 0
     fi
@@ -47,6 +47,9 @@ _gre() {
             ;;
         status|--status)
             COMPREPLY=( $(compgen -W "--json" -- "$cur") )
+            ;;
+        hub)
+            COMPREPLY=( $(compgen -W "install status start stop restart uninstall" -- "$cur") )
             ;;
         import)
             COMPREPLY=( $(compgen -f -X '!*.tar.gz' -- "$cur") )

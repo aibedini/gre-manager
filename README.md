@@ -170,6 +170,14 @@ sudo gre
   AES-256-GCM encrypted secrets, localhost bind
 
 ```bash
+# on any server that has gre-manager installed — installs Node.js,
+# the hub package, and a systemd service in one go:
+sudo gre hub install        # or menu option 14
+```
+
+Manual alternative:
+
+```bash
 cd hub && npm install && npm start    # http://127.0.0.1:3939
 ```
 
