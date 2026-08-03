@@ -92,15 +92,15 @@ function sanitizeParams(params) {
 }
 
 // Run one action; returns { rc, stdout, stderr, command } and logs it.
-async function runAction(db, server, secret, action, params) {
+async function runAction(db, server, secret, action, params, sshOpts = {}) {
   const builder = BUILDERS[action];
   if (!builder) throw new Error(`unknown action: ${action}`);
   const command = builder(params || {});
-  const result = await ssh.exec(server, secret, command, { timeoutMs: 300000 });
+  const result = await ssh.exec(server, secret, command, { timeoutMs: 300000, ...sshOpts });
 
   const output = [result.stdout, result.stderr].filter(Boolean).join('\n').slice(0, 20000);
   db.prepare(
-    'INSERT INTO action_log (server_id, server_name, action, params, rc, output, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    "INSERT INTO action_log (kind, server_id, server_name, action, params, rc, output, created_at) VALUES ('action', ?, ?, ?, ?, ?, ?, ?)"
   ).run(server.id, server.name, action, JSON.stringify(sanitizeParams(params)), result.rc, output, Date.now());
 
   return { ...result, command };

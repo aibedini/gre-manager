@@ -157,11 +157,17 @@ sudo gre
 
 - **Discovery over SSH** — detects the manager version, roles, nodes/peers with live reachability,
   **unmanaged GRE tunnels**, and **legacy vatanhost artifacts** on every server
+- **Automatic SSH key provisioning** — add a server with its password once; the hub creates a
+  dedicated ed25519 key, installs it, wipes the password, and uses key auth from then on
+  (delete/reinstall anytime, remote cleanup included)
+- **Server cards** — role, version, tunnels, watchdog, node/peer names with reachability,
+  legacy/unmanaged badges at a glance
 - **Central management** — add/remove nodes and peers, watchdog control, doctor, update, install,
   and typed-confirmation purge, all driven through the `gre` CLI over SSH (no agent needed)
 - **Web SSH terminal** — xterm.js terminal per server, right in the browser
-- **Secure by default** — single-user login (scrypt + sessions + rate-limit), AES-256-GCM encrypted
-  server secrets, localhost bind
+- **Heavy security** — optional TOTP 2FA + recovery codes, CSRF tokens, security headers,
+  session idle/absolute limits, login rate-limit + audit log, SSH host-key pinning (TOFU),
+  AES-256-GCM encrypted secrets, localhost bind
 
 ```bash
 cd hub && npm install && npm start    # http://127.0.0.1:3939

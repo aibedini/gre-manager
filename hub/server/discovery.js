@@ -138,8 +138,11 @@ function parseProbe(stdout) {
 }
 
 // Run the probe on a server and return the parsed snapshot.
-async function discover(server, secret) {
-  const result = await ssh.exec(server, secret, `bash -s <<'GRE_HUB_PROBE_EOF'\n${PROBE}\nGRE_HUB_PROBE_EOF`, { timeoutMs: 60000 });
+async function discover(server, secret, sshOpts = {}) {
+  const result = await ssh.exec(server, secret, `bash -s <<'GRE_HUB_PROBE_EOF'\n${PROBE}\nGRE_HUB_PROBE_EOF`, { timeoutMs: 60000, ...sshOpts });
+  if (result.hostkey_mismatch) {
+    return { hostkey_mismatch: true, presented_fp: result.presented_fp };
+  }
   if (result.rc !== 0 && !result.stdout.includes('@@BEGIN')) {
     return {
       taken_at: new Date().toISOString(),

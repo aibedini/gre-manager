@@ -22,7 +22,12 @@
         <div class="field hidden" id="auth-confirm-wrap">
           <label for="auth-confirm">Confirm password</label>
           <input type="password" id="auth-confirm" autocomplete="new-password" />
-          <div class="hint">Minimum 8 characters. Stored as a scrypt hash.</div>
+          <div class="hint">Minimum 12 characters. Stored as a scrypt hash.</div>
+        </div>
+        <div class="field hidden" id="auth-2fa-wrap">
+          <label for="auth-2fa">Two-factor code</label>
+          <input type="text" id="auth-2fa" autocomplete="one-time-code" inputmode="numeric" placeholder="123456 or a recovery code" />
+          <div class="hint">Code from your authenticator, or a one-time recovery code.</div>
         </div>
         <div class="form-error" id="auth-error"></div>
         <button type="submit" class="btn" style="width:100%; justify-content:center" id="auth-submit">Sign in</button>
@@ -38,6 +43,7 @@
         <nav class="nav">
           <button data-page="servers" class="active">Servers</button>
           <button data-page="log">Action log</button>
+          <button data-page="settings">Settings</button>
         </nav>
         <div class="spacer"></div>
         <button class="btn btn-ghost btn-sm" id="btn-logout">Log out</button>
@@ -59,11 +65,28 @@
           <div class="page-head">
             <div>
               <h2>Action log</h2>
-              <div class="sub">Last 100 actions across all servers.</div>
+              <div class="sub">Last 100 events: remote actions and hub security events.</div>
             </div>
-            <button class="btn btn-ghost btn-sm" id="btn-refresh-log">Refresh</button>
+            <div style="display:flex; gap:8px; align-items:center">
+              <div class="nav" style="margin:0" id="log-filter">
+                <button data-kind="" class="active">All</button>
+                <button data-kind="action">Actions</button>
+                <button data-kind="auth">Auth</button>
+              </div>
+              <button class="btn btn-ghost btn-sm" id="btn-refresh-log">Refresh</button>
+            </div>
           </div>
           <div id="log-table-wrap"></div>
+        </section>
+
+        <section id="page-settings" class="page hidden">
+          <div class="page-head">
+            <div>
+              <h2>Settings</h2>
+              <div class="sub">Hub password, sessions and two-factor authentication.</div>
+            </div>
+          </div>
+          <div id="settings-body" style="max-width:560px"></div>
         </section>
       </main>
     </div>

@@ -12,10 +12,21 @@ function esc(s) {
   }[c]));
 }
 
+const state = {
+  servers: [],
+  current: null,      // server object open in the drawer
+  csrf: '',
+  totpEnabled: false,
+  logKind: '',
+};
+
 async function api(path, { method = 'GET', body } = {}) {
+  const headers = {};
+  if (body) headers['Content-Type'] = 'application/json';
+  if (method !== 'GET' && state.csrf) headers['x-csrf-token'] = state.csrf;
   const res = await fetch(path, {
     method,
-    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
   let data = null;
@@ -24,7 +35,12 @@ async function api(path, { method = 'GET', body } = {}) {
     showAuth(false);
     throw new Error('not authenticated');
   }
-  if (!res.ok) throw new Error((data && data.error) || `request failed (${res.status})`);
+  if (!res.ok) {
+    const err = new Error((data && data.error) || `request failed (${res.status})`);
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
   return data;
 }
 
@@ -35,7 +51,7 @@ function toast(msg, isError = false) {
   el.classList.toggle('error', isError);
   el.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), 3200);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 3400);
 }
 
 function timeAgo(isoOrMs) {
@@ -72,12 +88,50 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeModal();
 });
 
+// ---------- host key mismatch ----------------------------------------------
+
+function showHostKeyMismatch(server, data) {
+  openModal(`
+    <h2>Host key mismatch</h2>
+    <p class="sub"><strong>${esc(server.name)}</strong> presented a different SSH host key than the one pinned.
+    This can mean a man-in-the-middle attack — or a legitimate server reinstall.</p>
+    <dl class="kv" style="margin-bottom:8px">
+      <dt>Pinned</dt><dd>${esc(data.expected_fp || '(none)')}</dd>
+      <dt>Presented</dt><dd>${esc(data.presented_fp || '(unknown)')}</dd>
+    </dl>
+    <div class="foot">
+      <button class="btn btn-ghost" id="hk-cancel">Cancel</button>
+      <button class="btn btn-danger" id="hk-accept">Accept new key (logged)</button>
+    </div>`);
+  $('#hk-cancel').addEventListener('click', closeModal);
+  $('#hk-accept').addEventListener('click', async () => {
+    if (!confirm(`Really accept the new host key for ${server.name}?\n\n${data.presented_fp}\n\nOnly proceed if you know why the key changed.`)) return;
+    try {
+      await api(`/api/servers/${server.id}/host-key/accept`, { method: 'POST', body: { fingerprint: data.presented_fp } });
+      server.host_key_fp = data.presented_fp;
+      closeModal();
+      toast('New host key accepted and pinned');
+    } catch (err) { toast(err.message, true); }
+  });
+}
+
+function handleHostKeyError(server, err) {
+  if (err.data && err.data.hostkey_mismatch) {
+    showHostKeyMismatch(server, err.data);
+    return true;
+  }
+  return false;
+}
+
 // ---------- auth ----------------------------------------------------------
 
 let authMode = 'login'; // 'login' | 'setup'
+let authNeed2fa = false;
 
 function showAuth(needsSetup) {
   authMode = needsSetup ? 'setup' : 'login';
+  authNeed2fa = false;
+  state.csrf = '';
   $('#view-main').classList.add('hidden');
   closeDrawer();
   $('#view-auth').classList.remove('hidden');
@@ -86,10 +140,12 @@ function showAuth(needsSetup) {
     ? 'First run — set the password for this hub.'
     : 'Sign in to continue.';
   $('#auth-confirm-wrap').classList.toggle('hidden', !needsSetup);
+  $('#auth-2fa-wrap').classList.add('hidden');
   $('#auth-submit').textContent = needsSetup ? 'Create password' : 'Sign in';
   $('#auth-error').textContent = '';
   $('#auth-password').value = '';
   $('#auth-confirm').value = '';
+  $('#auth-2fa').value = '';
   $('#auth-password').focus();
 }
 
@@ -104,12 +160,27 @@ $('#auth-form').addEventListener('submit', async (e) => {
         errEl.textContent = 'Passwords do not match.';
         return;
       }
-      await api('/api/setup', { method: 'POST', body: { password } });
+      const r = await api('/api/setup', { method: 'POST', body: { password } });
+      state.csrf = r.csrf;
     } else {
-      await api('/api/login', { method: 'POST', body: { password } });
+      const body = { password };
+      if (authNeed2fa) body.code = $('#auth-2fa').value.trim();
+      const r = await api('/api/login', { method: 'POST', body });
+      state.csrf = r.csrf;
     }
     enterMain();
   } catch (err) {
+    if (authMode === 'login' && err.data && err.data.requires_2fa) {
+      if (!authNeed2fa) {
+        authNeed2fa = true;
+        $('#auth-2fa-wrap').classList.remove('hidden');
+        $('#auth-2fa').focus();
+        errEl.textContent = 'Two-factor authentication is enabled — enter your code.';
+      } else {
+        errEl.textContent = err.message;
+      }
+      return;
+    }
     errEl.textContent = err.message;
   }
 });
@@ -121,35 +192,60 @@ $('#btn-logout').addEventListener('click', async () => {
 
 // ---------- navigation ----------------------------------------------------
 
-$$('.nav button').forEach((btn) => {
+$$('.nav button[data-page]').forEach((btn) => {
   btn.addEventListener('click', () => {
-    $$('.nav button').forEach((b) => b.classList.remove('active'));
+    $$('.nav button[data-page]').forEach((b) => b.classList.remove('active'));
     btn.classList.add('active');
     const page = btn.dataset.page;
     $('#page-servers').classList.toggle('hidden', page !== 'servers');
     $('#page-log').classList.toggle('hidden', page !== 'log');
+    $('#page-settings').classList.toggle('hidden', page !== 'settings');
     if (page === 'log') loadLog();
+    if (page === 'settings') renderSettings();
   });
 });
 
-function enterMain() {
+async function enterMain() {
   $('#view-auth').classList.add('hidden');
   $('#view-main').classList.remove('hidden');
+  try {
+    const me = await api('/api/me');
+    state.csrf = me.csrf;
+    state.totpEnabled = me.totp_enabled;
+  } catch { /* csrf already set from login */ }
   loadServers();
 }
 
-// ---------- state ---------------------------------------------------------
-
-const state = {
-  servers: [],
-  current: null, // server object open in the drawer
-};
-
 // ---------- servers grid --------------------------------------------------
+
+function roleInfo(snap) {
+  const roles = (snap && snap.roles) || [];
+  if (roles.includes('IRAN') && roles.includes('FOREIGN')) return { label: 'both', cls: 'blue' };
+  if (roles.includes('IRAN')) return { label: 'iran', cls: 'blue' };
+  if (roles.includes('FOREIGN')) return { label: 'foreign', cls: 'blue' };
+  return { label: 'unknown', cls: 'gray' };
+}
+
+function peerList(snap) {
+  const st = snap && snap.status;
+  if (!st) return null;
+  if (Array.isArray(st.nodes)) return st.nodes;
+  if (Array.isArray(st.iran_peers)) return st.iran_peers;
+  return null;
+}
+
+function watchdogOn(snap) {
+  const wd = snap && (snap.watchdog || (snap.status && snap.status.watchdog));
+  if (!wd) return null;
+  if (typeof wd === 'object') return wd.enabled === true || wd.enabled === 1;
+  return String(wd) === 'enabled';
+}
 
 function badgesFor(server) {
   const snap = server.snapshot;
   const out = [];
+  if (server.key_installed) out.push(['green', 'ssh key']);
+  else out.push(['gray', server.has_secret ? 'password' : 'password required']);
   if (!snap) {
     out.push(['gray', 'not discovered']);
     return out;
@@ -161,22 +257,14 @@ function badgesFor(server) {
   if (!snap.manager || !snap.manager.installed) {
     out.push(['yellow', 'no manager']);
   } else {
-    const roles = snap.roles || [];
-    let role = 'none';
-    if (roles.includes('IRAN') && roles.includes('FOREIGN')) role = 'both';
-    else if (roles.includes('IRAN')) role = 'iran';
-    else if (roles.includes('FOREIGN')) role = 'foreign';
-    out.push([role === 'none' ? 'gray' : 'blue', role]);
+    const role = roleInfo(snap);
+    out.push([role.cls, role.label]);
     if (snap.manager.version) out.push(['gray', `v${snap.manager.version}`]);
     if (snap.tunnels_up !== null && snap.tunnels_up !== undefined) {
       out.push([snap.tunnels_up > 0 ? 'green' : 'gray', `${snap.tunnels_up} up`]);
     }
-    const peers = countPeers(snap);
-    if (peers !== null) out.push(['gray', `${peers} peer${peers === 1 ? '' : 's'}`]);
-    if (snap.watchdog) {
-      const on = snap.watchdog.enabled === true || snap.watchdog.enabled === 1 || snap.watchdog === 'enabled';
-      out.push([on ? 'green' : 'gray', on ? 'watchdog' : 'no watchdog']);
-    }
+    const wd = watchdogOn(snap);
+    if (wd !== null) out.push([wd ? 'green' : 'gray', wd ? 'watchdog' : 'no watchdog']);
   }
   if (snap.legacy && snap.legacy.present) out.push(['red', 'legacy']);
   if (snap.unmanaged_tunnels && snap.unmanaged_tunnels.length) {
@@ -185,28 +273,28 @@ function badgesFor(server) {
   return out;
 }
 
-function countPeers(snap) {
-  const st = snap.status;
-  if (!st) return null;
-  if (Array.isArray(st.nodes)) return st.nodes.length;
-  if (Array.isArray(st.iran_peers)) return st.iran_peers.length;
-  return null;
-}
-
 function healthDot(server) {
   const snap = server.snapshot;
+  if (!server.has_secret && !server.key_installed) return 'err';
   if (!snap) return 'unknown';
   if (snap.error) return 'err';
   if (!snap.manager || !snap.manager.installed) return 'warn';
-  const st = snap.status;
-  if (!st) return 'unknown';
-  const lists = [st.nodes, st.iran_peers].filter(Array.isArray);
-  if (lists.length) {
-    const all = lists.flat();
-    if (all.some((n) => n.reachable === false)) return 'warn';
-    if (all.length && all.every((n) => n.reachable === true)) return 'ok';
+  const peers = peerList(snap);
+  if (peers) {
+    if (peers.some((n) => n.reachable === false)) return 'warn';
+    if (peers.length && peers.every((n) => n.reachable === true)) return 'ok';
   }
   return 'ok';
+}
+
+function peerNamesHtml(snap) {
+  const peers = peerList(snap);
+  if (!peers || !peers.length) return '';
+  const items = peers.map((p) => {
+    const cls = p.reachable === true ? 'ok' : p.reachable === false ? 'err' : 'unknown';
+    return `<span class="peer-chip"><span class="dot ${cls}"></span>${esc(p.name)}</span>`;
+  }).join('');
+  return `<div class="peer-chips">${items}</div>`;
 }
 
 function renderServers() {
@@ -222,6 +310,10 @@ function renderServers() {
       .map(([cls, label]) => `<span class="badge ${cls}">${esc(label)}</span>`)
       .join('');
     const snap = s.snapshot;
+    const peers = peerList(snap);
+    const peerLine = peers
+      ? `<div class="card-peers-title muted">${peers.length} ${snap.status.nodes ? 'iran node' : 'foreign peer'}${peers.length === 1 ? '' : 's'}</div>${peerNamesHtml(snap)}`
+      : '';
     return `
       <div class="card" style="--i:${i}" data-id="${s.id}">
         <div class="card-top">
@@ -232,14 +324,31 @@ function renderServers() {
           <span><span class="dot ${healthDot(s)}"></span></span>
         </div>
         <div class="card-badges">${badges}</div>
+        ${peerLine}
         <div class="card-foot">
           <span>${snap ? `discovered ${timeAgo(snap.taken_at)}` : 'never discovered'}</span>
-          <span class="muted">Open &rarr;</span>
+          <button class="btn btn-ghost btn-sm btn-card-discover" data-id="${s.id}">Discover</button>
         </div>
       </div>`;
   }).join('');
   $$('.card', grid).forEach((card) => {
     card.addEventListener('click', () => openDrawer(Number(card.dataset.id)));
+  });
+  $$('.btn-card-discover', grid).forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const server = state.servers.find((s) => s.id === Number(btn.dataset.id));
+      btn.disabled = true;
+      btn.textContent = '…';
+      try {
+        const snap = await api(`/api/servers/${server.id}/discover`, { method: 'POST' });
+        server.snapshot = snap;
+        toast(`Discovery complete: ${server.name}`);
+      } catch (err) {
+        if (!handleHostKeyError(server, err)) toast(err.message, true);
+      }
+      loadServers();
+    });
   });
 }
 
@@ -252,7 +361,7 @@ async function loadServers() {
       if (fresh) { state.current = fresh; renderOverview(); }
     }
   } catch (err) {
-    toast(err.message, true);
+    if (err.message !== 'not authenticated') toast(err.message, true);
   }
 }
 
@@ -260,9 +369,12 @@ async function loadServers() {
 
 function serverFormHtml(server) {
   const s = server || {};
+  const isKey = server && server.key_installed;
   return `
     <h2>${server ? 'Edit server' : 'Add server'}</h2>
-    <p class="sub">Credentials are stored AES-256-GCM encrypted.</p>
+    <p class="sub">${server
+      ? 'Credentials stay AES-256-GCM encrypted.'
+      : 'A dedicated ed25519 SSH key will be created and installed automatically; the password is used only once.'}</p>
     <form id="server-form">
       <div class="form-row">
         <div class="field"><label>Name</label><input name="name" required value="${esc(s.name || '')}" placeholder="iran-1" /></div>
@@ -271,18 +383,18 @@ function serverFormHtml(server) {
       <div class="form-row">
         <div class="field"><label>SSH port</label><input name="ssh_port" type="number" value="${s.ssh_port || 22}" /></div>
         <div class="field"><label>Username</label><input name="username" value="${esc(s.username || 'root')}" /></div>
-        <div class="field"><label>Auth</label>
-          <select name="auth_type">
-            <option value="password" ${s.auth_type === 'password' ? 'selected' : ''}>Password</option>
-            <option value="key" ${s.auth_type === 'key' ? 'selected' : ''}>Private key</option>
-          </select>
-        </div>
       </div>
-      <div class="field" id="secret-field">
-        <label>${s.auth_type === 'key' ? 'Private key (PEM)' : 'Password / key'}</label>
-        <textarea name="secret" ${server ? '' : 'required'} placeholder="${server ? 'Leave empty to keep the existing secret' : 'Password or PEM private key'}"></textarea>
-        <div class="hint">For key auth, paste the full PEM including BEGIN/END lines.</div>
+      <div class="field">
+        <label>${server ? (isKey ? 'Fallback password (optional)' : 'Password') : 'SSH password'}</label>
+        <input name="secret" type="password" ${!server && !isKey ? 'required' : ''}
+          placeholder="${server ? 'Leave empty to keep current' : 'Used once to install the hub key'}" />
+        ${isKey ? '<div class="hint">This server authenticates with the hub SSH key; a password here is stored only as a fallback.</div>' : ''}
       </div>
+      ${!server ? `
+      <div class="field" style="display:flex; gap:8px; align-items:center">
+        <input type="checkbox" id="keep-fallback" name="keep_fallback" style="width:auto" />
+        <label for="keep-fallback" style="margin:0; color:var(--text)">Keep password as fallback after key install</label>
+      </div>` : ''}
       <div class="form-error" id="server-form-error"></div>
       <div class="foot">
         ${server ? '<button type="button" class="btn btn-danger" id="btn-delete-server">Delete</button>' : ''}
@@ -296,10 +408,6 @@ function serverFormHtml(server) {
 function openServerForm(server) {
   openModal(serverFormHtml(server));
   const form = $('#server-form');
-  form.auth_type.addEventListener('change', () => {
-    $('#secret-field label').textContent =
-      form.auth_type.value === 'key' ? 'Private key (PEM)' : 'Password / key';
-  });
   $('#btn-cancel-server').addEventListener('click', closeModal);
   const delBtn = $('#btn-delete-server');
   if (delBtn) {
@@ -321,16 +429,20 @@ function openServerForm(server) {
       host: form.host.value.trim(),
       ssh_port: Number(form.ssh_port.value) || 22,
       username: form.username.value.trim() || 'root',
-      auth_type: form.auth_type.value,
     };
-    if (form.secret.value) body.secret = form.secret.value;
+    if (server) {
+      if (form.secret.value) body.secret = form.secret.value;
+    } else {
+      body.password = form.secret.value;
+      body.keep_fallback = form.keep_fallback.checked;
+    }
     try {
       if (server) {
         await api(`/api/servers/${server.id}`, { method: 'PUT', body });
         toast('Server updated');
       } else {
         await api('/api/servers', { method: 'POST', body });
-        toast('Server added — discovery running');
+        toast('Server added — installing SSH key and discovering');
       }
       closeModal();
       loadServers();
@@ -407,16 +519,32 @@ function renderOverview() {
   const snap = s.snapshot;
 
   const toolbar = `
-    <div style="display:flex; gap:8px; margin-bottom:28px">
+    <div style="display:flex; gap:8px; margin-bottom:28px; flex-wrap:wrap">
       <button class="btn btn-ghost btn-sm" id="ov-discover">Run discovery</button>
       <button class="btn btn-ghost btn-sm" id="ov-test">Test connection</button>
       <button class="btn btn-ghost btn-sm" id="ov-edit">Edit server</button>
     </div>`;
 
+  const sshSection = `
+    <div class="section"><h3>SSH access</h3>
+      <dl class="kv">
+        <dt>Auth</dt><dd>${s.key_installed ? 'hub ed25519 key' : 'password'}</dd>
+        <dt>Hub key</dt><dd>${s.key_installed ? `installed (gre-hub-${s.id})` : (s.has_secret ? 'not installed' : 'not installed — password required')}</dd>
+        <dt>Fallback password</dt><dd>${s.has_fallback_password ? 'stored (encrypted)' : 'none'}</dd>
+        <dt>Host key</dt><dd>${s.host_key_fp ? esc(s.host_key_fp) : 'not pinned yet (TOFU on first connect)'}</dd>
+      </dl>
+      <div style="display:flex; gap:8px; margin-top:14px; flex-wrap:wrap">
+        ${s.key_installed
+          ? '<button class="btn btn-ghost btn-sm" id="ov-key-reinstall">Reinstall key</button><button class="btn btn-danger btn-sm" id="ov-key-delete">Remove hub key</button>'
+          : '<button class="btn btn-ghost btn-sm" id="ov-key-reinstall">Install hub key</button>'}
+      </div>
+    </div>`;
+
+  let body = '';
   if (!snap) {
-    el.innerHTML = toolbar + '<div class="empty">No discovery data yet. Run discovery to probe this server.</div>';
+    body = '<div class="empty">No discovery data yet. Run discovery to probe this server.</div>';
   } else if (snap.error) {
-    el.innerHTML = toolbar + `
+    body = `
       <div class="section"><h3>Probe failed</h3>
       <div class="output-pane">${esc(snap.error)}</div></div>
       <div class="muted" style="font-size:12px">Last attempt ${timeAgo(snap.taken_at)}</div>`;
@@ -448,7 +576,7 @@ function renderOverview() {
         <div>${snap.unmanaged_tunnels.map((t) => `<span class="badge yellow">${esc(t)}</span>`).join(' ')}</div>
       </div>` : '';
 
-    el.innerHTML = toolbar + `
+    body = `
       <div class="section"><h3>Manager</h3>
         <dl class="kv">
           <dt>Installed</dt><dd>${snap.manager.installed ? 'yes' : 'no'}</dd>
@@ -464,8 +592,15 @@ function renderOverview() {
       ${st.nodes ? `<div class="section"><h3>Iran nodes (${st.nodes.length})</h3>${peersTable(st.nodes, 'nodes') || '<div class="empty">None</div>'}</div>` : ''}
       ${st.iran_peers ? `<div class="section"><h3>Foreign peers (${st.iran_peers.length})</h3>${peersTable(st.iran_peers, 'peers') || '<div class="empty">None</div>'}</div>` : ''}
       ${unmanagedHtml}
-      ${legacyHtml}`;
+      ${legacyHtml}
+      <div class="section"><h3>Raw snapshot</h3>
+        <details><summary class="muted" style="cursor:pointer; font-size:12px">Full JSON</summary>
+          <div class="output-pane" style="margin-top:10px; max-height:300px">${esc(JSON.stringify(snap, null, 2))}</div>
+        </details>
+      </div>`;
   }
+
+  el.innerHTML = toolbar + sshSection + body;
 
   $('#ov-discover').addEventListener('click', async () => {
     const btn = $('#ov-discover');
@@ -476,7 +611,10 @@ function renderOverview() {
       renderOverview();
       loadServers();
       toast('Discovery complete');
-    } catch (err) { toast(err.message, true); btn.disabled = false; btn.textContent = 'Run discovery'; }
+    } catch (err) {
+      if (!handleHostKeyError(s, err)) toast(err.message, true);
+      btn.disabled = false; btn.textContent = 'Run discovery';
+    }
   });
   $('#ov-test').addEventListener('click', async () => {
     const btn = $('#ov-test');
@@ -484,10 +622,45 @@ function renderOverview() {
     try {
       const r = await api(`/api/servers/${s.id}/test`, { method: 'POST' });
       toast(r.ok ? 'Connection OK' : `Connection failed: ${r.stderr || `rc=${r.rc}`}`, !r.ok);
-    } catch (err) { toast(err.message, true); }
+    } catch (err) {
+      if (!handleHostKeyError(s, err)) toast(err.message, true);
+    }
     btn.disabled = false; btn.textContent = 'Test connection';
   });
   $('#ov-edit').addEventListener('click', () => openServerForm(s));
+
+  const reinstallBtn = $('#ov-key-reinstall');
+  if (reinstallBtn) {
+    reinstallBtn.addEventListener('click', async () => {
+      if (!s.has_secret && !s.key_installed) {
+        toast('Set a password first (Edit server) so the hub can connect once to install the key', true);
+        return;
+      }
+      reinstallBtn.disabled = true;
+      reinstallBtn.textContent = 'Working…';
+      try {
+        await api(`/api/servers/${s.id}/key/reinstall`, { method: 'POST' });
+        toast('SSH key installed and verified');
+        loadServers();
+      } catch (err) {
+        if (!handleHostKeyError(s, err)) toast(err.message, true);
+      }
+      reinstallBtn.disabled = false;
+      reinstallBtn.textContent = s.key_installed ? 'Reinstall key' : 'Install hub key';
+    });
+  }
+  const deleteKeyBtn = $('#ov-key-delete');
+  if (deleteKeyBtn) {
+    deleteKeyBtn.addEventListener('click', async () => {
+      if (!confirm(`Remove the hub SSH key from ${s.name}?\n\nThe gre-hub-${s.id} line is deleted from authorized_keys and the local key is destroyed.`)) return;
+      if (!confirm('Second confirmation: the hub will need a password to connect afterwards. Continue?')) return;
+      try {
+        const r = await api(`/api/servers/${s.id}/key/delete`, { method: 'POST' });
+        toast(r.password_required ? 'Key removed — password required on next connect' : 'Key removed — fallback password restored');
+        loadServers();
+      } catch (err) { toast(err.message, true); }
+    });
+  }
 }
 
 // ---------- actions tab ---------------------------------------------------
@@ -571,6 +744,10 @@ async function executeAction(action, params = {}) {
     setActionOutput(`$ ${r.command}\n(exit ${r.rc})\n\n${out || '(no output)'}`);
     loadServers(); // snapshot may have been refreshed
   } catch (err) {
+    if (handleHostKeyError(s, err)) {
+      setActionOutput(`$ ${action}\n\nAborted: host key mismatch — see the warning dialog.`);
+      return;
+    }
     setActionOutput(`$ ${action}\n\nError: ${err.message}`);
   }
 }
@@ -729,24 +906,35 @@ $('#btn-term-reconnect').addEventListener('click', () => {
 
 // ---------- action log page ----------------------------------------------
 
+$$('#log-filter button').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    $$('#log-filter button').forEach((b) => b.classList.remove('active'));
+    btn.classList.add('active');
+    state.logKind = btn.dataset.kind;
+    loadLog();
+  });
+});
+
 async function loadLog() {
   const wrap = $('#log-table-wrap');
   try {
-    const rows = await api('/api/actions');
+    const rows = await api(`/api/actions${state.logKind ? `?kind=${state.logKind}` : ''}`);
     if (!rows.length) {
-      wrap.innerHTML = '<div class="empty">No actions recorded yet.</div>';
+      wrap.innerHTML = '<div class="empty">No events recorded yet.</div>';
       return;
     }
     wrap.innerHTML = `
       <table class="data">
-        <thead><tr><th>When</th><th>Server</th><th>Action</th><th>Params</th><th>Exit</th></tr></thead>
+        <thead><tr><th>When</th><th>Type</th><th>Server</th><th>Event</th><th>Params</th><th>Exit</th><th>Details</th></tr></thead>
         <tbody>${rows.map((r) => `
           <tr>
             <td>${timeAgo(r.created_at)}</td>
+            <td><span class="badge ${r.kind === 'auth' ? 'blue' : 'gray'}">${esc(r.kind)}</span></td>
             <td>${esc(r.server_name)}</td>
             <td>${esc(r.action)}</td>
             <td>${esc(r.params || '')}</td>
             <td>${r.rc === 0 ? '<span class="badge green">0</span>' : `<span class="badge red">${esc(r.rc)}</span>`}</td>
+            <td class="muted">${esc((r.output || '').slice(0, 120))}</td>
           </tr>`).join('')}
         </tbody>
       </table>`;
@@ -756,6 +944,148 @@ async function loadLog() {
 }
 
 $('#btn-refresh-log').addEventListener('click', loadLog);
+
+// ---------- settings page --------------------------------------------------
+
+function renderSettings() {
+  const el = $('#settings-body');
+  el.innerHTML = `
+    <div class="section">
+      <h3>Change hub password</h3>
+      <form id="pw-form">
+        <div class="field"><label>Current password</label><input type="password" name="current" required autocomplete="current-password" /></div>
+        <div class="field"><label>New password (min 12 chars)</label><input type="password" name="next" required autocomplete="new-password" /></div>
+        <div class="field"><label>Confirm new password</label><input type="password" name="confirm" required autocomplete="new-password" /></div>
+        <div class="form-error" id="pw-error"></div>
+        <button type="submit" class="btn">Change password</button>
+        <div class="hint" style="margin-top:8px">All other sessions are signed out.</div>
+      </form>
+    </div>
+    <div class="section">
+      <h3>Two-factor authentication</h3>
+      <p class="muted" style="font-size:13px; margin-bottom:14px">
+        Status: ${state.totpEnabled
+          ? '<span class="badge green">enabled</span>'
+          : '<span class="badge gray">disabled</span>'}
+      </p>
+      ${state.totpEnabled
+        ? '<button class="btn btn-danger btn-sm" id="btn-2fa-disable">Disable 2FA</button>'
+        : '<button class="btn btn-ghost btn-sm" id="btn-2fa-enable">Enable TOTP 2FA</button>'}
+    </div>
+    <div class="section">
+      <h3>Sessions</h3>
+      <p class="muted" style="font-size:13px; margin-bottom:14px">Sessions expire after 1 hour idle and 12 hours maximum. Sign out everywhere except this browser:</p>
+      <button class="btn btn-ghost btn-sm" id="btn-logout-all">Log out all other sessions</button>
+    </div>`;
+
+  $('#pw-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    const errEl = $('#pw-error');
+    errEl.textContent = '';
+    if (form.next.value !== form.confirm.value) {
+      errEl.textContent = 'New passwords do not match.';
+      return;
+    }
+    try {
+      await api('/api/password', { method: 'POST', body: { current: form.current.value, next: form.next.value } });
+      form.reset();
+      toast('Password changed — other sessions signed out');
+    } catch (err) { errEl.textContent = err.message; }
+  });
+
+  $('#btn-logout-all').addEventListener('click', async () => {
+    try {
+      await api('/api/logout-all', { method: 'POST' });
+      toast('All other sessions signed out');
+    } catch (err) { toast(err.message, true); }
+  });
+
+  const enableBtn = $('#btn-2fa-enable');
+  if (enableBtn) enableBtn.addEventListener('click', open2faEnable);
+  const disableBtn = $('#btn-2fa-disable');
+  if (disableBtn) disableBtn.addEventListener('click', open2faDisable);
+}
+
+async function open2faEnable() {
+  let setup;
+  try {
+    setup = await api('/api/2fa/setup', { method: 'POST' });
+  } catch (err) { toast(err.message, true); return; }
+  openModal(`
+    <h2>Enable two-factor authentication</h2>
+    <p class="sub">Add this key to any TOTP authenticator (Aegis, Bitwarden, 1Password, …), then enter the 6-digit code.</p>
+    <div class="field">
+      <label>Manual entry key</label>
+      <div class="output-pane" style="max-height:none; user-select:all">${esc(setup.secret)}</div>
+    </div>
+    <div class="field">
+      <label>otpauth URI</label>
+      <div class="output-pane" style="max-height:80px; user-select:all; font-size:11px">${esc(setup.uri)}</div>
+    </div>
+    <form id="2fa-enable-form">
+      <div class="field"><label>Code from authenticator</label><input name="code" required inputmode="numeric" autocomplete="one-time-code" placeholder="123456" /></div>
+      <div class="form-error" id="2fa-enable-error"></div>
+      <div class="foot">
+        <button type="button" class="btn btn-ghost" id="btn-cancel-2fa">Cancel</button>
+        <button type="submit" class="btn">Activate 2FA</button>
+      </div>
+    </form>`);
+  $('#btn-cancel-2fa').addEventListener('click', closeModal);
+  $('#2fa-enable-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      const r = await api('/api/2fa/enable', { method: 'POST', body: { code: e.target.code.value.trim() } });
+      state.totpEnabled = true;
+      showRecoveryCodes(r.recovery_codes);
+    } catch (err) {
+      $('#2fa-enable-error').textContent = err.message;
+    }
+  });
+}
+
+function showRecoveryCodes(codes) {
+  openModal(`
+    <h2>Recovery codes</h2>
+    <p class="sub">Each code works once, together with your password. Store them somewhere safe — they are shown only now.</p>
+    <div class="output-pane" style="max-height:none; user-select:all">${codes.map(esc).join('\n')}</div>
+    <div class="foot">
+      <button class="btn" id="btn-codes-saved">I saved these codes</button>
+    </div>`);
+  $('#btn-codes-saved').addEventListener('click', () => {
+    closeModal();
+    renderSettings();
+    toast('Two-factor authentication enabled');
+  });
+}
+
+function open2faDisable() {
+  openModal(`
+    <h2>Disable two-factor authentication</h2>
+    <p class="sub">Confirm with your hub password and a current code (or recovery code).</p>
+    <form id="2fa-disable-form">
+      <div class="field"><label>Password</label><input type="password" name="password" required autocomplete="current-password" /></div>
+      <div class="field"><label>Two-factor code</label><input name="code" required inputmode="numeric" autocomplete="one-time-code" /></div>
+      <div class="form-error" id="2fa-disable-error"></div>
+      <div class="foot">
+        <button type="button" class="btn btn-ghost" id="btn-cancel-2fad">Cancel</button>
+        <button type="submit" class="btn btn-danger">Disable 2FA</button>
+      </div>
+    </form>`);
+  $('#btn-cancel-2fad').addEventListener('click', closeModal);
+  $('#2fa-disable-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try {
+      await api('/api/2fa/disable', { method: 'POST', body: { password: e.target.password.value, code: e.target.code.value.trim() } });
+      state.totpEnabled = false;
+      closeModal();
+      renderSettings();
+      toast('Two-factor authentication disabled');
+    } catch (err) {
+      $('#2fa-disable-error').textContent = err.message;
+    }
+  });
+}
 
 // ---------- boot ----------------------------------------------------------
 
@@ -767,7 +1097,9 @@ $('#btn-refresh-log').addEventListener('click', loadLog);
       return;
     }
     try {
-      await api('/api/me');
+      const me = await api('/api/me');
+      state.csrf = me.csrf;
+      state.totpEnabled = me.totp_enabled;
       enterMain();
     } catch {
       showAuth(false);
