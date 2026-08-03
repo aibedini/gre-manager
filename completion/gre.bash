@@ -24,7 +24,7 @@ _gre() {
             if (( COMP_CWORD == 2 )); then
                 COMPREPLY=( $(compgen -W "peer" -- "$cur") )
             elif (( COMP_CWORD == 3 )); then
-                COMPREPLY=( $(compgen -W "list add remove apply" -- "$cur") )
+                COMPREPLY=( $(compgen -W "list add remove apply suggest" -- "$cur") )
             elif (( COMP_CWORD >= 4 )); then
                 case "${COMP_WORDS[3]}" in
                     add)
@@ -33,7 +33,7 @@ _gre() {
                     remove|apply)
                         COMPREPLY=( $(compgen -W "--name --yes" -- "$cur") )
                         ;;
-                    list)
+                    list|suggest)
                         COMPREPLY=( $(compgen -W "--json" -- "$cur") )
                         ;;
                 esac

@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.0] - 2026-08-03
+
+### Added
+- **`gre iran peer suggest [--json]`** — prints collision-free suggested values
+  for a new foreign peer: generic free name, next subnet base, index, GRE key,
+  and free TCP/UDP ports (skipping ports/ranges used by other peers and local
+  listeners). Powers the "Suggest" auto-fill button in gre-hub's
+  Peer-add / Configure-as-IRAN forms.
+
 ## [2.6.1] - 2026-08-03
 
 ### Fixed
@@ -344,3 +353,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [2.5.0]: https://github.com/aibedini/gre-manager/releases/tag/v2.5.0
 [2.6.0]: https://github.com/aibedini/gre-manager/releases/tag/v2.6.0
 [2.6.1]: https://github.com/aibedini/gre-manager/releases/tag/v2.6.1
+[2.7.0]: https://github.com/aibedini/gre-manager/releases/tag/v2.7.0

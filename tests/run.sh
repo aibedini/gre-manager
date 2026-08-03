@@ -156,6 +156,13 @@ assert "hub status says not installed" grep -q "not installed" <<< "$GRE_OUT"
 gre hub bogus;     assert_not "hub bogus subcommand fails" test "$GRE_RC" -eq 0
 gre hub domain "bad_domain!"; assert_not "hub domain invalid fails" test "$GRE_RC" -eq 0
 gre hub unexpose;  assert "hub unexpose rc=0 on fresh" test "$GRE_RC" -eq 0
+gre iran peer suggest; assert "peer suggest rc=0 on fresh" test "$GRE_RC" -eq 0
+assert "fresh suggest base 10.200" grep -q "10.200" <<< "$GRE_OUT"
+gre iran peer suggest --json; assert "peer suggest --json rc=0" test "$GRE_RC" -eq 0
+json_valid "peer suggest JSON valid"
+json_check "fresh suggest values" \
+  'assert d["subnet_base"]=="10.200" and d["idx"]==1 and d["key"]==1001 and d["tcp_port"]=="3001"' \
+  '"subnet_base":"10.200"'
 gre export "$WORK/exp.tar.gz" --yes; assert "export with no config writes empty backup (rc=0 with --yes)" test "$GRE_RC" -eq 0
 gre import;        assert_not "import without file fails" test "$GRE_RC" -eq 0
 gre bogus-command; assert_not "unknown command fails" test "$GRE_RC" -eq 0
@@ -586,6 +593,10 @@ assert "wizard wrote peer conf" test -f "$R/etc/multi-gre/foreigns/nl1.conf"
 assert "wizard suggested next base 10.201" grep -qx "SUBNET_BASE=10.201" "$R/etc/multi-gre/foreigns/nl1.conf"
 assert "wizard suggested free tcp port 3002" grep -qx "TCP_PORTS=3002" "$R/etc/multi-gre/foreigns/nl1.conf"
 assert "wizard suggested free udp port 3002" grep -qx "UDP_PORTS=3002" "$R/etc/multi-gre/foreigns/nl1.conf"
+gre iran peer suggest --json
+json_check "suggest skips used bases and ports" \
+  'assert d["subnet_base"]=="10.202" and d["tcp_port"]=="3003"' \
+  '"subnet_base":"10.202"'
 rm -rf "$R"
 
 # ======================================================================

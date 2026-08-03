@@ -62,7 +62,7 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are validated then sourced by design
 set -uo pipefail
 
-VERSION="2.6.1"
+VERSION="2.7.0"
 
 GITHUB_REPO="aibedini/gre-manager"
 RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/gre-manager.sh"
@@ -2492,6 +2492,50 @@ iran_peers_json() { # prints the iran_peers JSON array (pings each peer once)
     printf '%s' "$out"
 }
 
+cli_iran_peer_suggest() { # gre iran peer suggest [--json] — collision-free values for a new peer
+    local json=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)     json=1; shift ;;
+            --help|-h)  echo "Usage: gre iran peer suggest [--json]"; return 0 ;;
+            *)          err "Unknown option: $1"; err "Usage: gre iran peer suggest [--json]"; return 1 ;;
+        esac
+    done
+
+    local s_base="" s_idx="" s_key="" s_tcp="" s_udp="" s_name=""
+    s_base="$(next_free_subnet_base)" || { err "No free subnet base left (pool exhausted)"; return 1; }
+    s_idx="$(next_free_peer_idx "$s_base")" || { err "No free tunnel index left in $s_base"; return 1; }
+    s_key=$(( 1000 + s_idx ))
+    s_tcp="$(suggest_free_port tcp)" || s_tcp=""
+    s_udp="$(suggest_free_port udp)" || s_udp=""
+
+    # first free generic name irNN (rename freely — it must match the FOREIGN side)
+    local f existing=" " n=""
+    for f in "$FOREIGNS_DIR"/*.conf; do
+        [[ -e "$f" ]] || continue
+        n="$(grep -E '^NAME=' "$f" | cut -d= -f2)"
+        [[ -n "$n" ]] && existing+="$n "
+    done
+    local i
+    for (( i = 1; i <= 99; i++ )); do
+        n="$(printf 'ir%02d' "$i")"
+        if [[ "$existing" != *" $n "* ]]; then s_name="$n"; break; fi
+    done
+
+    if (( json )); then
+        printf '{"name":"%s","subnet_base":"%s","idx":%s,"key":%s,"tcp_port":"%s","udp_port":"%s"}\n' \
+            "$s_name" "$s_base" "$s_idx" "$s_key" "$s_tcp" "$s_udp"
+    else
+        echo "Suggested values for a new foreign peer (collision-free with existing config):"
+        printf '  name        : %s  (must match the FOREIGN node name)\n' "$s_name"
+        printf '  subnet base : %s\n' "$s_base"
+        printf '  index       : %s\n' "$s_idx"
+        printf '  GRE key     : %s\n' "$s_key"
+        printf '  TCP port    : %s\n' "${s_tcp:-none}"
+        printf '  UDP port    : %s\n' "${s_udp:-none}"
+    fi
+}
+
 cli_iran_peer_list() { # gre iran peer list [--json]
     local json=0
     while [[ $# -gt 0 ]]; do
@@ -3299,6 +3343,9 @@ Usage:
                           remove an Iran node from FOREIGN
   gre iran peer list [--json]
                           list foreign peers this Iran connects to
+  gre iran peer suggest [--json]
+                          print collision-free suggested values for a new peer
+                          (name, subnet base, index, GRE key, TCP/UDP ports)
   gre iran peer add --name NAME --foreign-ip IP [--iran-ip IP] [--subnet-base A.B]
                     [--idx N] [--key K] [--wan IFACE] [--tcp-ports LIST]
                     [--udp-ports LIST] [--mss-clamp on|off] [--yes]
@@ -3374,10 +3421,12 @@ EOF
                     add)     cli_iran_peer_add "${@:4}" ;;
                     remove)  cli_iran_peer_remove "${@:4}" ;;
                     apply)   cli_iran_peer_apply "${@:4}" ;;
+                    suggest) cli_iran_peer_suggest "${@:4}" ;;
                     --help|-h)
                         cat <<'EOF'
 Usage:
   gre iran peer list [--json]
+  gre iran peer suggest [--json]
   gre iran peer add --name NAME --foreign-ip IP [--iran-ip IP] [--subnet-base A.B]
                     [--idx N] [--key K] [--wan IFACE] [--tcp-ports LIST]
                     [--udp-ports LIST] [--mss-clamp on|off] [--yes]
