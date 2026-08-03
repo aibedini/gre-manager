@@ -676,6 +676,22 @@ const SIMPLE_ACTIONS = [
 ];
 
 const FORM_ACTIONS = [
+  { id: 'setup_foreign', label: 'Configure as FOREIGN', desc: 'First-time FOREIGN setup (requires gre >= 2.6.0)', fields: [
+    { name: 'foreign_ip', label: 'Foreign IP (optional)' },
+    { name: 'gre_whitelist', label: 'GRE whitelist', type: 'select', options: [['', 'default (on)'], ['on', 'on'], ['off', 'off']] },
+    { name: 'icmp_drop', label: 'ICMP drop', type: 'select', options: [['', 'default (off)'], ['on', 'on'], ['off', 'off']] },
+    { name: 'downtime', label: 'Downtime tolerance, minutes (default 2)', type: 'number' },
+  ] },
+  { id: 'setup_iran', label: 'Configure as IRAN', desc: 'First-time IRAN setup — creates the first foreign peer', fields: [
+    { name: 'foreign_ip', label: 'Foreign IP', required: true },
+    { name: 'name', label: 'Peer name (optional)' },
+    { name: 'idx', label: 'Index (optional)', type: 'number' },
+    { name: 'key', label: 'GRE key (optional)' },
+    { name: 'subnet_base', label: 'Subnet base, e.g. 10.9 (optional)' },
+    { name: 'tcp_ports', label: 'TCP ports list (optional)' },
+    { name: 'udp_ports', label: 'UDP ports list (optional)' },
+    { name: 'downtime', label: 'Downtime tolerance, minutes (default 2)', type: 'number' },
+  ] },
   { id: 'watchdog_interval', label: 'Watchdog: interval', desc: 'Set check interval (1-60 min)', fields: [
     { name: 'interval', label: 'Interval (minutes)', type: 'number', required: true },
   ] },
@@ -741,7 +757,8 @@ async function executeAction(action, params = {}) {
   try {
     const r = await api(`/api/servers/${s.id}/action`, { method: 'POST', body: { action, params } });
     const out = [r.stdout, r.stderr].filter(Boolean).join('\n').trim();
-    setActionOutput(`$ ${r.command}\n(exit ${r.rc})\n\n${out || '(no output)'}`);
+    const hintLine = r.hint ? `\n\nHint: ${r.hint}` : '';
+    setActionOutput(`$ ${r.command}\n(exit ${r.rc})\n\n${out || '(no output)'}${hintLine}`);
     loadServers(); // snapshot may have been refreshed
   } catch (err) {
     if (handleHostKeyError(s, err)) {
@@ -758,11 +775,21 @@ function runSimpleAction(def) {
 }
 
 function openActionForm(def) {
-  const fields = def.fields.map((f) => `
+  const fields = def.fields.map((f) => {
+    if (f.type === 'select') {
+      const opts = (f.options || []).map(([v, label]) => `<option value="${esc(v)}">${esc(label)}</option>`).join('');
+      return `
+    <div class="field">
+      <label>${esc(f.label)}</label>
+      <select name="${f.name}" ${f.required ? 'required' : ''}>${opts}</select>
+    </div>`;
+    }
+    return `
     <div class="field">
       <label>${esc(f.label)}</label>
       <input name="${f.name}" ${f.required ? 'required' : ''} type="${f.type || 'text'}" />
-    </div>`).join('');
+    </div>`;
+  }).join('');
   openModal(`
     <h2>${esc(def.label)}</h2>
     <p class="sub">${esc(def.desc)}</p>

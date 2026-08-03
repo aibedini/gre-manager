@@ -41,17 +41,19 @@ function makeSshOpts(db, cryptKey) {
     hostKey: {
       expected: server.host_key_fp || null,
       onNew: (fp) => {
-        db.prepare('UPDATE servers SET host_key_fp = ? WHERE id = ?').run(fp, server.id);
-        server.host_key_fp = fp;
-        audit(db, {
-          kind: 'auth',
-          serverId: server.id,
-          serverName: server.name,
-          action: 'host_key_pin',
-          params: { fingerprint: fp },
-          rc: 0,
-          output: 'pinned on first connect (TOFU)',
-        });
+        try {
+          db.prepare('UPDATE servers SET host_key_fp = ? WHERE id = ?').run(fp, server.id);
+          server.host_key_fp = fp;
+          audit(db, {
+            kind: 'auth',
+            serverId: server.id,
+            serverName: server.name,
+            action: 'host_key_pin',
+            params: { fingerprint: fp },
+            rc: 0,
+            output: 'pinned on first connect (TOFU)',
+          });
+        } catch { /* server row deleted mid-connect */ }
       },
     },
     fallbackPassword: server.password_enc ? decrypt(cryptKey, server.password_enc) : null,
@@ -65,8 +67,13 @@ function createRouter(db, cryptKey, dataDir) {
   const wrap = (fn) => (req, res) =>
     Promise.resolve(fn(req, res)).catch((err) => res.status(500).json({ error: err.message }));
 
-  const auditEvent = (serverId, serverName, action, params, rc = 0, output = '', kind = 'auth') =>
-    audit(db, { kind, serverId, serverName, action, params, rc, output });
+  // Audit must never crash the process: async provisioning/discovery can
+  // outlive a deleted server row, making server_id a dangling FK.
+  const auditEvent = (serverId, serverName, action, params, rc = 0, output = '', kind = 'auth') => {
+    try {
+      audit(db, { kind, serverId, serverName, action, params, rc, output });
+    } catch { /* referenced server already deleted */ }
+  };
 
   const getSetting = (key) => {
     const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
@@ -406,7 +413,13 @@ function createRouter(db, cryptKey, dataDir) {
           .then((snap) => { if (!snap.hostkey_mismatch) saveSnapshot(server.id, snap); })
           .catch(() => {});
       }
-      res.json({ ok: result.rc === 0, rc: result.rc, stdout: result.stdout, stderr: result.stderr, command: result.command });
+      // gre prints "Unknown argument" when the CLI is older than the action
+      // requires (e.g. foreign-setup needs >= 2.6.0) — surface a clear hint.
+      const combined = `${result.stdout || ''}\n${result.stderr || ''}`;
+      const hint = result.rc !== 0 && /Unknown argument/i.test(combined)
+        ? 'remote gre is too old for this action; run the \'update\' action first'
+        : undefined;
+      res.json({ ok: result.rc === 0, rc: result.rc, stdout: result.stdout, stderr: result.stderr, command: result.command, ...(hint ? { hint } : {}) });
     } catch (err) {
       res.status(400).json({ error: err.message });
     }

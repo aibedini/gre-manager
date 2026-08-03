@@ -126,6 +126,44 @@ async function main() {
     r = await anon.call('/api/servers');
     check('GET /api/servers → empty list', r.status === 200 && Array.isArray(r.data) && r.data.length === 0);
 
+    console.log('setup_foreign / setup_iran actions:');
+    r = await anon.call('/api/servers', {
+      method: 'POST',
+      body: { name: 'dummy', host: '127.0.0.1', ssh_port: 2, username: 'root', password: 'dummy-password' },
+    });
+    check('add dummy server → 201', r.status === 201);
+    const dummyId = r.data && r.data.id;
+
+    r = await anon.call(`/api/servers/${dummyId}/action`, { method: 'POST', body: { action: 'setup_iran', params: {} } });
+    check('setup_iran without foreign_ip → 400', r.status === 400);
+
+    r = await anon.call(`/api/servers/${dummyId}/action`, { method: 'POST', body: { action: 'setup_iran', params: { foreign_ip: 'not-an-ip' } } });
+    check('setup_iran with bad IPv4 → 400', r.status === 400);
+
+    r = await anon.call(`/api/servers/${dummyId}/action`, { method: 'POST', body: { action: 'setup_foreign', params: { gre_whitelist: 'maybe' } } });
+    check('setup_foreign with bad enum → 400', r.status === 400);
+
+    r = await anon.call(`/api/servers/${dummyId}/action`, { method: 'POST', body: { action: 'setup_foreign', params: { downtime: 5000 } } });
+    check('setup_foreign with out-of-range downtime → 400', r.status === 400);
+
+    r = await anon.call(`/api/servers/${dummyId}/action`, { method: 'POST', body: { action: 'setup_iran', params: { foreign_ip: '1.2.3.4', name: 'peer1', idx: 3, key: '1001', subnet_base: '10.9', tcp_ports: '80,443', udp_ports: '53', downtime: 5 } } });
+    check('setup_iran valid → reaches SSH, correct command',
+      r.status === 200 &&
+      r.data.command === `gre iran-setup --foreign-ip '1.2.3.4' --name 'peer1' --idx 3 --key '1001' --subnet-base '10.9' --tcp-ports '80,443' --udp-ports '53' --downtime 5 --yes`,
+      r.data && r.data.command);
+
+    r = await anon.call(`/api/servers/${dummyId}/action`, { method: 'POST', body: { action: 'setup_foreign', params: {} } });
+    check('setup_foreign defaults → bare command', r.status === 200 && r.data.command === 'gre foreign-setup --yes', r.data && r.data.command);
+
+    r = await anon.call(`/api/servers/${dummyId}/action`, { method: 'POST', body: { action: 'setup_foreign', params: { foreign_ip: '2.3.4.5', gre_whitelist: 'off', icmp_drop: 'on', downtime: 10 } } });
+    check('setup_foreign full params → correct command',
+      r.status === 200 &&
+      r.data.command === `gre foreign-setup --foreign-ip '2.3.4.5' --gre-whitelist off --icmp-drop on --downtime 10 --yes`,
+      r.data && r.data.command);
+
+    r = await anon.call(`/api/servers/${dummyId}`, { method: 'DELETE' });
+    check('delete dummy server → 200', r.status === 200);
+
     r = await anon.call('/api/definitely-not-a-route');
     check('unknown /api route → 404 JSON', r.status === 404 && r.data && r.data.error === 'not found');
 

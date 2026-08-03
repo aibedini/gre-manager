@@ -53,8 +53,12 @@ Configuration via environment variables:
   warnings, and a per-card Discover button.
 - **Actions** — allowlisted, non-interactive (`--yes`) commands executed over SSH
   with captured output: install, update, doctor, restart all, watchdog control,
-  node add/remove (FOREIGN), peer add/remove/apply (IRAN), export, and purge
-  (requires typing `PURGE`). Every run is recorded in the action log (params with
+  first-time role setup (`setup_foreign` → `gre foreign-setup`, needs gre >=
+  2.6.0; `setup_iran` → `gre iran-setup`, creates the first peer — both refuse
+  when the server is already configured), node add/remove (FOREIGN), peer
+  add/remove/apply (IRAN), export, and purge (requires typing `PURGE`). When a
+  remote gre is too old for an action, the hub appends a hint to run the
+  `update` action first. Every run is recorded in the action log (params with
   secrets masked).
 - **Terminal** — full SSH shell in the browser (xterm.js), bridged over a
   WebSocket authenticated by a short-lived one-time ticket.
