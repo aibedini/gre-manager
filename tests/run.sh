@@ -149,6 +149,8 @@ gre watchdog bogus; assert_not "watchdog bogus fails" test "$GRE_RC" -eq 0
 gre hub status;    assert "hub status rc=0 on fresh" test "$GRE_RC" -eq 0
 assert "hub status says not installed" grep -q "not installed" <<< "$GRE_OUT"
 gre hub bogus;     assert_not "hub bogus subcommand fails" test "$GRE_RC" -eq 0
+gre hub domain "bad_domain!"; assert_not "hub domain invalid fails" test "$GRE_RC" -eq 0
+gre hub unexpose;  assert "hub unexpose rc=0 on fresh" test "$GRE_RC" -eq 0
 gre export "$WORK/exp.tar.gz" --yes; assert "export with no config writes empty backup (rc=0 with --yes)" test "$GRE_RC" -eq 0
 gre import;        assert_not "import without file fails" test "$GRE_RC" -eq 0
 gre bogus-command; assert_not "unknown command fails" test "$GRE_RC" -eq 0

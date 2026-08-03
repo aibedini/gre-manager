@@ -173,6 +173,10 @@ sudo gre
 # on any server that has gre-manager installed — installs Node.js,
 # the hub package, and a systemd service in one go:
 sudo gre hub install        # or menu option 14
+
+# expose it on the web with free HTTPS (auto-installs Caddy):
+sudo gre hub domain hub.example.com
+# undo:  sudo gre hub unexpose
 ```
 
 Manual alternative:

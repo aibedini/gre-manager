@@ -49,7 +49,7 @@ _gre() {
             COMPREPLY=( $(compgen -W "--json" -- "$cur") )
             ;;
         hub)
-            COMPREPLY=( $(compgen -W "install status start stop restart uninstall" -- "$cur") )
+            COMPREPLY=( $(compgen -W "install status start stop restart domain unexpose uninstall" -- "$cur") )
             ;;
         import)
             COMPREPLY=( $(compgen -f -X '!*.tar.gz' -- "$cur") )

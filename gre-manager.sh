@@ -60,7 +60,7 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are validated then sourced by design
 set -uo pipefail
 
-VERSION="2.3.0"
+VERSION="2.4.0"
 
 GITHUB_REPO="aibedini/gre-manager"
 RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/gre-manager.sh"
@@ -1812,6 +1812,12 @@ EOF
     info "                  then open http://127.0.0.1:$HUB_PORT_DEFAULT"
     info "First visit: create the hub password, then enable 2FA in Settings."
     info "Manage: gre hub [status|start|stop|restart|uninstall]"
+    echo
+    if confirm "Set up web access with a domain + free HTTPS now?"; then
+        hub_expose || true
+    else
+        info "Later: gre hub domain  (or menu -> gre-hub -> option 5)"
+    fi
 }
 
 hub_menu() { # gre hub [install|status|start|stop|restart|uninstall]
@@ -1827,6 +1833,8 @@ hub_menu() { # gre hub [install|status|start|stop|restart|uninstall]
         start)   systemctl start gre-hub.service   && ok "gre-hub started" ;;
         stop)    systemctl stop gre-hub.service    && ok "gre-hub stopped" ;;
         restart) systemctl restart gre-hub.service && ok "gre-hub restarted" ;;
+        domain)    hub_expose "${2:-}" ;;
+        unexpose)  hub_unexpose ;;
         uninstall)
             warn "This removes the gre-hub service and $HUB_DIR (including dashboard data)."
             confirm "Continue with gre-hub uninstall?" || { info "Aborted."; return; }
@@ -1837,22 +1845,160 @@ hub_menu() { # gre hub [install|status|start|stop|restart|uninstall]
             audit_log "hub-uninstall"
             ok "gre-hub removed."
             ;;
-        *) err "Usage: gre hub [install|status|start|stop|restart|uninstall]"; return 1 ;;
+        *) err "Usage: gre hub [install|status|start|stop|restart|domain [DOMAIN]|unexpose|uninstall]"; return 1 ;;
     esac
+}
+
+# ------------------------------------------------------------- gre-hub web exposure (domain + HTTPS)
+CADDY_BIN="/usr/local/bin/caddy"
+CADDY_UNIT="/etc/systemd/system/caddy.service"
+CADDY_MAIN="/etc/caddy/Caddyfile"
+CADDY_SITES="/etc/caddy/sites"
+HUB_DOMAIN_FILE="/etc/gre-hub/domain"
+HUB_WEB_DROPIN="/etc/systemd/system/gre-hub.service.d/web.conf"
+
+hub_domain_current() {
+    [[ -f "$HUB_DOMAIN_FILE" ]] && grep -E '^DOMAIN=' "$HUB_DOMAIN_FILE" | cut -d= -f2
+    return 0
+}
+
+valid_domain() {
+    [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$ ]]
+}
+
+hub_ensure_caddy() {
+    if [[ -x "$CADDY_BIN" ]] || command -v caddy >/dev/null 2>&1; then
+        ok "Caddy found: $(caddy version 2>/dev/null | awk '{print $1}')"
+        return 0
+    fi
+    info "Installing Caddy (official static binary)..."
+    local arch="" pkg="linux_amd64"
+    arch="$(uname -m)"
+    [[ "$arch" == "aarch64" || "$arch" == "arm64" ]] && pkg="linux_arm64"
+    local tmp="" url=""
+    tmp="$(mktemp -d)" || return 1
+    url="$(curl -fsSL --max-time 30 "https://api.github.com/repos/caddyserver/caddy/releases/latest" 2>/dev/null \
+        | grep -m1 "browser_download_url.*${pkg}\.tar\.gz" | cut -d'"' -f4)"
+    if [[ -z "$url" ]] || ! curl -fsSL --max-time 240 "$url" -o "$tmp/caddy.tar.gz" 2>/dev/null; then
+        err "Could not download Caddy."
+        rm -rf "$tmp"; return 1
+    fi
+    tar xzf "$tmp/caddy.tar.gz" -C "$tmp" caddy || { err "Could not extract Caddy."; rm -rf "$tmp"; return 1; }
+    mv "$tmp/caddy" "$CADDY_BIN"
+    chmod +x "$CADDY_BIN"
+    rm -rf "$tmp"
+    cat > "$CADDY_UNIT" <<EOF
+[Unit]
+Description=Caddy web server (installed by gre-manager for gre-hub)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$CADDY_BIN run --environ --config $CADDY_MAIN
+ExecReload=$CADDY_BIN reload --config $CADDY_MAIN
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    mkdir -p /etc/caddy "$CADDY_SITES"
+    systemctl daemon-reload
+    ok "Caddy $("$CADDY_BIN" version 2>/dev/null | awk '{print $1}') installed"
+}
+
+hub_expose() { # hub_expose [domain]
+    require_root
+    [[ -d "$HUB_DIR" ]] || { err "gre-hub is not installed yet (run: gre hub install)."; return 1; }
+    local domain="${1:-}"
+    if [[ -z "$domain" ]]; then
+        ask domain "Domain for the dashboard (e.g. hub.example.com)" "$(hub_domain_current)"
+    fi
+    valid_domain "$domain" || { err "Invalid domain: $domain"; return 1; }
+
+    # DNS sanity check (warn only — user may still be propagating)
+    local my_ip="" dns_ip=""
+    my_ip="$(detect_public_ip "$(detect_wan_iface)")"
+    dns_ip="$(getent hosts "$domain" 2>/dev/null | awk '{print $1; exit}')"
+    if [[ -z "$dns_ip" ]]; then
+        warn "DNS: $domain does not resolve from this server yet."
+    elif [[ -n "$my_ip" && "$dns_ip" != "$my_ip" ]]; then
+        warn "DNS: $domain -> $dns_ip, but this server's IP is $my_ip."
+    fi
+    if [[ -z "$dns_ip" ]] || [[ -n "$my_ip" && "$dns_ip" != "$my_ip" ]]; then
+        confirm "Continue anyway? (Let's Encrypt fails until DNS points here)" || { info "Aborted."; return 1; }
+    fi
+
+    # port 80/443 must be free (or already ours via caddy)
+    if ! systemctl is-active caddy.service >/dev/null 2>&1; then
+        grep -q . <<< "$(ss -tlnH 'sport = :80' 2>/dev/null)" && { err "Port 80 is used by another service."; return 1; }
+        grep -q . <<< "$(ss -tlnH 'sport = :443' 2>/dev/null)" && { err "Port 443 is used by another service."; return 1; }
+    fi
+
+    hub_ensure_caddy || return 1
+    mkdir -p /etc/caddy "$CADDY_SITES"
+    cat > "$CADDY_SITES/gre-hub.caddy" <<EOF
+# gre-hub (managed by 'gre hub domain')
+$domain {
+	reverse_proxy 127.0.0.1:$HUB_PORT_DEFAULT
+}
+EOF
+    if [[ ! -f "$CADDY_MAIN" ]]; then
+        printf 'import %s/*.caddy\n' "$CADDY_SITES" > "$CADDY_MAIN"
+    elif ! grep -q "$CADDY_SITES" "$CADDY_MAIN"; then
+        printf '\nimport %s/*.caddy\n' "$CADDY_SITES" >> "$CADDY_MAIN"
+    fi
+
+    mkdir -p "$(dirname "$HUB_WEB_DROPIN")"
+    printf '[Service]\nEnvironment=HUB_SECURE=1\n' > "$HUB_WEB_DROPIN"
+    mkdir -p "$(dirname "$HUB_DOMAIN_FILE")"
+    printf 'DOMAIN=%s\n' "$domain" > "$HUB_DOMAIN_FILE"
+    chmod 600 "$HUB_DOMAIN_FILE"
+
+    systemctl daemon-reload
+    systemctl enable --now caddy.service >/dev/null 2>&1 || true
+    systemctl reload caddy.service 2>/dev/null || systemctl restart caddy.service
+    systemctl restart gre-hub.service >/dev/null 2>&1 || true
+    audit_log "hub-expose domain=$domain"
+
+    echo
+    ok "Web access enabled:  https://$domain"
+    info "Let's Encrypt issues the certificate on first request; if it is not up yet, wait ~30s and re-check."
+    info "Verify:  curl -fsSI https://$domain"
+}
+
+hub_unexpose() {
+    require_root
+    rm -f "$CADDY_SITES/gre-hub.caddy" "$HUB_WEB_DROPIN" "$HUB_DOMAIN_FILE"
+    systemctl daemon-reload
+    systemctl reload caddy.service 2>/dev/null || systemctl restart caddy.service 2>/dev/null || true
+    systemctl restart gre-hub.service >/dev/null 2>&1 || true
+    audit_log "hub-unexpose"
+    ok "Web access disabled — the hub listens on 127.0.0.1:$HUB_PORT_DEFAULT again (SSH tunnel still works)."
 }
 
 hub_settings_menu() {
     require_root
-    local c=""
+    local c="" web=""
     while true; do
+        web="$(hub_domain_current)"
         echo
         echo   "  ── gre-hub dashboard ─────────────────────────────────────"
         printf '  Status: %s\n' "$(hub_status_text)"
+        if [[ -n "$web" ]]; then
+            printf '  Web:    %shttps://%s%s\n' "$C_GREEN" "$web" "$C_RESET"
+        else
+            echo   "  Web:    not exposed (localhost only)"
+        fi
         echo   "  1) Install / reinstall"
         echo   "  2) Start"
         echo   "  3) Stop"
         echo   "  4) Restart"
-        echo   "  5) Uninstall"
+        echo   "  5) Set up web access (domain + HTTPS)"
+        echo   "  6) Disable web access"
+        echo   "  7) Uninstall"
         echo   "  0) Back"
         read -rp "  Select: " c
         case "$c" in
@@ -1860,7 +2006,9 @@ hub_settings_menu() {
             2) hub_menu start ;;
             3) hub_menu stop ;;
             4) hub_menu restart ;;
-            5) hub_menu uninstall ;;
+            5) hub_expose ;;
+            6) hub_unexpose ;;
+            7) hub_menu uninstall ;;
             0) return ;;
             *) warn "Invalid selection." ;;
         esac
@@ -3070,7 +3218,8 @@ Usage:
   gre purge [--yes]       remove EVERYTHING GRE-related from this server
                           (all GRE tunnels, all related iptables rules,
                           systemd units, configs, old versions' artifacts)
-  gre hub                 gre-hub web dashboard: install|status|start|stop|restart|uninstall
+  gre hub                 gre-hub web dashboard: install|status|start|stop|restart
+                          domain [DOMAIN]|unexpose|uninstall
   gre update              self-update to the latest version
   gre --apply             bring up all configured tunnels (used by systemd)
   gre --stop              tear down all tunnels, keep config (used by systemd)
