@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>gre-hub</title>
+  <link rel="stylesheet" href="/vendor/xterm/css/xterm.css" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+
+  <!-- Auth (setup / login) -->
+  <div id="view-auth" class="auth-wrap hidden">
+    <div class="auth-box">
+      <h1 id="auth-title">gre-hub</h1>
+      <p class="sub" id="auth-sub">Sign in to continue.</p>
+      <form id="auth-form">
+        <div class="field">
+          <label for="auth-password">Password</label>
+          <input type="password" id="auth-password" autocomplete="current-password" required />
+        </div>
+        <div class="field hidden" id="auth-confirm-wrap">
+          <label for="auth-confirm">Confirm password</label>
+          <input type="password" id="auth-confirm" autocomplete="new-password" />
+          <div class="hint">Minimum 8 characters. Stored as a scrypt hash.</div>
+        </div>
+        <div class="form-error" id="auth-error"></div>
+        <button type="submit" class="btn" style="width:100%; justify-content:center" id="auth-submit">Sign in</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Main -->
+  <div id="view-main" class="hidden">
+    <div class="container">
+      <header class="topbar">
+        <div class="brand">gre<span>-hub</span></div>
+        <nav class="nav">
+          <button data-page="servers" class="active">Servers</button>
+          <button data-page="log">Action log</button>
+        </nav>
+        <div class="spacer"></div>
+        <button class="btn btn-ghost btn-sm" id="btn-logout">Log out</button>
+      </header>
+
+      <main>
+        <section id="page-servers" class="page">
+          <div class="page-head">
+            <div>
+              <h2>Servers</h2>
+              <div class="sub" id="servers-count"></div>
+            </div>
+            <button class="btn" id="btn-add-server">Add server</button>
+          </div>
+          <div class="grid" id="servers-grid"></div>
+        </section>
+
+        <section id="page-log" class="page hidden">
+          <div class="page-head">
+            <div>
+              <h2>Action log</h2>
+              <div class="sub">Last 100 actions across all servers.</div>
+            </div>
+            <button class="btn btn-ghost btn-sm" id="btn-refresh-log">Refresh</button>
+          </div>
+          <div id="log-table-wrap"></div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <!-- Server detail drawer -->
+  <div id="overlay" class="overlay"></div>
+  <aside id="drawer" class="drawer">
+    <div class="drawer-head">
+      <div>
+        <h2 id="drawer-name"></h2>
+        <div class="meta" id="drawer-meta"></div>
+      </div>
+      <div class="drawer-tabs">
+        <button data-tab="overview" class="active">Overview</button>
+        <button data-tab="actions">Actions</button>
+        <button data-tab="terminal">Terminal</button>
+      </div>
+      <div class="spacer" style="flex:1"></div>
+      <button class="icon-btn" id="drawer-close" title="Close">&times;</button>
+    </div>
+
+    <div class="drawer-body" id="tab-overview"></div>
+
+    <div class="drawer-body hidden" id="tab-actions">
+      <div class="section">
+        <h3>Run action</h3>
+        <div class="action-grid" id="action-grid"></div>
+      </div>
+      <div class="section">
+        <h3>Output</h3>
+        <div class="output-pane" id="action-output">No action run yet.</div>
+      </div>
+    </div>
+
+    <div class="drawer-body flush hidden" id="tab-terminal">
+      <div class="term-bar">
+        <span id="term-status">Disconnected</span>
+        <div style="flex:1"></div>
+        <button class="btn btn-ghost btn-sm" id="btn-term-reconnect">Reconnect</button>
+      </div>
+      <div id="terminal-container"></div>
+    </div>
+  </aside>
+
+  <!-- Generic modal -->
+  <div id="modal-wrap" class="modal-wrap">
+    <div class="modal" id="modal"></div>
+  </div>
+
+  <div id="toast"></div>
+
+  <script src="/vendor/xterm/lib/xterm.js"></script>
+  <script src="/vendor/xterm-fit/lib/addon-fit.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
