@@ -425,6 +425,28 @@ function createRouter(db, cryptKey, dataDir) {
     }
   }));
 
+  // --- Peer suggestions (gre >= 2.7.0) --------------------------------------
+  authed.post('/servers/:id/suggest-peer', wrap(async (req, res) => {
+    const server = getServer(req.params.id);
+    if (!server) return res.status(404).json({ error: 'not found' });
+    const result = await ssh.exec(server, getSecret(server), 'gre iran peer suggest --json', { timeoutMs: 30000, ...sshOptsFor(server) });
+    if (result.hostkey_mismatch) return hostKeyMismatchResponse(res, server, result.presented_fp);
+    const combined = `${result.stdout || ''}\n${result.stderr || ''}`;
+    if (result.rc !== 0) {
+      const tooOld = /Unknown argument/i.test(combined);
+      return res.status(400).json({
+        error: tooOld
+          ? 'remote gre is too old for this action; run the \'update\' action first'
+          : (result.stderr || `suggest failed (rc=${result.rc})`).trim().slice(0, 500),
+      });
+    }
+    try {
+      res.json(JSON.parse(result.stdout.trim()));
+    } catch {
+      res.status(400).json({ error: 'could not parse suggest output as JSON', raw: result.stdout.slice(0, 500) });
+    }
+  }));
+
   // --- Terminal ticket -----------------------------------------------------
   authed.post('/servers/:id/terminal-ticket', (req, res) => {
     const server = getServer(req.params.id);

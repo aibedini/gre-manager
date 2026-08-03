@@ -682,7 +682,7 @@ const FORM_ACTIONS = [
     { name: 'icmp_drop', label: 'ICMP drop', type: 'select', options: [['', 'default (off)'], ['on', 'on'], ['off', 'off']] },
     { name: 'downtime', label: 'Downtime tolerance, minutes (default 2)', type: 'number' },
   ] },
-  { id: 'setup_iran', label: 'Configure as IRAN', desc: 'First-time IRAN setup — creates the first foreign peer', fields: [
+  { id: 'setup_iran', label: 'Configure as IRAN', desc: 'First-time IRAN setup — creates the first foreign peer', suggest: true, fields: [
     { name: 'foreign_ip', label: 'Foreign IP', required: true },
     { name: 'name', label: 'Peer name (optional)' },
     { name: 'idx', label: 'Index (optional)', type: 'number' },
@@ -705,7 +705,7 @@ const FORM_ACTIONS = [
   { id: 'node_remove', label: 'Node: remove', desc: 'Remove an Iran node (FOREIGN side)', fields: [
     { name: 'name', label: 'Name', required: true },
   ] },
-  { id: 'peer_add', label: 'Peer: add', desc: 'Connect to a foreign server (IRAN side)', fields: [
+  { id: 'peer_add', label: 'Peer: add', desc: 'Connect to a foreign server (IRAN side)', suggest: true, fields: [
     { name: 'name', label: 'Name', required: true },
     { name: 'foreign_ip', label: 'Foreign IP', required: true },
     { name: 'iran_ip', label: 'Iran IP (optional)' },
@@ -797,11 +797,41 @@ function openActionForm(def) {
       ${fields}
       <div class="form-error" id="action-form-error"></div>
       <div class="foot">
+        ${def.suggest ? '<button type="button" class="btn btn-ghost" id="btn-suggest" title="Fill with collision-free values from the server (gre >= 2.7.0)">Suggest</button>' : ''}
         <button type="button" class="btn btn-ghost" id="btn-cancel-action">Cancel</button>
         <button type="submit" class="btn">Run</button>
       </div>
     </form>`);
   $('#btn-cancel-action').addEventListener('click', closeModal);
+  const suggestBtn = $('#btn-suggest');
+  if (suggestBtn) {
+    // Map suggest response keys to form field names; empty values are skipped.
+    const SUGGEST_MAP = { name: 'name', subnet_base: 'subnet_base', idx: 'idx', key: 'key', tcp_port: 'tcp_ports', udp_port: 'udp_ports' };
+    suggestBtn.addEventListener('click', async () => {
+      const form = $('#action-form');
+      const errEl = $('#action-form-error');
+      errEl.textContent = '';
+      suggestBtn.disabled = true;
+      suggestBtn.textContent = 'Suggesting…';
+      try {
+        const s = state.current;
+        const data = await api(`/api/servers/${s.id}/suggest-peer`, { method: 'POST' });
+        let filled = 0;
+        for (const [src, dest] of Object.entries(SUGGEST_MAP)) {
+          const v = data[src];
+          if (v !== undefined && v !== null && v !== '' && form[dest]) {
+            form[dest].value = v;
+            filled++;
+          }
+        }
+        toast(filled ? `Suggested values filled in (${filled} fields)` : 'Server returned no suggestions');
+      } catch (err) {
+        errEl.textContent = err.message;
+      }
+      suggestBtn.disabled = false;
+      suggestBtn.textContent = 'Suggest';
+    });
+  }
   $('#action-form').addEventListener('submit', (e) => {
     e.preventDefault();
     const form = e.target;

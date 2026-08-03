@@ -161,6 +161,17 @@ async function main() {
       r.data.command === `gre foreign-setup --foreign-ip '2.3.4.5' --gre-whitelist off --icmp-drop on --downtime 10 --yes`,
       r.data && r.data.command);
 
+    r = await anon.call(`/api/servers/${dummyId}/suggest-peer`, { method: 'POST', useCookie: false });
+    check('suggest-peer unauthenticated → 401', r.status === 401);
+
+    r = await anon.call(`/api/servers/${dummyId}/suggest-peer`, { method: 'POST', useCsrf: false });
+    check('suggest-peer without CSRF → 403', r.status === 403);
+
+    r = await anon.call(`/api/servers/${dummyId}/suggest-peer`, { method: 'POST' });
+    check('suggest-peer on dead server → sane 400 error (no crash)',
+      r.status === 400 && typeof (r.data && r.data.error) === 'string' && r.data.error.length > 0,
+      JSON.stringify(r.data));
+
     r = await anon.call(`/api/servers/${dummyId}`, { method: 'DELETE' });
     check('delete dummy server → 200', r.status === 200);
 
