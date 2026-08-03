@@ -35,6 +35,7 @@ server still accepts many Iran nodes — a full many-to-many topology.
 
 - [Features](#features)
 - [Install](#install)
+- [gre-hub (web dashboard)](#gre-hub-web-dashboard)
 - [Quick start](#quick-start)
 - [Menu guide](#menu-guide)
 - [CLI reference](#cli-reference)
@@ -148,6 +149,25 @@ sudo gre
   0) Exit
   ═════════════════════════════════════════════════════════════
 ```
+
+## gre-hub (web dashboard)
+
+`hub/` is a minimal web dashboard + central SSH hub for managing all your servers from one place
+(Node.js + Express + SQLite + ssh2 + xterm.js, no build step):
+
+- **Discovery over SSH** — detects the manager version, roles, nodes/peers with live reachability,
+  **unmanaged GRE tunnels**, and **legacy vatanhost artifacts** on every server
+- **Central management** — add/remove nodes and peers, watchdog control, doctor, update, install,
+  and typed-confirmation purge, all driven through the `gre` CLI over SSH (no agent needed)
+- **Web SSH terminal** — xterm.js terminal per server, right in the browser
+- **Secure by default** — single-user login (scrypt + sessions + rate-limit), AES-256-GCM encrypted
+  server secrets, localhost bind
+
+```bash
+cd hub && npm install && npm start    # http://127.0.0.1:3939
+```
+
+See [hub/README.md](hub/README.md) for deployment and security notes (TLS, SSH keys).
 
 ## Quick start
 
