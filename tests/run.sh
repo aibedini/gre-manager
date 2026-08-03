@@ -507,6 +507,12 @@ gre --apply
 awk '/multi-gre-node-|multi-gre-block/ {print NR": "$0}' "$R/state/iptables.filter" > "$R/state/order.txt"
 assert "two node ACCEPTs" bash -c "grep -c 'multi-gre-node-' '$R/state/order.txt' | grep -qx 2"
 assert "block rule is last" bash -c "tail -1 '$R/state/order.txt' | grep -q multi-gre-block"
+# regression v2.2.2: with 2 managed tunnels, doctor must NOT report a false
+# "unmanaged tunnel" (pipefail+SIGPIPE flipped grep -q when the match was early)
+gre doctor
+printf '%s' "$GRE_OUT" > "$R/doctor.txt"
+assert_not "no false unmanaged-tunnel warning" grep -q "unmanaged GRE tunnel '" "$R/doctor.txt"
+assert "coexistence check passes" grep -q "no unmanaged GRE tunnels" "$R/doctor.txt"
 # status JSON on foreign side
 gre status --json
 json_valid "foreign JSON valid"

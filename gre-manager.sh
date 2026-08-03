@@ -60,7 +60,7 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are validated then sourced by design
 set -uo pipefail
 
-VERSION="2.2.1"
+VERSION="2.2.2"
 
 GITHUB_REPO="aibedini/gre-manager"
 RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/gre-manager.sh"
@@ -244,9 +244,11 @@ port_lists_overlap() { # list1 list2 -> 0 if overlapping (OVERLAP_DESC is set)
 port_in_use() { # proto(tcp|udp) port -> 0 if a local service listens on it
     local proto="$1" port="$2"
     command -v ss >/dev/null 2>&1 || return 1
+    # note: herestring, not a pipe — grep -q exiting early would SIGPIPE the
+    # producer and pipefail would flip the result (false "port free")
     case "$proto" in
-        tcp) ss -tlnH "sport = :$port" 2>/dev/null | grep -q . ;;
-        udp) ss -ulnH "sport = :$port" 2>/dev/null | grep -q . ;;
+        tcp) grep -q . <<< "$(ss -tlnH "sport = :$port" 2>/dev/null)" ;;
+        udp) grep -q . <<< "$(ss -ulnH "sport = :$port" 2>/dev/null)" ;;
         *)   return 1 ;;
     esac
 }
@@ -470,7 +472,7 @@ check_peer_collisions() { # check_peer_collisions NAME SUBNET_BASE IDX TUN TCP_P
 subnet_route_conflict() { # subnet_route_conflict BASE -> 0 if a local route covers BASE.*
     local base="$1"
     local esc="${base//./\\.}"
-    ip -4 route show 2>/dev/null | awk '{print $1}' | grep -qE "^${esc}\." || return 1
+    grep -qE "^${esc}\." <<< "$(ip -4 route show 2>/dev/null | awk '{print $1}')" || return 1
     return 0
 }
 
@@ -577,10 +579,14 @@ managed_tunnel_names() { # tunnels managed by us (foreign nodes + iran peers)
 }
 
 unmanaged_gre_tunnels() { # GRE tunnels present but NOT created by gre-manager
-    local t
+    local t managed=""
+    managed="$(managed_tunnel_names)"
     gre_tunnel_names | while IFS= read -r t; do
         [[ -n "$t" && "$t" != "gre0" && "$t" != "gretap0" && "$t" != "erspan0" ]] || continue
-        managed_tunnel_names | grep -qx "$t" || printf '%s\n' "$t"
+        # herestring, not a pipe: grep -q exiting on an early match would SIGPIPE
+        # the producer; under pipefail that flips the pipeline to failure and
+        # falsely reports a managed tunnel as unmanaged.
+        grep -qx "$t" <<< "$managed" || printf '%s\n' "$t"
     done
 }
 
@@ -2408,7 +2414,7 @@ doctor() { # gre doctor — diagnostics; exits non-zero if any check FAILs
             else
                 d_fail "[$NAME] WAN interface '$WAN_IF' from the peer conf does not exist"
             fi
-            if ip -4 -o addr show 2>/dev/null | awk '{split($4,a,"/"); print a[1]}' | grep -qx "$IRAN_IP"; then
+            if grep -qx "$IRAN_IP" <<< "$(ip -4 -o addr show 2>/dev/null | awk '{split($4,a,"/"); print a[1]}')"; then
                 d_pass "[$NAME] IRAN_IP $IRAN_IP is assigned to a local interface"
             else
                 d_fail "[$NAME] IRAN_IP $IRAN_IP is not assigned to any local interface"
