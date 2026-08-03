@@ -146,6 +146,11 @@ gre iran --help;   assert "iran --help rc=0"   test "$GRE_RC" -eq 0
 gre iran peer --help; assert "iran peer --help rc=0" test "$GRE_RC" -eq 0
 gre watchdog status; assert "watchdog status rc=0" test "$GRE_RC" -eq 0
 gre watchdog bogus; assert_not "watchdog bogus fails" test "$GRE_RC" -eq 0
+gre foreign-setup --yes; assert "foreign-setup rc=0 on fresh" test "$GRE_RC" -eq 0
+assert "foreign-setup wrote conf" test -f "$R/etc/multi-gre/foreign.conf"
+assert "foreign-setup default whitelist on" grep -qx "GRE_WHITELIST=1" "$R/etc/multi-gre/foreign.conf"
+gre foreign-setup --yes; assert_not "foreign-setup refuses when configured" test "$GRE_RC" -eq 0
+rm -f "$R/etc/multi-gre/foreign.conf"
 gre hub status;    assert "hub status rc=0 on fresh" test "$GRE_RC" -eq 0
 assert "hub status says not installed" grep -q "not installed" <<< "$GRE_OUT"
 gre hub bogus;     assert_not "hub bogus subcommand fails" test "$GRE_RC" -eq 0

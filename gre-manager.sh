@@ -49,6 +49,8 @@
 #   gre iran-setup --foreign-ip IP [--iran-ip IP] [--name NAME] [--idx N]
 #                  [--key K] [--wan IFACE] [--tcp-ports LIST] [--udp-ports LIST]
 #                  [--mss-clamp on|off] [--yes]     (creates the FIRST peer only)
+#   gre foreign-setup [--foreign-ip IP] [--gre-whitelist on|off]
+#                  [--icmp-drop on|off] [--downtime MIN] [--yes]
 #   gre export [path] [--yes]   back up /etc/multi-gre to a tar.gz archive
 #   gre import <file> [--yes]   restore a backup made by 'gre export'
 #   gre watchdog        watchdog timer: enable|disable|status
@@ -60,7 +62,7 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are validated then sourced by design
 set -uo pipefail
 
-VERSION="2.5.0"
+VERSION="2.6.0"
 
 GITHUB_REPO="aibedini/gre-manager"
 RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/gre-manager.sh"
@@ -2331,6 +2333,67 @@ cli_node_remove() { # gre node remove --name NAME [--yes]
     info "(No need to uninstall the Iran server — only that one peer.)"
 }
 
+# ------------------------------------------------------------- CLI: foreign setup
+cli_foreign_setup() { # gre foreign-setup [--foreign-ip IP] [--gre-whitelist on|off] [--icmp-drop on|off] [--downtime MIN] [--yes]
+    require_root
+    if [[ -f "$FOREIGN_CONF" ]]; then
+        err "This server is already configured as FOREIGN (add nodes with: gre node add --name NAME --ip IRAN_IP)."
+        return 1
+    fi
+    local FOREIGN_IP="" GRE_WHITELIST="on" ICMP_DROP="off" DOWNTIME="2" YES=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --foreign-ip)    [[ -n "${2:-}" ]] || { err "Missing value for --foreign-ip"; return 1; }; FOREIGN_IP="$2"; shift 2 ;;
+            --gre-whitelist) [[ "${2:-}" == "on" || "${2:-}" == "off" ]] || { err "--gre-whitelist must be 'on' or 'off'"; return 1; }; GRE_WHITELIST="$2"; shift 2 ;;
+            --icmp-drop)     [[ "${2:-}" == "on" || "${2:-}" == "off" ]] || { err "--icmp-drop must be 'on' or 'off'"; return 1; }; ICMP_DROP="$2"; shift 2 ;;
+            --downtime)      [[ "${2:-}" =~ ^[0-9]+$ ]] || { err "--downtime must be minutes (0 = disable auto-heal)"; return 1; }; DOWNTIME="$2"; shift 2 ;;
+            --yes|-y)        YES=1; shift ;;
+            --help|-h)       echo "Usage: gre foreign-setup [--foreign-ip IP] [--gre-whitelist on|off] [--icmp-drop on|off] [--downtime MIN] [--yes]"; return 0 ;;
+            *)               err "Unknown option: $1"
+                             err "Usage: gre foreign-setup [--foreign-ip IP] [--gre-whitelist on|off] [--icmp-drop on|off] [--downtime MIN] [--yes]"
+                             return 1 ;;
+        esac
+    done
+
+    if [[ -z "$FOREIGN_IP" ]]; then
+        FOREIGN_IP="$(detect_public_ip "$(detect_wan_iface)")"
+    fi
+    valid_ip "$FOREIGN_IP" || { err "Invalid or undetectable foreign IP: '$FOREIGN_IP' (pass --foreign-ip)"; return 1; }
+
+    local whitelist_flag="0" icmp_flag="0"
+    [[ "$GRE_WHITELIST" == "on" ]] && whitelist_flag="1"
+    [[ "$ICMP_DROP" == "on" ]] && icmp_flag="1"
+
+    # warn (non-fatal) if other GRE tunnels exist and the whitelist will block them
+    if [[ "$whitelist_flag" == "1" ]]; then
+        local other_tuns=""
+        other_tuns="$(unmanaged_gre_tunnels | tr '\n' ' ')"
+        [[ -n "${other_tuns// /}" ]] && \
+            warn "Other GRE tunnels exist ($other_tuns) — the whitelist will BLOCK them."
+    fi
+
+    mkdir -p "$CONF_DIR" "$NODES_DIR"
+    cat > "$FOREIGN_CONF" <<EOF
+FOREIGN_IP=$FOREIGN_IP
+ICMP_DROP=$icmp_flag
+GRE_WHITELIST=$whitelist_flag
+EOF
+    chmod 600 "$FOREIGN_CONF"
+
+    local dt_enabled=1 dt_interval=$(( DOWNTIME / 2 ))
+    (( DOWNTIME == 0 )) && dt_enabled=0
+    (( dt_interval < 1 )) && dt_interval=1
+    write_global_conf "$dt_enabled" "$dt_interval" "$DOWNTIME"
+
+    install_service
+    audit_log "foreign-setup ip=$FOREIGN_IP icmp_drop=$icmp_flag gre_whitelist=$whitelist_flag tolerance=${DOWNTIME}m"
+
+    echo
+    ok "FOREIGN server configured (ip $FOREIGN_IP, whitelist $GRE_WHITELIST, icmp drop $ICMP_DROP)."
+    info "Add Iran nodes with:  gre node add --name ir01 --ip IRAN_PUBLIC_IP"
+    info "Each add prints the exact values / command for the Iran side."
+}
+
 # ------------------------------------------------------------- CLI: iran setup
 cli_iran_setup() { # gre iran-setup --foreign-ip IP [options]  (creates the FIRST peer only)
     require_root
@@ -3256,6 +3319,10 @@ Usage:
                           back up /etc/multi-gre (default: ./gre-backup-<timestamp>.tar.gz)
   gre import <file> [--yes]
                           restore a backup created by 'gre export'
+  gre foreign-setup [--foreign-ip IP] [--gre-whitelist on|off]
+                 [--icmp-drop on|off] [--downtime MIN] [--yes]
+                          configure this server as FOREIGN (non-interactive);
+                          refuses when already configured (use 'gre node add')
   gre watchdog            watchdog: enable|disable|status|interval <1-60>
   gre purge [--yes]       remove EVERYTHING GRE-related from this server
                           (all GRE tunnels, all related iptables rules,
@@ -3334,6 +3401,7 @@ EOF
             *)       err "Usage: gre iran peer <list|add|remove|apply> ...  (see: gre iran --help)"; exit 1 ;;
         esac ;;
     iran-setup)        cli_iran_setup "${@:2}" ;;
+    foreign-setup)     cli_foreign_setup "${@:2}" ;;
     doctor)            doctor ;;
     export)            cli_export "${@:2}" ;;
     import)            cli_import "${@:2}" ;;

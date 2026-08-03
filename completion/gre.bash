@@ -7,7 +7,7 @@ _gre() {
     COMPREPLY=()
 
     if (( COMP_CWORD == 1 )); then
-        cmds="node iran iran-setup doctor export import watchdog status update purge hub --status --apply --stop --version --help"
+        cmds="node iran iran-setup foreign-setup doctor export import watchdog status update purge hub --status --apply --stop --version --help"
         COMPREPLY=( $(compgen -W "$cmds" -- "$cur") )
         return 0
     fi
@@ -41,6 +41,9 @@ _gre() {
             ;;
         iran-setup)
             COMPREPLY=( $(compgen -W "--foreign-ip --iran-ip --name --idx --key --subnet-base --wan --tcp-ports --udp-ports --mss-clamp --downtime --yes" -- "$cur") )
+            ;;
+        foreign-setup)
+            COMPREPLY=( $(compgen -W "--foreign-ip --gre-whitelist --icmp-drop --downtime --yes" -- "$cur") )
             ;;
         watchdog)
             COMPREPLY=( $(compgen -W "enable disable status interval" -- "$cur") )

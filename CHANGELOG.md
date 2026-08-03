@@ -4,6 +4,16 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2026-08-03
+
+### Added
+- **`gre foreign-setup` — non-interactive FOREIGN setup** (mirrors `iran-setup`
+  for the foreign side): `gre foreign-setup [--foreign-ip IP] [--gre-whitelist
+  on|off] [--icmp-drop on|off] [--downtime MIN] [--yes]` writes the foreign
+  config, applies watchdog settings and installs the systemd service; refuses
+  when already configured and points to `gre node add`. This also powers the
+  new "Configure as FOREIGN / Configure as IRAN" actions in gre-hub.
+
 ## [2.5.0] - 2026-08-03
 
 ### Added
@@ -324,3 +334,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [2.3.0]: https://github.com/aibedini/gre-manager/releases/tag/v2.3.0
 [2.4.0]: https://github.com/aibedini/gre-manager/releases/tag/v2.4.0
 [2.5.0]: https://github.com/aibedini/gre-manager/releases/tag/v2.5.0
+[2.6.0]: https://github.com/aibedini/gre-manager/releases/tag/v2.6.0
