@@ -4,6 +4,13 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.1] - 2026-08-03
+
+### Added
+- gre-hub: **Suggest auto-fill button** in the Peer-add and Configure-as-IRAN
+  forms (`POST /api/servers/:id/suggest-peer` driving
+  `gre iran peer suggest --json`; requires remote gre >= 2.7.0).
+
 ## [2.7.0] - 2026-08-03
 
 ### Added
@@ -354,3 +361,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [2.6.0]: https://github.com/aibedini/gre-manager/releases/tag/v2.6.0
 [2.6.1]: https://github.com/aibedini/gre-manager/releases/tag/v2.6.1
 [2.7.0]: https://github.com/aibedini/gre-manager/releases/tag/v2.7.0
+[2.7.1]: https://github.com/aibedini/gre-manager/releases/tag/v2.7.1
