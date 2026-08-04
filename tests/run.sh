@@ -618,13 +618,15 @@ sect "16. self-update is release-only and downgrade-safe"
 mkroot
 UPDATE_STUBS="$R/update-stubs"
 mkdir -p "$UPDATE_STUBS" "$R/update-fixtures"
+CURRENT_VERSION="$(grep -m1 -E '^VERSION=' "$SUT" | cut -d'"' -f2)"
+NEWER_VERSION="$(awk -F. '{ printf "%d.%d.%d", $1, $2, $3 + 1 }' <<< "$CURRENT_VERSION")"
 cat > "$R/update-fixtures/older" <<'EOF'
 #!/usr/bin/env bash
 VERSION="2.7.1"
 EOF
-cat > "$R/update-fixtures/newer" <<'EOF'
+cat > "$R/update-fixtures/newer" <<EOF
 #!/usr/bin/env bash
-VERSION="2.8.1"
+VERSION="$NEWER_VERSION"
 EOF
 cat > "$R/update-fixtures/failure" <<'EOF'
 #!/usr/bin/env bash
@@ -676,7 +678,7 @@ assert_not "updater never falls back to raw main" grep -q "raw.githubusercontent
 printf 'newer\n' > "$R/state/update-mode"
 PATH="$UPDATE_STUBS:$PATH" gre update --yes
 assert "newer release update succeeds" test "$GRE_RC" -eq 0
-assert "newer release replaces installed file" grep -q '^VERSION="2.8.1"' "$R/usr/local/sbin/gre"
+assert "newer release replaces installed file" grep -q "^VERSION=\"$NEWER_VERSION\"" "$R/usr/local/sbin/gre"
 rm -rf "$R"
 
 # ======================================================================
