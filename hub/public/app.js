@@ -677,13 +677,13 @@ const SIMPLE_ACTIONS = [
 
 const FORM_ACTIONS = [
   { id: 'setup_foreign', label: 'Configure as FOREIGN', desc: 'First-time FOREIGN setup (requires gre >= 2.6.0)', fields: [
-    { name: 'foreign_ip', label: 'Foreign IP (optional)' },
+    { name: 'foreign_ip', label: 'Foreign IP (optional)', ipRole: 'FOREIGN', includeCurrent: true, blankLabel: 'Auto-detect (default)' },
     { name: 'gre_whitelist', label: 'GRE whitelist', type: 'select', options: [['', 'default (on)'], ['on', 'on'], ['off', 'off']] },
     { name: 'icmp_drop', label: 'ICMP drop', type: 'select', options: [['', 'default (off)'], ['on', 'on'], ['off', 'off']] },
     { name: 'downtime', label: 'Downtime tolerance, minutes (default 2)', type: 'number' },
   ] },
   { id: 'setup_iran', label: 'Configure as IRAN', desc: 'First-time IRAN setup — creates the first foreign peer', suggest: true, suggestionKind: 'peer', fields: [
-    { name: 'foreign_ip', label: 'Foreign IP', required: true, ipRole: 'FOREIGN' },
+    { name: 'foreign_ip', label: 'Foreign IP', required: true, ipRole: 'FOREIGN', blankLabel: 'Select a FOREIGN server…' },
     { name: 'name', label: 'Peer name (optional)' },
     { name: 'idx', label: 'Index (optional)', type: 'number' },
     { name: 'key', label: 'GRE key (optional)' },
@@ -697,18 +697,18 @@ const FORM_ACTIONS = [
   ] },
   { id: 'node_add', label: 'Node: add', desc: 'Add an Iran node (FOREIGN side)', suggest: true, suggestionKind: 'node', fields: [
     { name: 'name', label: 'Name', required: true },
-    { name: 'ip', label: 'Iran IP', required: true, ipRole: 'IRAN' },
+    { name: 'ip', label: 'Iran IP', required: true, ipRole: 'IRAN', blankLabel: 'Select an IRAN server…' },
     { name: 'idx', label: 'Index (optional)', type: 'number' },
     { name: 'key', label: 'GRE key (optional)' },
     { name: 'subnet_base', label: 'Subnet base, e.g. 10.9 (optional)' },
   ] },
   { id: 'node_remove', label: 'Node: remove', desc: 'Remove an Iran node (FOREIGN side)', fields: [
-    { name: 'name', label: 'Name', required: true },
+    { name: 'name', label: 'Name', required: true, statusResource: 'nodes', blankLabel: 'Select an Iran node…' },
   ] },
   { id: 'peer_add', label: 'Peer: add', desc: 'Connect to a foreign server (IRAN side)', suggest: true, suggestionKind: 'peer', fields: [
     { name: 'name', label: 'Name', required: true },
-    { name: 'foreign_ip', label: 'Foreign IP', required: true, ipRole: 'FOREIGN' },
-    { name: 'iran_ip', label: 'Iran IP (optional)', ipRole: 'IRAN', includeCurrent: true },
+    { name: 'foreign_ip', label: 'Foreign IP', required: true, ipRole: 'FOREIGN', blankLabel: 'Select a FOREIGN server…' },
+    { name: 'iran_ip', label: 'Iran IP (optional)', ipRole: 'IRAN', includeCurrent: true, blankLabel: 'Default (current server)' },
     { name: 'subnet_base', label: 'Subnet base (optional)' },
     { name: 'idx', label: 'Index (optional)', type: 'number' },
     { name: 'key', label: 'GRE key (optional)' },
@@ -716,10 +716,10 @@ const FORM_ACTIONS = [
     { name: 'udp_ports', label: 'UDP ports list (optional)' },
   ] },
   { id: 'peer_remove', label: 'Peer: remove', desc: 'Remove one foreign peer (IRAN side)', fields: [
-    { name: 'name', label: 'Name', required: true },
+    { name: 'name', label: 'Name', required: true, statusResource: 'iran_peers', blankLabel: 'Select a foreign peer…' },
   ] },
   { id: 'peer_apply', label: 'Peer: apply', desc: 'Re-apply one peer tunnel + rules', fields: [
-    { name: 'name', label: 'Name', required: true },
+    { name: 'name', label: 'Name', required: true, statusResource: 'iran_peers', blankLabel: 'Select a foreign peer…' },
   ] },
 ];
 
@@ -780,13 +780,39 @@ function roleServerOptions(role, includeCurrent = false) {
     .filter((server) => includeCurrent || server.id !== (state.current && state.current.id))
     .filter((server) => ((server.snapshot && server.snapshot.roles) || [])
       .some((value) => String(value).toUpperCase() === role))
-    .filter((server) => /^\d{1,3}(?:\.\d{1,3}){3}$/.test(server.host || ''))
+    .filter((server) => isIPv4Host(server.host))
     .filter((server) => !seen.has(server.host) && seen.add(server.host))
     .map((server) => ({ value: server.host, label: server.name }));
 }
 
+function isIPv4Host(value) {
+  const parts = String(value || '').split('.');
+  return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+}
+
+function statusResourceNames(snapshot, resource) {
+  const values = snapshot && snapshot.status && snapshot.status[resource];
+  if (!Array.isArray(values)) return [];
+  return [...new Set(values
+    .map((item) => (typeof item === 'string' ? item : item && item.name))
+    .map((name) => String(name || '').trim())
+    .filter(Boolean))];
+}
+
+function selectOptions(items) {
+  return items.map((item) => `<option value="${esc(item.value)}">${esc(item.label)} — ${esc(item.value)}</option>`).join('');
+}
+
+function randomPoolValue(values, excluded = new Set()) {
+  const clean = [...new Set((Array.isArray(values) ? values : [values])
+    .filter((value) => value !== undefined && value !== null && value !== '')
+    .map(String))];
+  const preferred = clean.filter((value) => !excluded.has(value));
+  const pool = preferred.length ? preferred : clean;
+  return pool.length ? pool[Math.floor(Math.random() * pool.length)] : '';
+}
+
 function openActionForm(def) {
-  const suggestFields = new Set(['name', 'subnet_base', 'idx', 'key', 'tcp_ports', 'udp_ports']);
   const fields = def.fields.map((f) => {
     if (f.type === 'select') {
       const opts = (f.options || []).map(([v, label]) => `<option value="${esc(v)}">${esc(label)}</option>`).join('');
@@ -796,18 +822,40 @@ function openActionForm(def) {
       <select name="${f.name}" ${f.required ? 'required' : ''}>${opts}</select>
     </div>`;
     }
-    const listId = f.ipRole
-      ? `${def.id}-${f.name}-servers`
-      : (def.suggest && suggestFields.has(f.name) ? `${def.id}-${f.name}-suggestions` : '');
-    const options = f.ipRole
-      ? roleServerOptions(f.ipRole, f.includeCurrent).map((item) => `<option value="${esc(item.value)}">${esc(item.label)}</option>`).join('')
-      : '';
+    if (f.ipRole) {
+      const options = roleServerOptions(f.ipRole, f.includeCurrent);
+      const hint = options.length
+        ? `${options.length} ${f.ipRole} server${options.length === 1 ? '' : 's'} available from Hub discovery.`
+        : `No discovered ${f.ipRole} servers are currently available in this Hub.`;
+      return `
+    <div class="field">
+      <label>${esc(f.label)}</label>
+      <select name="${f.name}" ${f.required ? 'required' : ''}>
+        <option value="">${esc(f.blankLabel || 'Select a server…')}</option>
+        ${selectOptions(options)}
+      </select>
+      <span class="hint">${esc(hint)}</span>
+    </div>`;
+    }
+    if (f.statusResource) {
+      const names = statusResourceNames(state.current && state.current.snapshot, f.statusResource);
+      const options = names.map((name) => `<option value="${esc(name)}">${esc(name)}</option>`).join('');
+      return `
+    <div class="field">
+      <label>${esc(f.label)}</label>
+      <select name="${f.name}" ${f.required ? 'required' : ''} data-status-resource="${esc(f.statusResource)}">
+        <option value="">${esc(f.blankLabel || 'Select a resource…')}</option>
+        ${options}
+      </select>
+      <span class="hint" id="${def.id}-${f.name}-status">${names.length ? `${names.length} cached option${names.length === 1 ? '' : 's'}; refreshing discovery…` : 'Loading current server resources…'}</span>
+    </div>`;
+    }
+    const listId = def.suggest && f.name === 'subnet_base' ? `${def.id}-${f.name}-suggestions` : '';
     return `
     <div class="field">
       <label>${esc(f.label)}</label>
       <input name="${f.name}" ${f.required ? 'required' : ''} type="${f.type || 'text'}" ${listId ? `list="${listId}"` : ''} autocomplete="off" />
-      ${listId ? `<datalist id="${listId}">${options}</datalist>` : ''}
-      ${f.ipRole ? `<span class="hint">Choose a ${f.ipRole} server from this hub, or type another IP.</span>` : ''}
+      ${listId ? `<datalist id="${listId}"></datalist><span class="hint">Choose a free suggested base or type a valid A.B value.</span>` : ''}
     </div>`;
   }).join('');
   openModal(`
@@ -823,10 +871,41 @@ function openActionForm(def) {
       </div>
     </form>`);
   $('#btn-cancel-action').addEventListener('click', closeModal);
+  const resourceFields = def.fields.filter((f) => f.statusResource);
+  if (resourceFields.length) {
+    const refreshResources = async () => {
+      const server = state.current;
+      try {
+        const snapshot = await api(`/api/servers/${server.id}/discover`, { method: 'POST' });
+        if (snapshot.error) throw new Error(snapshot.error);
+        server.snapshot = snapshot;
+        const listed = state.servers.find((item) => item.id === server.id);
+        if (listed) listed.snapshot = snapshot;
+        for (const field of resourceFields) {
+          const select = $(`#action-form [name="${field.name}"]`);
+          const hint = $(`#${def.id}-${field.name}-status`);
+          if (!select || !hint) continue;
+          const names = statusResourceNames(snapshot, field.statusResource);
+          const previous = select.value;
+          select.innerHTML = `<option value="">${esc(field.blankLabel || 'Select a resource…')}</option>${names.map((name) => `<option value="${esc(name)}">${esc(name)}</option>`).join('')}`;
+          if (names.includes(previous)) select.value = previous;
+          hint.textContent = names.length
+            ? `${names.length} current option${names.length === 1 ? '' : 's'} from live discovery.`
+            : `No configured ${field.statusResource === 'nodes' ? 'Iran nodes' : 'foreign peers'} found on this server.`;
+        }
+      } catch (err) {
+        for (const field of resourceFields) {
+          const hint = $(`#${def.id}-${field.name}-status`);
+          if (hint) hint.textContent = `Discovery failed: ${err.message}. Cached options are shown when available.`;
+        }
+      }
+    };
+    refreshResources();
+  }
   const suggestBtn = $('#btn-suggest');
   if (suggestBtn) {
     const SUGGEST_MAP = { name: 'name', subnet_base: 'subnet_base', idx: 'idx', key: 'key', tcp_port: 'tcp_ports', udp_port: 'udp_ports' };
-    const loadSuggestions = async ({ fillEmpty = false, base = '' } = {}) => {
+    const loadSuggestions = async ({ fillEmpty = false, refreshPorts = false, base = '' } = {}) => {
       const form = $('#action-form');
       const errEl = $('#action-form-error');
       errEl.textContent = '';
@@ -845,7 +924,16 @@ function openActionForm(def) {
           const clean = values.filter((value) => value !== undefined && value !== null && value !== '');
           const list = $(`#${def.id}-${dest}-suggestions`);
           if (list) list.innerHTML = clean.map((value) => `<option value="${esc(value)}"></option>`).join('');
-          if (fillEmpty && !form[dest].value && clean.length) { form[dest].value = clean[0]; filled++; }
+          if (fillEmpty && !['tcp_ports', 'udp_ports'].includes(dest) && !form[dest].value && clean.length) {
+            form[dest].value = randomPoolValue(clean);
+            filled++;
+          }
+        }
+        if (refreshPorts) {
+          const tcp = form.tcp_ports ? randomPoolValue(data.tcp_port) : '';
+          const udp = form.udp_ports ? randomPoolValue(data.udp_port, new Set(tcp ? [tcp] : [])) : '';
+          if (form.tcp_ports && tcp) { form.tcp_ports.value = tcp; filled++; }
+          if (form.udp_ports && udp) { form.udp_ports.value = udp; filled++; }
         }
         if (fillEmpty) toast(filled ? `Loaded 10-value pools and filled ${filled} fields` : 'Suggestion lists refreshed');
       } catch (err) {
@@ -854,10 +942,10 @@ function openActionForm(def) {
       suggestBtn.disabled = false;
       suggestBtn.textContent = 'Refresh values';
     };
-    suggestBtn.addEventListener('click', () => loadSuggestions({ fillEmpty: true, base: $('#action-form').subnet_base?.value.trim() || '' }));
+    suggestBtn.addEventListener('click', () => loadSuggestions({ fillEmpty: true, refreshPorts: true, base: $('#action-form').subnet_base?.value.trim() || '' }));
     const baseInput = $('#action-form').subnet_base;
     if (baseInput) baseInput.addEventListener('change', () => loadSuggestions({ base: baseInput.value.trim() }));
-    loadSuggestions();
+    loadSuggestions({ refreshPorts: true });
   }
   $('#action-form').addEventListener('submit', (e) => {
     e.preventDefault();

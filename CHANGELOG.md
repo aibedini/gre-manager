@@ -4,6 +4,15 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.1] - 2026-08-04
+
+### Changed
+- gre-hub action forms now use role-filtered native selects for server IPs and
+  live-discovered native selects for Node-remove, Peer-remove, and Peer-apply.
+  Subnet base remains editable with free-value suggestions; Peer-add TCP/UDP
+  ports are randomized from collision-free pools and kept distinct when the
+  returned pools permit it.
+
 ## [2.8.0] - 2026-08-04
 
 ### Added
