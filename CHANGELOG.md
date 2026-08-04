@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - The suggestion endpoint validates suggestion type, count, and subnet base
   before building its remote command.
+- `gre update` now installs only checksum-verified pinned releases, aborts cleanly
+  when release assets are unavailable, and refuses version downgrades. This
+  removes the previous network-dependent fallback to the unverified `main` branch.
 
 ## [2.7.1] - 2026-08-03
 

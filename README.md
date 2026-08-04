@@ -408,9 +408,10 @@ warning lists everything before you confirm.
 sudo gre update
 ```
 
-Prefers the latest **pinned release**, verifies its SHA-256 checksum, refuses to install on
-mismatch, and only falls back to the main branch (with a warning) when release assets are
-unavailable. Your configuration, watchdog settings, nodes and peers are preserved across updates.
+Downloads only the latest **pinned release**, verifies its SHA-256 checksum, and refuses to
+install a lower version. If release assets are temporarily unavailable, the update stops without
+changing the installed file; it never falls back to an unverified development build from `main`.
+Your configuration, watchdog settings, nodes and peers are preserved across updates.
 
 ## Upgrading from v1.x
 

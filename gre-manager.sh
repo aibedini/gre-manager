@@ -65,7 +65,6 @@ set -uo pipefail
 VERSION="2.8.0"
 
 GITHUB_REPO="aibedini/gre-manager"
-RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/gre-manager.sh"
 
 CONF_DIR="/etc/multi-gre"
 NODES_DIR="$CONF_DIR/nodes"
@@ -154,6 +153,26 @@ valid_ip() {
 
 valid_name() {
     [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,9}$ ]]
+}
+
+valid_version() { # stable SemVer used by releases (major.minor.patch)
+    [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+version_is_newer() { # candidate current -> 0 only when candidate > current
+    local candidate="$1" current="$2" i c n
+    local IFS='.'
+    local -a candidate_parts=() current_parts=()
+    valid_version "$candidate" && valid_version "$current" || return 1
+    read -ra candidate_parts <<< "$candidate"
+    read -ra current_parts <<< "$current"
+    for i in 0 1 2; do
+        c=$((10#${candidate_parts[$i]}))
+        n=$((10#${current_parts[$i]}))
+        (( c > n )) && return 0
+        (( c < n )) && return 1
+    done
+    return 1
 }
 
 valid_port_list() { # comma list of ports or a:b ranges, max 15 (multiport limit)
@@ -1659,7 +1678,9 @@ self_update() {
     tmp="$(mktemp -d)" || { err "mktemp failed"; return 1; }
 
     local remote_ver="" verified="no"
-    # Preferred: latest pinned GitHub release, verified against its SHA-256 checksum.
+    # Only install the latest pinned GitHub release. Falling back to main made
+    # update results depend on transient asset-download failures and bypassed
+    # checksum verification.
     # GitHub connectivity from some networks is flaky — retry each step once.
     local tag="" attempt="" dl_ok=0
     for attempt in 1 2; do
@@ -1680,37 +1701,39 @@ self_update() {
         (( attempt == 1 )) && info "Release asset download failed; retrying..." && sleep 3
     done
 
-    if [[ "$dl_ok" == "1" ]]; then
-        if command -v sha256sum >/dev/null 2>&1; then
-            if (cd "$tmp" && sha256sum -c gre.sha256 >/dev/null 2>&1); then
-                verified="yes"
-            else
-                err "Checksum verification FAILED for release $tag; refusing to update."
-                rm -rf "$tmp"
-                return 1
-            fi
-        else
-            warn "sha256sum not available; installing release $tag without checksum verification."
-        fi
-        remote_ver="$(grep -m1 -E '^VERSION=' "$tmp/gre" | cut -d'"' -f2)"
-    else
-        # Fallback: raw main branch (no checksum possible)
-        warn "Release assets unavailable after retries; falling back to the main branch (no checksum)."
-        if ! curl -fsSL --max-time 60 "$RAW_URL" -o "$tmp/gre"; then
-            err "Download failed. Check your internet connection."
-            rm -rf "$tmp"
-            return 1
-        fi
-        remote_ver="$(grep -m1 -E '^VERSION=' "$tmp/gre" | cut -d'"' -f2)"
+    if [[ "$dl_ok" != "1" ]]; then
+        err "Latest release assets are unavailable after retries; update aborted."
+        info "No files were changed. Retry later."
+        rm -rf "$tmp"
+        return 1
     fi
 
-    if [[ -z "$remote_ver" ]]; then
-        err "Could not parse the remote version."
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        err "sha256sum is required for a verified update; refusing to install."
+        rm -rf "$tmp"
+        return 1
+    fi
+    if (cd "$tmp" && sha256sum -c gre.sha256 >/dev/null 2>&1); then
+        verified="yes"
+    else
+        err "Checksum verification FAILED for release $tag; refusing to update."
+        rm -rf "$tmp"
+        return 1
+    fi
+    remote_ver="$(grep -m1 -E '^VERSION=' "$tmp/gre" | cut -d'"' -f2)"
+
+    if ! valid_version "$remote_ver"; then
+        err "Could not parse a valid release version."
         rm -rf "$tmp"
         return 1
     fi
     if [[ "$remote_ver" == "$VERSION" ]]; then
         ok "Already up to date (v$VERSION)."
+        rm -rf "$tmp"
+        return 0
+    fi
+    if ! version_is_newer "$remote_ver" "$VERSION"; then
+        warn "Installed v$VERSION is newer than latest release v$remote_ver; refusing to downgrade."
         rm -rf "$tmp"
         return 0
     fi

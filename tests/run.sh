@@ -614,6 +614,72 @@ assert_not "suggest rejects an invalid count" test "$GRE_RC" -eq 0
 rm -rf "$R"
 
 # ======================================================================
+sect "16. self-update is release-only and downgrade-safe"
+mkroot
+UPDATE_STUBS="$R/update-stubs"
+mkdir -p "$UPDATE_STUBS" "$R/update-fixtures"
+cat > "$R/update-fixtures/older" <<'EOF'
+#!/usr/bin/env bash
+VERSION="2.7.1"
+EOF
+cat > "$R/update-fixtures/newer" <<'EOF'
+#!/usr/bin/env bash
+VERSION="2.8.1"
+EOF
+cat > "$R/update-fixtures/failure" <<'EOF'
+#!/usr/bin/env bash
+VERSION="2.8.0"
+EOF
+cat > "$UPDATE_STUBS/curl" <<'EOF'
+#!/usr/bin/env bash
+out="" url=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    http*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+printf '%s\n' "$url" >> "$TEST_ROOT/state/update-urls"
+mode="$(cat "$TEST_ROOT/state/update-mode")"
+if [[ "$url" == */releases/latest ]]; then
+  printf '{"tag_name":"v%s"}\n' "$(grep -m1 '^VERSION=' "$TEST_ROOT/update-fixtures/${mode}" | cut -d'"' -f2)"
+elif [[ "$mode" == "failure" ]]; then
+  exit 22
+elif [[ "$url" == */gre.sha256 ]]; then
+  printf 'test-checksum  gre\n' > "$out"
+elif [[ "$url" == */gre ]]; then
+  cp "$TEST_ROOT/update-fixtures/${mode}" "$out"
+else
+  exit 22
+fi
+EOF
+cat > "$UPDATE_STUBS/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+[[ "${1:-}" == "-c" ]]
+EOF
+chmod +x "$UPDATE_STUBS/curl" "$UPDATE_STUBS/sha256sum"
+
+printf 'sentinel\n' > "$R/usr/local/sbin/gre"
+printf 'older\n' > "$R/state/update-mode"
+PATH="$UPDATE_STUBS:$PATH" gre update --yes
+assert "update refuses a downgrade" grep -q "refusing to downgrade" <<< "$GRE_OUT"
+assert "downgrade leaves installed file unchanged" grep -qx "sentinel" "$R/usr/local/sbin/gre"
+
+: > "$R/state/update-urls"
+printf 'failure\n' > "$R/state/update-mode"
+PATH="$UPDATE_STUBS:$PATH" gre update --yes
+assert_not "missing release assets fail the update" test "$GRE_RC" -eq 0
+assert "asset failure leaves installed file unchanged" grep -qx "sentinel" "$R/usr/local/sbin/gre"
+assert_not "updater never falls back to raw main" grep -q "raw.githubusercontent.com" "$R/state/update-urls"
+
+printf 'newer\n' > "$R/state/update-mode"
+PATH="$UPDATE_STUBS:$PATH" gre update --yes
+assert "newer release update succeeds" test "$GRE_RC" -eq 0
+assert "newer release replaces installed file" grep -q '^VERSION="2.8.1"' "$R/usr/local/sbin/gre"
+rm -rf "$R"
+
+# ======================================================================
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]
