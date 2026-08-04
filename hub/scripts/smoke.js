@@ -167,6 +167,15 @@ async function main() {
     r = await anon.call(`/api/servers/${dummyId}/suggest-peer`, { method: 'POST', useCsrf: false });
     check('suggest-peer without CSRF → 403', r.status === 403);
 
+    r = await anon.call(`/api/servers/${dummyId}/suggest-peer`, { method: 'POST', body: { kind: 'invalid' } });
+    check('suggest-peer rejects invalid kind → 400', r.status === 400);
+
+    r = await anon.call(`/api/servers/${dummyId}/suggest-peer`, { method: 'POST', body: { count: 21 } });
+    check('suggest-peer rejects count above pool limit → 400', r.status === 400);
+
+    r = await anon.call(`/api/servers/${dummyId}/suggest-peer`, { method: 'POST', body: { base: '10.200;id' } });
+    check('suggest-peer rejects unsafe base → 400', r.status === 400);
+
     r = await anon.call(`/api/servers/${dummyId}/suggest-peer`, { method: 'POST' });
     check('suggest-peer on dead server → sane 400 error (no crash)',
       r.status === 400 && typeof (r.data && r.data.error) === 'string' && r.data.error.length > 0,

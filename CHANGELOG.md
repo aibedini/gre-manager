@@ -4,6 +4,23 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.0] - 2026-08-04
+
+### Added
+- `gre iran peer suggest` now accepts `--count N` and `--base A.B`, returning
+  rolling pools of up to 20 collision-free names, subnet bases, indexes, GRE
+  keys, and TCP/UDP ports while preserving the original single-value JSON shape.
+- `gre node suggest` provides the equivalent name/subnet/index/key pools using
+  FOREIGN-side node allocations.
+- gre-hub Node-add, Peer-add, and Configure-as-IRAN forms now use editable
+  datalist comboboxes. IP choices come from role-matched servers already in the
+  hub; resource choices load ten free values and refresh indexes/keys when the
+  selected subnet base changes.
+
+### Security
+- The suggestion endpoint validates suggestion type, count, and subnet base
+  before building its remote command.
+
 ## [2.7.1] - 2026-08-03
 
 ### Added

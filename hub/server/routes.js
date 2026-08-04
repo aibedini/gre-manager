@@ -425,15 +425,22 @@ function createRouter(db, cryptKey, dataDir) {
     }
   }));
 
-  // --- Peer suggestions (gre >= 2.7.0) --------------------------------------
+  // --- Collision-free value pools (gre >= 2.8.0 for count/base/node) --------
   authed.post('/servers/:id/suggest-peer', wrap(async (req, res) => {
     const server = getServer(req.params.id);
     if (!server) return res.status(404).json({ error: 'not found' });
-    const result = await ssh.exec(server, getSecret(server), 'gre iran peer suggest --json', { timeoutMs: 30000, ...sshOptsFor(server) });
+    const { kind = 'peer', base = '' } = req.body || {};
+    const count = Number((req.body || {}).count ?? 10);
+    if (!['peer', 'node'].includes(kind)) return res.status(400).json({ error: 'kind must be peer or node' });
+    if (!Number.isInteger(count) || count < 1 || count > 20) return res.status(400).json({ error: 'count must be an integer from 1 to 20' });
+    if (base && !/^\d{1,3}\.\d{1,3}$/.test(String(base))) return res.status(400).json({ error: 'base must look like A.B' });
+    const command = kind === 'node' ? 'gre node suggest' : 'gre iran peer suggest';
+    const baseArg = base ? ` --base ${String(base)}` : '';
+    const result = await ssh.exec(server, getSecret(server), `${command} --json --count ${count}${baseArg}`, { timeoutMs: 30000, ...sshOptsFor(server) });
     if (result.hostkey_mismatch) return hostKeyMismatchResponse(res, server, result.presented_fp);
     const combined = `${result.stdout || ''}\n${result.stderr || ''}`;
     if (result.rc !== 0) {
-      const tooOld = /Unknown argument/i.test(combined);
+      const tooOld = /Unknown (?:argument|option)/i.test(combined);
       return res.status(400).json({
         error: tooOld
           ? 'remote gre is too old for this action; run the \'update\' action first'

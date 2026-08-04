@@ -682,8 +682,8 @@ const FORM_ACTIONS = [
     { name: 'icmp_drop', label: 'ICMP drop', type: 'select', options: [['', 'default (off)'], ['on', 'on'], ['off', 'off']] },
     { name: 'downtime', label: 'Downtime tolerance, minutes (default 2)', type: 'number' },
   ] },
-  { id: 'setup_iran', label: 'Configure as IRAN', desc: 'First-time IRAN setup — creates the first foreign peer', suggest: true, fields: [
-    { name: 'foreign_ip', label: 'Foreign IP', required: true },
+  { id: 'setup_iran', label: 'Configure as IRAN', desc: 'First-time IRAN setup — creates the first foreign peer', suggest: true, suggestionKind: 'peer', fields: [
+    { name: 'foreign_ip', label: 'Foreign IP', required: true, ipRole: 'FOREIGN' },
     { name: 'name', label: 'Peer name (optional)' },
     { name: 'idx', label: 'Index (optional)', type: 'number' },
     { name: 'key', label: 'GRE key (optional)' },
@@ -695,9 +695,9 @@ const FORM_ACTIONS = [
   { id: 'watchdog_interval', label: 'Watchdog: interval', desc: 'Set check interval (1-60 min)', fields: [
     { name: 'interval', label: 'Interval (minutes)', type: 'number', required: true },
   ] },
-  { id: 'node_add', label: 'Node: add', desc: 'Add an Iran node (FOREIGN side)', fields: [
+  { id: 'node_add', label: 'Node: add', desc: 'Add an Iran node (FOREIGN side)', suggest: true, suggestionKind: 'node', fields: [
     { name: 'name', label: 'Name', required: true },
-    { name: 'ip', label: 'Iran IP', required: true },
+    { name: 'ip', label: 'Iran IP', required: true, ipRole: 'IRAN' },
     { name: 'idx', label: 'Index (optional)', type: 'number' },
     { name: 'key', label: 'GRE key (optional)' },
     { name: 'subnet_base', label: 'Subnet base, e.g. 10.9 (optional)' },
@@ -705,10 +705,10 @@ const FORM_ACTIONS = [
   { id: 'node_remove', label: 'Node: remove', desc: 'Remove an Iran node (FOREIGN side)', fields: [
     { name: 'name', label: 'Name', required: true },
   ] },
-  { id: 'peer_add', label: 'Peer: add', desc: 'Connect to a foreign server (IRAN side)', suggest: true, fields: [
+  { id: 'peer_add', label: 'Peer: add', desc: 'Connect to a foreign server (IRAN side)', suggest: true, suggestionKind: 'peer', fields: [
     { name: 'name', label: 'Name', required: true },
-    { name: 'foreign_ip', label: 'Foreign IP', required: true },
-    { name: 'iran_ip', label: 'Iran IP (optional)' },
+    { name: 'foreign_ip', label: 'Foreign IP', required: true, ipRole: 'FOREIGN' },
+    { name: 'iran_ip', label: 'Iran IP (optional)', ipRole: 'IRAN', includeCurrent: true },
     { name: 'subnet_base', label: 'Subnet base (optional)' },
     { name: 'idx', label: 'Index (optional)', type: 'number' },
     { name: 'key', label: 'GRE key (optional)' },
@@ -774,7 +774,19 @@ function runSimpleAction(def) {
   executeAction(def.id);
 }
 
+function roleServerOptions(role, includeCurrent = false) {
+  const seen = new Set();
+  return state.servers
+    .filter((server) => includeCurrent || server.id !== (state.current && state.current.id))
+    .filter((server) => ((server.snapshot && server.snapshot.roles) || [])
+      .some((value) => String(value).toUpperCase() === role))
+    .filter((server) => /^\d{1,3}(?:\.\d{1,3}){3}$/.test(server.host || ''))
+    .filter((server) => !seen.has(server.host) && seen.add(server.host))
+    .map((server) => ({ value: server.host, label: server.name }));
+}
+
 function openActionForm(def) {
+  const suggestFields = new Set(['name', 'subnet_base', 'idx', 'key', 'tcp_ports', 'udp_ports']);
   const fields = def.fields.map((f) => {
     if (f.type === 'select') {
       const opts = (f.options || []).map(([v, label]) => `<option value="${esc(v)}">${esc(label)}</option>`).join('');
@@ -784,10 +796,18 @@ function openActionForm(def) {
       <select name="${f.name}" ${f.required ? 'required' : ''}>${opts}</select>
     </div>`;
     }
+    const listId = f.ipRole
+      ? `${def.id}-${f.name}-servers`
+      : (def.suggest && suggestFields.has(f.name) ? `${def.id}-${f.name}-suggestions` : '');
+    const options = f.ipRole
+      ? roleServerOptions(f.ipRole, f.includeCurrent).map((item) => `<option value="${esc(item.value)}">${esc(item.label)}</option>`).join('')
+      : '';
     return `
     <div class="field">
       <label>${esc(f.label)}</label>
-      <input name="${f.name}" ${f.required ? 'required' : ''} type="${f.type || 'text'}" />
+      <input name="${f.name}" ${f.required ? 'required' : ''} type="${f.type || 'text'}" ${listId ? `list="${listId}"` : ''} autocomplete="off" />
+      ${listId ? `<datalist id="${listId}">${options}</datalist>` : ''}
+      ${f.ipRole ? `<span class="hint">Choose a ${f.ipRole} server from this hub, or type another IP.</span>` : ''}
     </div>`;
   }).join('');
   openModal(`
@@ -797,7 +817,7 @@ function openActionForm(def) {
       ${fields}
       <div class="form-error" id="action-form-error"></div>
       <div class="foot">
-        ${def.suggest ? '<button type="button" class="btn btn-ghost" id="btn-suggest" title="Fill with collision-free values from the server (gre >= 2.7.0)">Suggest</button>' : ''}
+        ${def.suggest ? '<button type="button" class="btn btn-ghost" id="btn-suggest" title="Reload 10 collision-free values from the server (gre >= 2.8.0)">Refresh values</button>' : ''}
         <button type="button" class="btn btn-ghost" id="btn-cancel-action">Cancel</button>
         <button type="submit" class="btn">Run</button>
       </div>
@@ -805,32 +825,39 @@ function openActionForm(def) {
   $('#btn-cancel-action').addEventListener('click', closeModal);
   const suggestBtn = $('#btn-suggest');
   if (suggestBtn) {
-    // Map suggest response keys to form field names; empty values are skipped.
     const SUGGEST_MAP = { name: 'name', subnet_base: 'subnet_base', idx: 'idx', key: 'key', tcp_port: 'tcp_ports', udp_port: 'udp_ports' };
-    suggestBtn.addEventListener('click', async () => {
+    const loadSuggestions = async ({ fillEmpty = false, base = '' } = {}) => {
       const form = $('#action-form');
       const errEl = $('#action-form-error');
       errEl.textContent = '';
       suggestBtn.disabled = true;
-      suggestBtn.textContent = 'Suggesting…';
+      suggestBtn.textContent = 'Loading values…';
       try {
         const s = state.current;
-        const data = await api(`/api/servers/${s.id}/suggest-peer`, { method: 'POST' });
+        const data = await api(`/api/servers/${s.id}/suggest-peer`, {
+          method: 'POST',
+          body: { kind: def.suggestionKind || 'peer', count: 10, ...(base ? { base } : {}) },
+        });
         let filled = 0;
         for (const [src, dest] of Object.entries(SUGGEST_MAP)) {
-          const v = data[src];
-          if (v !== undefined && v !== null && v !== '' && form[dest]) {
-            form[dest].value = v;
-            filled++;
-          }
+          if (!form[dest]) continue;
+          const values = Array.isArray(data[src]) ? data[src] : [data[src]];
+          const clean = values.filter((value) => value !== undefined && value !== null && value !== '');
+          const list = $(`#${def.id}-${dest}-suggestions`);
+          if (list) list.innerHTML = clean.map((value) => `<option value="${esc(value)}"></option>`).join('');
+          if (fillEmpty && !form[dest].value && clean.length) { form[dest].value = clean[0]; filled++; }
         }
-        toast(filled ? `Suggested values filled in (${filled} fields)` : 'Server returned no suggestions');
+        if (fillEmpty) toast(filled ? `Loaded 10-value pools and filled ${filled} fields` : 'Suggestion lists refreshed');
       } catch (err) {
         errEl.textContent = err.message;
       }
       suggestBtn.disabled = false;
-      suggestBtn.textContent = 'Suggest';
-    });
+      suggestBtn.textContent = 'Refresh values';
+    };
+    suggestBtn.addEventListener('click', () => loadSuggestions({ fillEmpty: true, base: $('#action-form').subnet_base?.value.trim() || '' }));
+    const baseInput = $('#action-form').subnet_base;
+    if (baseInput) baseInput.addEventListener('change', () => loadSuggestions({ base: baseInput.value.trim() }));
+    loadSuggestions();
   }
   $('#action-form').addEventListener('submit', (e) => {
     e.preventDefault();

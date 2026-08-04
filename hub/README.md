@@ -58,10 +58,12 @@ Configuration via environment variables:
   when the server is already configured), node add/remove (FOREIGN), peer
   add/remove/apply (IRAN), export, and purge (requires typing `PURGE`). When a
   remote gre is too old for an action, the hub appends a hint to run the
-  `update` action first. The "Peer: add" and "Configure as IRAN" forms have a
-  **Suggest** button that asks the server for collision-free values
-  (`gre iran peer suggest --json`, requires remote gre >= 2.7.0) and fills the
-  form. Every run is recorded in the action log (params with secrets masked).
+  `update` action first. The Node-add, Peer-add, and Configure-as-IRAN forms use
+  editable dropdowns: role-matched IRAN/FOREIGN IPs come from servers already
+  registered in the hub, while ten rolling free-value suggestions come from
+  `gre node suggest` or `gre iran peer suggest --count 10` (requires remote gre
+  >= 2.8.0). Changing the subnet refreshes its index/key pool. Every run is
+  recorded in the action log (params with secrets masked).
 - **Terminal** — full SSH shell in the browser (xterm.js), bridged over a
   WebSocket authenticated by a short-lived one-time ticket.
 

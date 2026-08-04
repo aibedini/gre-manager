@@ -62,7 +62,7 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are validated then sourced by design
 set -uo pipefail
 
-VERSION="2.7.1"
+VERSION="2.8.0"
 
 GITHUB_REPO="aibedini/gre-manager"
 RAW_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/main/gre-manager.sh"
@@ -2492,49 +2492,144 @@ iran_peers_json() { # prints the iran_peers JSON array (pings each peer once)
     printf '%s' "$out"
 }
 
-cli_iran_peer_suggest() { # gre iran peer suggest [--json] — collision-free values for a new peer
-    local json=0
+json_string_array() {
+    local sep="" value
+    printf '['
+    for value in "$@"; do
+        printf '%s"%s"' "$sep" "$value"
+        sep=","
+    done
+    printf ']'
+}
+
+json_number_array() {
+    local sep="" value
+    printf '['
+    for value in "$@"; do
+        printf '%s%s' "$sep" "$value"
+        sep=","
+    done
+    printf ']'
+}
+
+cli_suggest_resources() { # cli_suggest_resources peer|node [--json] [--count N] [--base A.B]
+    local kind="$1"; shift
+    local json=0 count=1 requested_base="" conf_dir="" include_ports=0
+    if [[ "$kind" == "peer" ]]; then
+        conf_dir="$FOREIGNS_DIR"
+        include_ports=1
+    else
+        conf_dir="$NODES_DIR"
+    fi
+
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --json)     json=1; shift ;;
-            --help|-h)  echo "Usage: gre iran peer suggest [--json]"; return 0 ;;
-            *)          err "Unknown option: $1"; err "Usage: gre iran peer suggest [--json]"; return 1 ;;
+            --count)    [[ -n "${2:-}" ]] || { err "Missing value for --count"; return 1; }; count="$2"; shift 2 ;;
+            --base)     [[ -n "${2:-}" ]] || { err "Missing value for --base"; return 1; }; requested_base="$2"; shift 2 ;;
+            --help|-h)
+                if [[ "$kind" == "peer" ]]; then
+                    echo "Usage: gre iran peer suggest [--json] [--count N] [--base A.B]"
+                else
+                    echo "Usage: gre node suggest [--json] [--count N] [--base A.B]"
+                fi
+                return 0 ;;
+            *)          err "Unknown option: $1"; return 1 ;;
         esac
     done
+    if ! [[ "$count" =~ ^[0-9]+$ ]] || (( count < 1 || count > 20 )); then
+        err "Invalid count: $count (expected 1..20)"
+        return 1
+    fi
+    [[ -z "$requested_base" ]] || valid_subnet_base "$requested_base" || {
+        err "Invalid subnet base: $requested_base (expected A.B, e.g. 10.201)"
+        return 1
+    }
 
-    local s_base="" s_idx="" s_key="" s_tcp="" s_udp="" s_name=""
-    s_base="$(next_free_subnet_base)" || { err "No free subnet base left (pool exhausted)"; return 1; }
-    s_idx="$(next_free_peer_idx "$s_base")" || { err "No free tunnel index left in $s_base"; return 1; }
-    s_key=$(( 1000 + s_idx ))
-    s_tcp="$(suggest_free_port tcp)" || s_tcp=""
-    s_udp="$(suggest_free_port udp)" || s_udp=""
-
-    # first free generic name irNN (rename freely — it must match the FOREIGN side)
-    local f existing=" " n=""
-    for f in "$FOREIGNS_DIR"/*.conf; do
+    local f existing_names=" " used_bases=" " n="" b="" idx="" i port=""
+    local -a names=() bases=() indexes=() keys=() tcp_ports=() udp_ports=()
+    for f in "$conf_dir"/*.conf; do
         [[ -e "$f" ]] || continue
         n="$(grep -E '^NAME=' "$f" | cut -d= -f2)"
-        [[ -n "$n" ]] && existing+="$n "
+        [[ -n "$n" ]] && existing_names+="$n "
+        b="$(grep -E '^SUBNET_BASE=' "$f" | cut -d= -f2)"
+        used_bases+="${b:-$DEFAULT_SUBNET_BASE} "
     done
-    local i
-    for (( i = 1; i <= 99; i++ )); do
+    for (( i = 1; i <= 99 && ${#names[@]} < count; i++ )); do
         n="$(printf 'ir%02d' "$i")"
-        if [[ "$existing" != *" $n "* ]]; then s_name="$n"; break; fi
+        [[ "$existing_names" == *" $n "* ]] || names+=("$n")
     done
+    for (( i = 200; i <= 254 && ${#bases[@]} < count; i++ )); do
+        [[ "$used_bases" == *" 10.$i "* ]] || bases+=("10.$i")
+    done
+    ((${#bases[@]})) || { err "No free subnet base left (pool exhausted)"; return 1; }
+
+    local context_base="${requested_base:-${bases[0]}}" used_indexes=" "
+    for f in "$conf_dir"/*.conf; do
+        [[ -e "$f" ]] || continue
+        b="$(grep -E '^SUBNET_BASE=' "$f" | cut -d= -f2)"; b="${b:-$DEFAULT_SUBNET_BASE}"
+        [[ "$b" == "$context_base" ]] || continue
+        idx="$(grep -E '^IDX=' "$f" | cut -d= -f2)"
+        [[ -n "$idx" ]] && used_indexes+="$idx "
+    done
+    for (( i = 1; i <= 254 && ${#indexes[@]} < count; i++ )); do
+        if [[ "$used_indexes" != *" $i "* ]]; then
+            indexes+=("$i")
+            keys+=("$((1000 + i))")
+        fi
+    done
+    ((${#indexes[@]})) || { err "No free tunnel index left in $context_base"; return 1; }
+
+    if (( include_ports )); then
+        port=3001
+        for (( i = 0; i < count; i++ )); do
+            port="$(suggest_free_port tcp "$port")" || break
+            tcp_ports+=("$port")
+            port=$((port + 1))
+        done
+        port=3001
+        for (( i = 0; i < count; i++ )); do
+            port="$(suggest_free_port udp "$port")" || break
+            udp_ports+=("$port")
+            port=$((port + 1))
+        done
+    fi
 
     if (( json )); then
-        printf '{"name":"%s","subnet_base":"%s","idx":%s,"key":%s,"tcp_port":"%s","udp_port":"%s"}\n' \
-            "$s_name" "$s_base" "$s_idx" "$s_key" "$s_tcp" "$s_udp"
+        if (( count == 1 )); then
+            if (( include_ports )); then
+                printf '{"name":"%s","subnet_base":"%s","idx":%s,"key":%s,"tcp_port":"%s","udp_port":"%s"}\n' \
+                    "${names[0]:-}" "${bases[0]}" "${indexes[0]}" "${keys[0]}" "${tcp_ports[0]:-}" "${udp_ports[0]:-}"
+            else
+                printf '{"name":"%s","subnet_base":"%s","idx":%s,"key":%s}\n' \
+                    "${names[0]:-}" "${bases[0]}" "${indexes[0]}" "${keys[0]}"
+            fi
+        else
+            printf '{"context_base":"%s","name":' "$context_base"; json_string_array "${names[@]}"
+            printf ',"subnet_base":'; json_string_array "${bases[@]}"
+            printf ',"idx":'; json_number_array "${indexes[@]}"
+            printf ',"key":'; json_number_array "${keys[@]}"
+            if (( include_ports )); then
+                printf ',"tcp_port":'; json_string_array "${tcp_ports[@]}"
+                printf ',"udp_port":'; json_string_array "${udp_ports[@]}"
+            fi
+            printf '}\n'
+        fi
     else
-        echo "Suggested values for a new foreign peer (collision-free with existing config):"
-        printf '  name        : %s  (must match the FOREIGN node name)\n' "$s_name"
-        printf '  subnet base : %s\n' "$s_base"
-        printf '  index       : %s\n' "$s_idx"
-        printf '  GRE key     : %s\n' "$s_key"
-        printf '  TCP port    : %s\n' "${s_tcp:-none}"
-        printf '  UDP port    : %s\n' "${s_udp:-none}"
+        echo "Suggested values (collision-free with existing $kind config):"
+        printf '  names       : %s\n' "${names[*]:-none}"
+        printf '  subnet bases: %s\n' "${bases[*]:-none}"
+        printf '  indexes     : %s  (for %s)\n' "${indexes[*]:-none}" "$context_base"
+        printf '  GRE keys    : %s\n' "${keys[*]:-none}"
+        if (( include_ports )); then
+            printf '  TCP ports   : %s\n' "${tcp_ports[*]:-none}"
+            printf '  UDP ports   : %s\n' "${udp_ports[*]:-none}"
+        fi
     fi
 }
+
+cli_node_suggest() { cli_suggest_resources node "$@"; }
+cli_iran_peer_suggest() { cli_suggest_resources peer "$@"; }
 
 cli_iran_peer_list() { # gre iran peer list [--json]
     local json=0
@@ -3401,12 +3496,14 @@ case "${1:-}" in
     node)
         case "${2:-}" in
             list)    cli_node_list "${@:3}" ;;
+            suggest) cli_node_suggest "${@:3}" ;;
             add)     cli_node_add "${@:3}" ;;
             remove)  cli_node_remove "${@:3}" ;;
             --help|-h)
                 cat <<'EOF'
 Usage:
   gre node list [--json]
+  gre node suggest [--json] [--count N] [--base A.B]
   gre node add --name NAME --ip IRAN_IP [--idx N] [--key K] [--subnet-base A.B] [--yes]
   gre node remove --name NAME [--yes]
 EOF
@@ -3426,7 +3523,7 @@ EOF
                         cat <<'EOF'
 Usage:
   gre iran peer list [--json]
-  gre iran peer suggest [--json]
+  gre iran peer suggest [--json] [--count N] [--base A.B]
   gre iran peer add --name NAME --foreign-ip IP [--iran-ip IP] [--subnet-base A.B]
                     [--idx N] [--key K] [--wan IFACE] [--tcp-ports LIST]
                     [--udp-ports LIST] [--mss-clamp on|off] [--yes]

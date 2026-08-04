@@ -549,6 +549,10 @@ assert "legacy node conf (no base) applied" grep -q "10.200.9.1/30" "$R/state/ad
 gre node remove --name ir09 --yes
 assert "node remove rc=0" test "$GRE_RC" -eq 0
 assert "node remove hints peer remove" grep -q "gre iran peer remove --name ir09" <<< "$GRE_OUT"
+gre node suggest --json --count 10 --base 10.200
+json_check "node suggest uses FOREIGN node allocations" \
+  'assert d["context_base"]=="10.200" and all(len(d[k])==10 for k in ("name","subnet_base","idx","key")) and d["name"][0]=="ir03" and d["subnet_base"][0]=="10.202" and d["idx"][0]==2 and d["key"][0]==1002' \
+  '"name":\["ir03"'
 rm -rf "$R"
 
 # ======================================================================
@@ -597,6 +601,16 @@ gre iran peer suggest --json
 json_check "suggest skips used bases and ports" \
   'assert d["subnet_base"]=="10.202" and d["tcp_port"]=="3003"' \
   '"subnet_base":"10.202"'
+gre iran peer suggest --json --count 10
+json_check "suggest returns rolling pools of 10" \
+  'assert d["context_base"]=="10.202" and all(len(d[k])==10 for k in ("name","subnet_base","idx","key","tcp_port","udp_port")) and d["subnet_base"][0]=="10.202" and d["tcp_port"][0]=="3003" and d["tcp_port"][-1]=="3012"' \
+  '"tcp_port":\["3003"'
+gre iran peer suggest --json --count 10 --base 10.200
+json_check "base override refreshes index and key pools" \
+  'assert d["context_base"]=="10.200" and d["idx"][0]==2 and d["key"][0]==1002' \
+  '"context_base":"10.200"'
+gre iran peer suggest --json --count 0
+assert_not "suggest rejects an invalid count" test "$GRE_RC" -eq 0
 rm -rf "$R"
 
 # ======================================================================
