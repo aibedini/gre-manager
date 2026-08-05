@@ -163,6 +163,13 @@ json_valid "peer suggest JSON valid"
 json_check "fresh suggest values" \
   'assert d["subnet_base"]=="10.200" and d["idx"]==1 and d["key"]==1001 and d["tcp_port"]=="3001"' \
   '"subnet_base":"10.200"'
+gre iran peer add --name aparshetz01 --foreign-ip 203.0.113.10 --iran-ip 198.51.100.20 \
+  --subnet-base 10.200 --idx 1 --key 1001 --yes
+assert "11-character peer name accepted" test "$GRE_RC" -eq 0
+assert "11-character tunnel uses Linux maximum" tun_there gre-aparshetz01
+gre iran peer add --name abcdefghijkl --foreign-ip 203.0.113.11 \
+  --subnet-base 10.201 --idx 1 --key 1001 --yes
+assert_not "12-character peer name rejected" test "$GRE_RC" -eq 0
 gre export "$WORK/exp.tar.gz" --yes; assert "export with no config writes empty backup (rc=0 with --yes)" test "$GRE_RC" -eq 0
 gre import;        assert_not "import without file fails" test "$GRE_RC" -eq 0
 gre bogus-command; assert_not "unknown command fails" test "$GRE_RC" -eq 0

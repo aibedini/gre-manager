@@ -147,10 +147,32 @@ async function main() {
     check('setup_foreign with out-of-range downtime → 400', r.status === 400);
 
     r = await anon.call(`/api/servers/${dummyId}/action`, { method: 'POST', body: { action: 'setup_iran', params: { foreign_ip: '1.2.3.4', name: 'peer1', idx: 3, key: '1001', subnet_base: '10.9', tcp_ports: '80,443', udp_ports: '53', downtime: 5 } } });
-    check('setup_iran valid → reaches SSH, correct command',
-      r.status === 200 &&
-      r.data.command === `gre iran-setup --foreign-ip '1.2.3.4' --name 'peer1' --idx 3 --key '1001' --subnet-base '10.9' --tcp-ports '80,443' --udp-ports '53' --downtime 5 --yes`,
-      r.data && r.data.command);
+    check('setup_iran requires registered FOREIGN endpoint before SSH',
+      r.status === 400 && /registered in Hub/.test(r.data && r.data.error),
+      JSON.stringify(r.data));
+
+    r = await anon.call('/api/servers', {
+      method: 'POST',
+      body: { name: 'dummy-foreign', host: '127.0.0.2', ssh_port: 2, username: 'root', password: 'dummy-password' },
+    });
+    check('add registered peer endpoint → 201', r.status === 201);
+    const foreignDummyId = r.data && r.data.id;
+
+    r = await anon.call(`/api/servers/${dummyId}/action`, {
+      method: 'POST',
+      body: { action: 'setup_iran', params: { foreign_ip: '127.0.0.2', name: 'peer1' } },
+    });
+    check('failed two-way preflight → 409 and blocks gre action',
+      r.status === 409 && r.data.connectivity_failed === true && !r.data.command &&
+        r.data.iran_to_foreign.reachable === false && r.data.foreign_to_iran.reachable === false,
+      JSON.stringify(r.data));
+
+    r = await anon.call('/api/servers');
+    const iranDummy = Array.isArray(r.data) && r.data.find((server) => server.id === dummyId);
+    const foreignDummy = Array.isArray(r.data) && r.data.find((server) => server.id === foreignDummyId);
+    check('failed pair is persisted on both server cards',
+      iranDummy && iranDummy.connectivity.length === 1 && foreignDummy && foreignDummy.connectivity.length === 1,
+      JSON.stringify(r.data));
 
     r = await anon.call(`/api/servers/${dummyId}/action`, { method: 'POST', body: { action: 'setup_foreign', params: {} } });
     check('setup_foreign defaults → bare command', r.status === 200 && r.data.command === 'gre foreign-setup --yes', r.data && r.data.command);
@@ -183,6 +205,8 @@ async function main() {
 
     r = await anon.call(`/api/servers/${dummyId}`, { method: 'DELETE' });
     check('delete dummy server → 200', r.status === 200);
+    r = await anon.call(`/api/servers/${foreignDummyId}`, { method: 'DELETE' });
+    check('delete peer dummy server → 200', r.status === 200);
 
     r = await anon.call('/api/definitely-not-a-route');
     check('unknown /api route → 404 JSON', r.status === 404 && r.data && r.data.error === 'not found');

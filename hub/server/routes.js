@@ -10,6 +10,7 @@ const actions = require('./actions');
 const ssh = require('./ssh');
 const totp = require('./totp');
 const provision = require('./provision');
+const connectivity = require('./connectivity');
 const { encrypt, decrypt } = require('./crypto');
 const { audit } = require('./db');
 
@@ -120,6 +121,23 @@ function createRouter(db, cryptKey, dataDir) {
       host_key_pinned: !!row.host_key_fp,
     };
   };
+
+  const connectivityFor = (serverId) => db.prepare(`
+    SELECT c.*,
+      iran.name AS iran_name,
+      foreign_server.name AS foreign_name
+    FROM connectivity_checks c
+    JOIN servers iran ON iran.id = c.iran_server_id
+    JOIN servers foreign_server ON foreign_server.id = c.foreign_server_id
+    WHERE c.iran_server_id = ? OR c.foreign_server_id = ?
+    ORDER BY c.checked_at DESC
+  `).all(serverId, serverId).map((row) => ({
+    iran: { id: row.iran_server_id, name: row.iran_name, ip: row.iran_ip },
+    foreign: { id: row.foreign_server_id, name: row.foreign_name, ip: row.foreign_ip },
+    iran_to_foreign: { reachable: !!row.iran_to_foreign, detail: row.iran_to_foreign_detail },
+    foreign_to_iran: { reachable: !!row.foreign_to_iran, detail: row.foreign_to_iran_detail },
+    checked_at: row.checked_at,
+  }));
 
   // Uniform response when a server presents a different host key.
   const hostKeyMismatchResponse = (res, server, presentedFp) =>
@@ -258,7 +276,7 @@ function createRouter(db, cryptKey, dataDir) {
   // --- Servers CRUD -----------------------------------------------------
   authed.get('/servers', (req, res) => {
     const rows = db.prepare('SELECT * FROM servers ORDER BY name').all();
-    res.json(rows.map((r) => ({ ...publicServer(r), snapshot: getSnapshot(r.id) })));
+    res.json(rows.map((r) => ({ ...publicServer(r), snapshot: getSnapshot(r.id), connectivity: connectivityFor(r.id) })));
   });
 
   authed.post('/servers', (req, res) => {
@@ -298,7 +316,7 @@ function createRouter(db, cryptKey, dataDir) {
   authed.get('/servers/:id', (req, res) => {
     const server = getServer(req.params.id);
     if (!server) return res.status(404).json({ error: 'not found' });
-    res.json({ ...publicServer(server), snapshot: getSnapshot(server.id) });
+    res.json({ ...publicServer(server), snapshot: getSnapshot(server.id), connectivity: connectivityFor(server.id) });
   });
 
   authed.put('/servers/:id', (req, res) => {
@@ -405,7 +423,33 @@ function createRouter(db, cryptKey, dataDir) {
       return res.status(400).json({ error: `unknown action (allowed: ${actions.ACTION_NAMES.join(', ')})` });
     }
     try {
-      const result = await actions.runAction(db, server, getSecret(server), action, params || {}, sshOptsFor(server));
+      // Validate every action before doing network preflight work.
+      const command = actions.buildAction(action, params || {});
+      let preflight = null;
+      if (connectivity.PREFLIGHT_ACTIONS.has(action)) {
+        const pair = connectivity.resolvePair(db, server, action, params || {});
+        preflight = await connectivity.checkPair(pair, { getSecret, sshOptsFor });
+        if (preflight.hostkey_mismatch) {
+          auditEvent(server.id, server.name, `${action}_preflight`, { peer: preflight.server.name }, 1, 'aborted: SSH host key mismatch', 'action');
+          return hostKeyMismatchResponse(res, preflight.server, preflight.presented_fp);
+        }
+        connectivity.persistPair(db, preflight);
+        auditEvent(server.id, server.name, `${action}_preflight`, {
+          iran: `${preflight.iran.name} (${preflight.iran.ip})`,
+          foreign: `${preflight.foreign.name} (${preflight.foreign.ip})`,
+        }, preflight.ok ? 0 : 1,
+        `IRAN -> FOREIGN: ${preflight.iran_to_foreign.reachable ? 'PASS' : 'FAIL'}; FOREIGN -> IRAN: ${preflight.foreign_to_iran.reachable ? 'PASS' : 'FAIL'}`,
+        'action');
+        if (!preflight.ok) {
+          return res.status(409).json({
+            error: 'The servers cannot reach each other in both directions. No node or peer was created. Do not retry setup until network/ICMP routing or firewall is fixed.',
+            connectivity_failed: true,
+            ...preflight,
+          });
+        }
+      }
+
+      const result = await actions.runAction(db, server, getSecret(server), action, params || {}, sshOptsFor(server), command);
       if (result.hostkey_mismatch) return hostKeyMismatchResponse(res, server, result.presented_fp);
       // Refresh the snapshot after state-changing actions (best effort).
       if (!['doctor'].includes(action)) {
@@ -419,7 +463,7 @@ function createRouter(db, cryptKey, dataDir) {
       const hint = result.rc !== 0 && /Unknown argument/i.test(combined)
         ? 'remote gre is too old for this action; run the \'update\' action first'
         : undefined;
-      res.json({ ok: result.rc === 0, rc: result.rc, stdout: result.stdout, stderr: result.stderr, command: result.command, ...(hint ? { hint } : {}) });
+      res.json({ ok: result.rc === 0, rc: result.rc, stdout: result.stdout, stderr: result.stderr, command: result.command, ...(preflight ? { preflight } : {}), ...(hint ? { hint } : {}) });
     } catch (err) {
       res.status(400).json({ error: err.message });
     }

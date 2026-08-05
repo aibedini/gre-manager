@@ -50,7 +50,9 @@ Configuration via environment variables:
   (`vatan-m2`, nat rules referencing `132.168.30.`, broad MASQUERADE, INPUT icmp
   DROP). Snapshots are stored in SQLite; server cards show role, version,
   tunnels, watchdog, peer names with reachability dots, LEGACY/UNMANAGED
-  warnings, and a per-card Discover button.
+  warnings, and a per-card Discover button. The overview groups cards by IRAN,
+  FOREIGN, dual-role, and unconfigured state, and refreshes discovery every 10
+  seconds while the authenticated page is visible.
 - **Actions** — allowlisted, non-interactive (`--yes`) commands executed over SSH
   with captured output: install, update, doctor, restart all, watchdog control,
   first-time role setup (`setup_foreign` → `gre foreign-setup`, needs gre >=
@@ -66,7 +68,11 @@ Configuration via environment variables:
   suggest` or `gre iran peer suggest --count 10` (requires remote gre >= 2.8.0):
   subnet base remains an editable `A.B` combobox, while TCP/UDP ports are chosen
   randomly from the free pools without matching each other when alternatives
-  exist. Every run is recorded in the action log (params with secrets masked).
+  exist. Before Configure-as-IRAN, Peer-add, or Node-add runs, the Hub performs
+  bounded public IPv4 ping checks from IRAN to FOREIGN and back. Both endpoints
+  must be uniquely registered in the Hub and both directions must pass; failed
+  results are persisted and shown on both cards, and no `gre` setup command is
+  executed. Every run is recorded in the action log (params with secrets masked).
 - **Terminal** — full SSH shell in the browser (xterm.js), bridged over a
   WebSocket authenticated by a short-lived one-time ticket.
 

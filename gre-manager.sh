@@ -62,7 +62,7 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are validated then sourced by design
 set -uo pipefail
 
-VERSION="2.8.1"
+VERSION="2.8.2"
 
 GITHUB_REPO="aibedini/gre-manager"
 
@@ -152,7 +152,8 @@ valid_ip() {
 }
 
 valid_name() {
-    [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,9}$ ]]
+    # Linux interface names are limited to 15 characters; tunnels use gre-NAME.
+    [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,10}$ ]]
 }
 
 valid_version() { # stable SemVer used by releases (major.minor.patch)
@@ -399,7 +400,7 @@ validate_peer_values() { # validate_peer_values ["quiet"]
     local quiet="${1:-}" e=0
     valid_ip "$IRAN_IP"          || { [[ -z "$quiet" ]] && err "Invalid Iran IP: '$IRAN_IP'"; e=1; }
     valid_ip "$FOREIGN_IP"       || { [[ -z "$quiet" ]] && err "Invalid foreign IP: '$FOREIGN_IP'"; e=1; }
-    valid_name "$NAME"           || { [[ -z "$quiet" ]] && err "Invalid peer name: '$NAME'"; e=1; }
+    valid_name "$NAME"           || { [[ -z "$quiet" ]] && err "Invalid peer name: '$NAME' (use 1-11 letters, digits, '_' or '-'; start with a letter or digit)"; e=1; }
     valid_subnet_base "$SUBNET_BASE" || { [[ -z "$quiet" ]] && err "Invalid subnet base: '$SUBNET_BASE' (expected A.B, e.g. 10.201)"; e=1; }
     { [[ "$IDX" =~ ^[0-9]+$ ]] && (( IDX >= 1 && IDX <= 254 )); } \
                                  || { [[ -z "$quiet" ]] && err "Invalid tunnel index: '$IDX' (1-254)"; e=1; }
@@ -1452,7 +1453,7 @@ EOF
     echo
     info "Add a new IRAN node"
     ask NAME    "Node name (e.g. ir01)" "ir01"
-    valid_name "$NAME" || { err "Invalid node name: $NAME"; return 1; }
+    valid_name "$NAME" || { err "Invalid node name: $NAME (use 1-11 letters, digits, '_' or '-'; start with a letter or digit)"; return 1; }
     if [[ -f "$NODES_DIR/$NAME.conf" ]]; then
         err "Node '$NAME' already exists. Remove it first (menu option 3)."
         return 1
@@ -2253,7 +2254,7 @@ cli_node_add() { # gre node add --name NAME --ip IRAN_IP [--idx N] [--key K] [--
     [[ -n "$NAME" ]]    || { err "Missing required option: --name"; err "Usage: gre node add --name NAME --ip IRAN_IP [--idx N] [--key K] [--subnet-base A.B] [--yes]"; return 1; }
     [[ -n "$IRAN_IP" ]] || { err "Missing required option: --ip";   err "Usage: gre node add --name NAME --ip IRAN_IP [--idx N] [--key K] [--subnet-base A.B] [--yes]"; return 1; }
 
-    valid_name "$NAME" || { err "Invalid node name: $NAME"; return 1; }
+    valid_name "$NAME" || { err "Invalid node name: $NAME (use 1-11 letters, digits, '_' or '-'; start with a letter or digit)"; return 1; }
     if [[ -f "$NODES_DIR/$NAME.conf" ]]; then
         err "Node '$NAME' already exists. Remove it first (gre node remove --name $NAME)."
         return 1

@@ -18,6 +18,9 @@ const state = {
   csrf: '',
   totpEnabled: false,
   logKind: '',
+  autoRefreshTimer: null,
+  autoRefreshRunning: false,
+  lastRefreshAt: null,
 };
 
 async function api(path, { method = 'GET', body } = {}) {
@@ -129,6 +132,7 @@ let authMode = 'login'; // 'login' | 'setup'
 let authNeed2fa = false;
 
 function showAuth(needsSetup) {
+  stopAutoRefresh();
   authMode = needsSetup ? 'setup' : 'login';
   authNeed2fa = false;
   state.csrf = '';
@@ -213,7 +217,8 @@ async function enterMain() {
     state.csrf = me.csrf;
     state.totpEnabled = me.totp_enabled;
   } catch { /* csrf already set from login */ }
-  loadServers();
+  await loadServers();
+  startAutoRefresh();
 }
 
 // ---------- servers grid --------------------------------------------------
@@ -275,6 +280,8 @@ function badgesFor(server) {
 
 function healthDot(server) {
   const snap = server.snapshot;
+  if ((server.connectivity || []).some((pair) =>
+    !pair.iran_to_foreign.reachable || !pair.foreign_to_iran.reachable)) return 'err';
   if (!server.has_secret && !server.key_installed) return 'err';
   if (!snap) return 'unknown';
   if (snap.error) return 'err';
@@ -297,6 +304,33 @@ function peerNamesHtml(snap) {
   return `<div class="peer-chips">${items}</div>`;
 }
 
+function connectivityHtml(server) {
+  const pairs = Array.isArray(server.connectivity) ? server.connectivity : [];
+  if (!pairs.length) return '';
+  return `<div class="public-paths">${pairs.map((pair) => {
+    const other = server.id === pair.iran.id ? pair.foreign : pair.iran;
+    const blocked = !pair.iran_to_foreign.reachable || !pair.foreign_to_iran.reachable;
+    const line = (from, to, result) => `<div class="public-path-line ${result.reachable ? 'pass' : 'fail'}">
+      <span class="route">${esc(from)} -&gt; ${esc(to)}</span>
+      <span class="state">${result.reachable ? 'REACHABLE' : 'BLOCKED'}</span>
+    </div>`;
+    return `<div class="public-path-pair">
+      <div class="public-path-peer">Public path with ${esc(other.name)} · checked ${timeAgo(pair.checked_at)}</div>
+      ${line(pair.iran.ip, pair.foreign.ip, pair.iran_to_foreign)}
+      ${line(pair.foreign.ip, pair.iran.ip, pair.foreign_to_iran)}
+      ${blocked ? '<div class="public-path-blocked">Public path blocked</div>' : ''}
+    </div>`;
+  }).join('')}</div>`;
+}
+
+function roleGroup(server) {
+  const roles = ((server.snapshot && server.snapshot.roles) || []).map((role) => String(role).toUpperCase());
+  if (roles.includes('IRAN') && roles.includes('FOREIGN')) return 'dual';
+  if (roles.includes('IRAN')) return 'iran';
+  if (roles.includes('FOREIGN')) return 'foreign';
+  return 'unconfigured';
+}
+
 function renderServers() {
   const grid = $('#servers-grid');
   $('#servers-count').textContent =
@@ -305,7 +339,7 @@ function renderServers() {
     grid.innerHTML = '<div class="empty">Add your first server to start managing GRE tunnels.</div>';
     return;
   }
-  grid.innerHTML = state.servers.map((s, i) => {
+  const renderCard = (s, i) => {
     const badges = badgesFor(s)
       .map(([cls, label]) => `<span class="badge ${cls}">${esc(label)}</span>`)
       .join('');
@@ -325,11 +359,27 @@ function renderServers() {
         </div>
         <div class="card-badges">${badges}</div>
         ${peerLine}
+        ${connectivityHtml(s)}
         <div class="card-foot">
           <span>${snap ? `discovered ${timeAgo(snap.taken_at)}` : 'never discovered'}</span>
           <button class="btn btn-ghost btn-sm btn-card-discover" data-id="${s.id}">Discover</button>
         </div>
       </div>`;
+  };
+  const groups = [
+    ['iran', 'IRAN'],
+    ['foreign', 'FOREIGN'],
+    ['dual', 'DUAL ROLE'],
+    ['unconfigured', 'UNCONFIGURED'],
+  ];
+  let cardIndex = 0;
+  grid.innerHTML = groups.map(([key, label]) => {
+    const servers = state.servers.filter((server) => roleGroup(server) === key);
+    if (!servers.length && !['iran', 'foreign'].includes(key)) return '';
+    return `<section class="server-group ${key}">
+      <div class="server-group-head"><span>${label}</span><span class="server-group-count">${servers.length}</span></div>
+      <div class="grid">${servers.length ? servers.map((server) => renderCard(server, cardIndex++)).join('') : '<div class="empty">No servers in this group.</div>'}</div>
+    </section>`;
   }).join('');
   $$('.card', grid).forEach((card) => {
     card.addEventListener('click', () => openDrawer(Number(card.dataset.id)));
@@ -364,6 +414,53 @@ async function loadServers() {
     if (err.message !== 'not authenticated') toast(err.message, true);
   }
 }
+
+function updateAutoRefreshStatus() {
+  const el = $('#auto-refresh-status');
+  if (!el) return;
+  if (state.autoRefreshRunning) el.textContent = 'Auto refresh: refreshing…';
+  else if (document.hidden) el.textContent = 'Auto refresh: paused';
+  else el.textContent = `Auto refresh: 10s · last ${state.lastRefreshAt ? timeAgo(state.lastRefreshAt) : 'pending'}`;
+}
+
+async function refreshAllServers() {
+  if (state.autoRefreshRunning || document.hidden || $('#view-main').classList.contains('hidden')) return;
+  state.autoRefreshRunning = true;
+  updateAutoRefreshStatus();
+  try {
+    await Promise.allSettled(state.servers.map((server) =>
+      api(`/api/servers/${server.id}/discover`, { method: 'POST' })
+    ));
+    await loadServers();
+    state.lastRefreshAt = Date.now();
+  } finally {
+    state.autoRefreshRunning = false;
+    updateAutoRefreshStatus();
+  }
+}
+
+function startAutoRefresh() {
+  stopAutoRefresh(false);
+  state.lastRefreshAt = Date.now();
+  state.autoRefreshTimer = setInterval(() => {
+    updateAutoRefreshStatus();
+    if (!document.hidden && Date.now() - state.lastRefreshAt >= 10000) refreshAllServers();
+  }, 1000);
+  updateAutoRefreshStatus();
+}
+
+function stopAutoRefresh(reset = true) {
+  if (state.autoRefreshTimer) clearInterval(state.autoRefreshTimer);
+  state.autoRefreshTimer = null;
+  state.autoRefreshRunning = false;
+  if (reset) state.lastRefreshAt = null;
+  updateAutoRefreshStatus();
+}
+
+document.addEventListener('visibilitychange', () => {
+  updateAutoRefreshStatus();
+  if (!document.hidden && state.autoRefreshTimer && Date.now() - state.lastRefreshAt >= 10000) refreshAllServers();
+});
 
 // ---------- add / edit / delete server ------------------------------------
 
@@ -684,7 +781,7 @@ const FORM_ACTIONS = [
   ] },
   { id: 'setup_iran', label: 'Configure as IRAN', desc: 'First-time IRAN setup — creates the first foreign peer', suggest: true, suggestionKind: 'peer', fields: [
     { name: 'foreign_ip', label: 'Foreign IP', required: true, ipRole: 'FOREIGN', blankLabel: 'Select a FOREIGN server…' },
-    { name: 'name', label: 'Peer name (optional)' },
+    { name: 'name', label: 'Peer name (optional)', maxLength: 11 },
     { name: 'idx', label: 'Index (optional)', type: 'number' },
     { name: 'key', label: 'GRE key (optional)' },
     { name: 'subnet_base', label: 'Subnet base, e.g. 10.9 (optional)' },
@@ -696,7 +793,7 @@ const FORM_ACTIONS = [
     { name: 'interval', label: 'Interval (minutes)', type: 'number', required: true },
   ] },
   { id: 'node_add', label: 'Node: add', desc: 'Add an Iran node (FOREIGN side)', suggest: true, suggestionKind: 'node', fields: [
-    { name: 'name', label: 'Name', required: true },
+    { name: 'name', label: 'Name', required: true, maxLength: 11 },
     { name: 'ip', label: 'Iran IP', required: true, ipRole: 'IRAN', blankLabel: 'Select an IRAN server…' },
     { name: 'idx', label: 'Index (optional)', type: 'number' },
     { name: 'key', label: 'GRE key (optional)' },
@@ -706,7 +803,7 @@ const FORM_ACTIONS = [
     { name: 'name', label: 'Name', required: true, statusResource: 'nodes', blankLabel: 'Select an Iran node…' },
   ] },
   { id: 'peer_add', label: 'Peer: add', desc: 'Connect to a foreign server (IRAN side)', suggest: true, suggestionKind: 'peer', fields: [
-    { name: 'name', label: 'Name', required: true },
+    { name: 'name', label: 'Name', required: true, maxLength: 11 },
     { name: 'foreign_ip', label: 'Foreign IP', required: true, ipRole: 'FOREIGN', blankLabel: 'Select a FOREIGN server…' },
     { name: 'iran_ip', label: 'Iran IP (optional)', ipRole: 'IRAN', includeCurrent: true, blankLabel: 'Default (current server)' },
     { name: 'subnet_base', label: 'Subnet base (optional)' },
@@ -750,22 +847,52 @@ function setActionOutput(text, running = false) {
   pane.style.opacity = running ? '0.55' : '1';
 }
 
-async function executeAction(action, params = {}) {
+const CONNECTIVITY_ACTIONS = new Set(['setup_iran', 'peer_add', 'node_add']);
+
+function connectivityPanelHtml(data) {
+  const direction = (from, to, result) => `<div class="direction"><span>${esc(from)} -&gt; ${esc(to)}</span><span>${result.reachable ? 'REACHABLE' : 'BLOCKED'}</span></div>`;
+  return `<strong>${data.ok ? 'Both public paths are reachable' : 'Public path blocked · no configuration was created'}</strong>
+    ${direction(data.iran.ip, data.foreign.ip, data.iran_to_foreign)}
+    ${direction(data.foreign.ip, data.iran.ip, data.foreign_to_iran)}
+    ${data.ok ? '' : '<div style="margin-top:8px">Fix network routing, ICMP policy, or firewall rules before trying setup again.</div>'}`;
+}
+
+async function executeAction(action, params = {}, { inline = false } = {}) {
   const s = state.current;
-  if (!s) return;
+  if (!s) return false;
+  const panel = inline ? $('#action-connectivity') : null;
+  if (panel) {
+    panel.className = 'connectivity-panel checking';
+    panel.innerHTML = '<strong>Checking both directions…</strong>';
+  }
   setActionOutput(`$ ${action} ${JSON.stringify(params)}\nrunning…`, true);
   try {
     const r = await api(`/api/servers/${s.id}/action`, { method: 'POST', body: { action, params } });
     const out = [r.stdout, r.stderr].filter(Boolean).join('\n').trim();
     const hintLine = r.hint ? `\n\nHint: ${r.hint}` : '';
-    setActionOutput(`$ ${r.command}\n(exit ${r.rc})\n\n${out || '(no output)'}${hintLine}`);
+    const preflightLine = r.preflight
+      ? `Public preflight: IRAN -> FOREIGN ${r.preflight.iran_to_foreign.reachable ? 'PASS' : 'FAIL'}; FOREIGN -> IRAN ${r.preflight.foreign_to_iran.reachable ? 'PASS' : 'FAIL'}\n\n`
+      : '';
+    setActionOutput(`${preflightLine}$ ${r.command}\n(exit ${r.rc})\n\n${out || '(no output)'}${hintLine}`);
     loadServers(); // snapshot may have been refreshed
+    return true;
   } catch (err) {
     if (handleHostKeyError(s, err)) {
       setActionOutput(`$ ${action}\n\nAborted: host key mismatch — see the warning dialog.`);
-      return;
+      return false;
+    }
+    if (err.data && err.data.connectivity_failed) {
+      if (panel) {
+        panel.className = 'connectivity-panel';
+        panel.innerHTML = connectivityPanelHtml(err.data);
+      }
+      setActionOutput(`$ ${action}\n\nBLOCKED: ${err.message}`);
+      loadServers();
+      return false;
     }
     setActionOutput(`$ ${action}\n\nError: ${err.message}`);
+    if (inline) $('#action-form-error').textContent = err.message;
+    return false;
   }
 }
 
@@ -854,7 +981,7 @@ function openActionForm(def) {
     return `
     <div class="field">
       <label>${esc(f.label)}</label>
-      <input name="${f.name}" ${f.required ? 'required' : ''} type="${f.type || 'text'}" ${listId ? `list="${listId}"` : ''} autocomplete="off" />
+      <input name="${f.name}" ${f.required ? 'required' : ''} type="${f.type || 'text'}" ${f.maxLength ? `maxlength="${f.maxLength}"` : ''} ${listId ? `list="${listId}"` : ''} autocomplete="off" />
       ${listId ? `<datalist id="${listId}"></datalist><span class="hint">Choose a free suggested base or type a valid A.B value.</span>` : ''}
     </div>`;
   }).join('');
@@ -863,6 +990,7 @@ function openActionForm(def) {
     <p class="sub">${esc(def.desc)}</p>
     <form id="action-form">
       ${fields}
+      ${CONNECTIVITY_ACTIONS.has(def.id) ? '<div id="action-connectivity" class="hidden"></div>' : ''}
       <div class="form-error" id="action-form-error"></div>
       <div class="foot">
         ${def.suggest ? '<button type="button" class="btn btn-ghost" id="btn-suggest" title="Reload 10 collision-free values from the server (gre >= 2.8.0)">Refresh values</button>' : ''}
@@ -947,7 +1075,7 @@ function openActionForm(def) {
     if (baseInput) baseInput.addEventListener('change', () => loadSuggestions({ base: baseInput.value.trim() }));
     loadSuggestions({ refreshPorts: true });
   }
-  $('#action-form').addEventListener('submit', (e) => {
+  $('#action-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const form = e.target;
     const params = {};
@@ -955,8 +1083,21 @@ function openActionForm(def) {
       const v = form[f.name].value.trim();
       if (v !== '') params[f.name] = f.type === 'number' ? Number(v) : v;
     }
-    closeModal();
-    executeAction(def.id, params);
+    if (!CONNECTIVITY_ACTIONS.has(def.id)) {
+      closeModal();
+      executeAction(def.id, params);
+      return;
+    }
+    const submit = form.querySelector('button[type="submit"]');
+    submit.disabled = true;
+    submit.textContent = 'Checking…';
+    $('#action-form-error').textContent = '';
+    const ok = await executeAction(def.id, params, { inline: true });
+    if (ok) closeModal();
+    else if ($('#action-form')) {
+      submit.disabled = false;
+      submit.textContent = 'Run';
+    }
   });
 }
 

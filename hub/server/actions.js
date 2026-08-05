@@ -34,7 +34,7 @@ function optEnum(flag, value, allowed) {
 }
 
 const IPV4_RE = /^(\d{1,3}\.){3}\d{1,3}$/;
-const NAME_RE = /^[\w.-]{1,32}$/;
+const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,10}$/;
 const SUBNET_BASE_RE = /^\d{1,3}\.\d{1,3}$/;
 const PORT_LIST_RE = /^[0-9,:-]+$/;
 
@@ -67,7 +67,7 @@ const BUILDERS = {
     }
     let cmd = `gre iran-setup --foreign-ip ${q(p.foreign_ip)}`;
     if (p.name) {
-      if (!NAME_RE.test(String(p.name))) throw new Error('name must be 1-32 chars of letters, digits, _ . -');
+      if (!NAME_RE.test(String(p.name))) throw new Error('name must be 1-11 letters, digits, _ or -, starting with a letter or digit');
       cmd += ` --name ${q(p.name)}`;
     }
     cmd += optIntRange('--idx', p.idx, 1, 254);
@@ -101,6 +101,7 @@ const BUILDERS = {
   },
   node_add: (p) => {
     if (!p.name || !p.ip) throw new Error('node_add requires name and ip');
+    if (!NAME_RE.test(String(p.name))) throw new Error('name must be 1-11 letters, digits, _ or -, starting with a letter or digit');
     return (
       `gre node add --name ${q(p.name)} --ip ${q(p.ip)}` +
       optInt('--idx', p.idx) +
@@ -111,10 +112,12 @@ const BUILDERS = {
   },
   node_remove: (p) => {
     if (!p.name) throw new Error('node_remove requires name');
+    if (!NAME_RE.test(String(p.name))) throw new Error('name must be 1-11 letters, digits, _ or -, starting with a letter or digit');
     return `gre node remove --name ${q(p.name)} --yes`;
   },
   peer_add: (p) => {
     if (!p.name || !p.foreign_ip) throw new Error('peer_add requires name and foreign_ip');
+    if (!NAME_RE.test(String(p.name))) throw new Error('name must be 1-11 letters, digits, _ or -, starting with a letter or digit');
     return (
       `gre iran peer add --name ${q(p.name)} --foreign-ip ${q(p.foreign_ip)}` +
       optStr('--iran-ip', p.iran_ip) +
@@ -128,10 +131,12 @@ const BUILDERS = {
   },
   peer_remove: (p) => {
     if (!p.name) throw new Error('peer_remove requires name');
+    if (!NAME_RE.test(String(p.name))) throw new Error('name must be 1-11 letters, digits, _ or -, starting with a letter or digit');
     return `gre iran peer remove --name ${q(p.name)} --yes`;
   },
   peer_apply: (p) => {
     if (!p.name) throw new Error('peer_apply requires name');
+    if (!NAME_RE.test(String(p.name))) throw new Error('name must be 1-11 letters, digits, _ or -, starting with a letter or digit');
     return `gre iran peer apply --name ${q(p.name)}`;
   },
   export: (p) => `gre export${p.path ? ` ${q(p.path)}` : ''} --yes`,
@@ -152,10 +157,14 @@ function sanitizeParams(params) {
 }
 
 // Run one action; returns { rc, stdout, stderr, command } and logs it.
-async function runAction(db, server, secret, action, params, sshOpts = {}) {
+function buildAction(action, params = {}) {
   const builder = BUILDERS[action];
   if (!builder) throw new Error(`unknown action: ${action}`);
-  const command = builder(params || {});
+  return builder(params);
+}
+
+async function runAction(db, server, secret, action, params, sshOpts = {}, prebuiltCommand = null) {
+  const command = prebuiltCommand || buildAction(action, params || {});
   const result = await ssh.exec(server, secret, command, { timeoutMs: 300000, ...sshOpts });
 
   const output = [result.stdout, result.stderr].filter(Boolean).join('\n').slice(0, 20000);
@@ -166,4 +175,4 @@ async function runAction(db, server, secret, action, params, sshOpts = {}) {
   return { ...result, command };
 }
 
-module.exports = { runAction, ACTION_NAMES, sanitizeParams };
+module.exports = { runAction, buildAction, ACTION_NAMES, sanitizeParams };

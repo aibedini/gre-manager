@@ -4,6 +4,19 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.2] - 2026-08-05
+
+### Added
+- gre-hub blocks Configure-as-IRAN, Peer-add, and Node-add until bounded public
+  ICMP checks pass in both directions. Latest pair results are persisted and
+  shown direction-by-direction on both server cards.
+- Server cards are grouped into IRAN, FOREIGN, dual-role, and unconfigured
+  sections and discovery refreshes every 10 seconds while the page is visible.
+
+### Fixed
+- Peer and node names may now use all 11 characters available after the
+  `gre-` prefix within Linux's 15-character network-interface limit.
+
 ## [2.8.1] - 2026-08-04
 
 ### Changed

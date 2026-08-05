@@ -9,6 +9,7 @@ function openDb(dataDir) {
   fs.mkdirSync(dataDir, { recursive: true });
   const db = new Database(path.join(dataDir, 'hub.db'));
   db.pragma('journal_mode = WAL');
+  db.pragma('foreign_keys = ON');
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS settings (
@@ -55,7 +56,22 @@ function openDb(dataDir) {
       hash       TEXT PRIMARY KEY,
       used_at    INTEGER
     );
+    CREATE TABLE IF NOT EXISTS connectivity_checks (
+      id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+      iran_server_id            INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+      foreign_server_id         INTEGER NOT NULL REFERENCES servers(id) ON DELETE CASCADE,
+      iran_ip                   TEXT NOT NULL,
+      foreign_ip                TEXT NOT NULL,
+      iran_to_foreign           INTEGER NOT NULL,
+      foreign_to_iran           INTEGER NOT NULL,
+      iran_to_foreign_detail    TEXT NOT NULL DEFAULT '',
+      foreign_to_iran_detail    TEXT NOT NULL DEFAULT '',
+      checked_at                INTEGER NOT NULL,
+      UNIQUE (iran_server_id, foreign_server_id)
+    );
     CREATE INDEX IF NOT EXISTS idx_action_log_created ON action_log(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_connectivity_iran ON connectivity_checks(iran_server_id);
+    CREATE INDEX IF NOT EXISTS idx_connectivity_foreign ON connectivity_checks(foreign_server_id);
   `);
 
   // Migrations for v1 databases.
