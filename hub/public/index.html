@@ -42,6 +42,7 @@
         <div class="brand">gre<span>-hub</span></div>
         <nav class="nav">
           <button data-page="servers" class="active">Servers</button>
+          <button data-page="routes">Auto routes</button>
           <button data-page="log">Action log</button>
           <button data-page="settings">Settings</button>
         </nav>
@@ -59,6 +60,20 @@
             <button class="btn" id="btn-add-server">Add server</button>
           </div>
           <div class="server-groups" id="servers-grid"></div>
+        </section>
+
+        <section id="page-routes" class="page hidden">
+          <div class="page-head">
+            <div>
+              <h2>Auto GRE + 3x-ui routes</h2>
+              <div class="sub">Reserve a safe TCP+UDP port, create GRE forwarding and publish the IRAN endpoint.</div>
+            </div>
+            <div style="display:flex; gap:8px">
+              <button class="btn btn-ghost" id="btn-add-panel">Add 3x-ui panel</button>
+              <button class="btn" id="btn-add-route">Create route</button>
+            </div>
+          </div>
+          <div id="routes-body"></div>
         </section>
 
         <section id="page-log" class="page hidden">

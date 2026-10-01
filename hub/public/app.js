@@ -14,6 +14,8 @@ function esc(s) {
 
 const state = {
   servers: [],
+  routes: [],
+  panels: [],
   current: null,      // server object open in the drawer
   csrf: '',
   totpEnabled: false,
@@ -202,9 +204,11 @@ $$('.nav button[data-page]').forEach((btn) => {
     btn.classList.add('active');
     const page = btn.dataset.page;
     $('#page-servers').classList.toggle('hidden', page !== 'servers');
+    $('#page-routes').classList.toggle('hidden', page !== 'routes');
     $('#page-log').classList.toggle('hidden', page !== 'log');
     $('#page-settings').classList.toggle('hidden', page !== 'settings');
     if (page === 'log') loadLog();
+    if (page === 'routes') loadRoutes();
     if (page === 'settings') renderSettings();
   });
 });
@@ -1215,6 +1219,129 @@ async function connectTerminal(s) {
 
 $('#btn-term-reconnect').addEventListener('click', () => {
   if (state.current) { destroyTerminal(); connectTerminal(state.current); }
+});
+
+// ---------- automatic GRE + 3x-ui routes ---------------------------------
+
+async function loadRoutes() {
+  const wrap = $('#routes-body');
+  try {
+    [state.routes, state.panels] = await Promise.all([api('/api/gre-routes'), api('/api/xui-panels')]);
+    if (!state.routes.length) {
+      wrap.innerHTML = `<div class="empty">No automatic routes yet. ${state.panels.length ? 'Create the first route.' : 'Add a 3x-ui panel first.'}</div>`;
+      return;
+    }
+    wrap.innerHTML = `
+      <table class="data">
+        <thead><tr><th>Route</th><th>IRAN endpoint</th><th>FOREIGN</th><th>Panel</th><th>Mode</th><th>Status</th><th>Created</th><th></th></tr></thead>
+        <tbody>${state.routes.map((r) => `
+          <tr>
+            <td><strong>${esc(r.name)}</strong><div class="muted">${esc(r.method)}</div></td>
+            <td>${esc(r.iran_host)}:${esc(r.port)}<div class="muted">TCP + UDP</div></td>
+            <td>${esc(r.foreign_name)}</td>
+            <td>${esc(r.panel_name)}</td>
+            <td>${esc(r.capability || 'pending')}</td>
+            <td><span class="badge ${r.status === 'ACTIVE' ? 'green' : r.status === 'FAILED' ? 'red' : 'gray'}">${esc(r.status)}</span>${r.last_error ? `<div class="muted">${esc(r.last_error)}</div>` : ''}</td>
+            <td>${timeAgo(r.created_at)}</td>
+            <td><button class="btn btn-ghost btn-sm btn-reconcile" data-id="${r.id}">Reconcile</button></td>
+          </tr>`).join('')}</tbody>
+      </table>`;
+    $$('.btn-reconcile', wrap).forEach((btn) => btn.addEventListener('click', async () => {
+      btn.disabled = true; btn.textContent = 'Checking…';
+      try {
+        const result = await api(`/api/gre-routes/${btn.dataset.id}/reconcile`, { method: 'POST' });
+        toast(result.healthy ? 'Route is healthy' : 'Conflict found — route needs review', !result.healthy);
+        await loadRoutes();
+      } catch (err) { toast(err.message, true); btn.disabled = false; btn.textContent = 'Reconcile'; }
+    }));
+  } catch (err) { wrap.innerHTML = `<div class="empty">${esc(err.message)}</div>`; }
+}
+
+$('#btn-add-panel').addEventListener('click', () => {
+  openModal(`
+    <h2>Add 3x-ui panel</h2>
+    <p class="sub">Credentials are encrypted at rest and used only for panel automation.</p>
+    <form id="panel-form">
+      <div class="field"><label>Name</label><input name="name" required maxlength="80" /></div>
+      <div class="field"><label>Panel URL</label><input name="base_url" type="url" required placeholder="https://panel.example.com:2053/path" /></div>
+      <div class="field"><label>Username</label><input name="username" required autocomplete="username" /></div>
+      <div class="field"><label>Password</label><input name="password" type="password" required autocomplete="current-password" /></div>
+      <div class="form-error" id="panel-error"></div>
+      <div class="foot"><button type="button" class="btn btn-ghost modal-cancel">Cancel</button><button class="btn">Save panel</button></div>
+    </form>`);
+  $('.modal-cancel').addEventListener('click', closeModal);
+  $('#panel-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    try {
+      await api('/api/xui-panels', { method: 'POST', body: {
+        name: form.name.value.trim(), base_url: form.base_url.value.trim(),
+        username: form.username.value.trim(), password: form.password.value,
+      } });
+      closeModal();
+      await loadRoutes();
+      toast('3x-ui panel saved');
+    } catch (err) { $('#panel-error').textContent = err.message; }
+  });
+});
+
+$('#btn-add-route').addEventListener('click', async () => {
+  try {
+    state.panels = await api('/api/xui-panels');
+    if (!state.servers.length) await loadServers();
+    if (!state.panels.length) { toast('Add a 3x-ui panel first', true); return; }
+  } catch (err) { toast(err.message, true); return; }
+  const roleHas = (server, role) => ((server.snapshot && server.snapshot.roles) || []).map((x) => String(x).toUpperCase()).includes(role);
+  const iranServers = state.servers.filter((s) => roleHas(s, 'IRAN'));
+  const foreignServers = state.servers.filter((s) => roleHas(s, 'FOREIGN'));
+  if (!iranServers.length || !foreignServers.length) { toast('Discover at least one IRAN and one FOREIGN server first', true); return; }
+  const options = (rows) => rows.map((x) => `<option value="${x.id}">${esc(x.name)} — ${esc(x.host)}</option>`).join('');
+  openModal(`
+    <h2>Create automatic route</h2>
+    <p class="sub">The selected port is checked against listeners, nftables, iptables, Docker, 3x-ui and the permanent registry before it is reserved.</p>
+    <form id="route-form">
+      <div class="field"><label>Route name</label><input name="name" required maxlength="40" placeholder="IR05-DE02" /></div>
+      <div class="field"><label>IRAN server</label><select name="iran_server_id">${options(iranServers)}</select></div>
+      <div class="field"><label>FOREIGN server</label><select name="foreign_server_id">${options(foreignServers)}</select></div>
+      <div class="field"><label>3x-ui panel</label><select name="panel_id">${state.panels.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></div>
+      <div class="field"><label>Client name</label><input name="client_name" value="navid" required /></div>
+      <div class="field"><label>Preferred port (optional)</label><input name="port" type="number" min="1024" max="65535" placeholder="auto: 3000–3999" /></div>
+      <div id="port-result" class="hint">A safe TCP+UDP port will be selected before any changes are made.</div>
+      <div class="form-error" id="route-error"></div>
+      <div class="foot"><button type="button" class="btn btn-ghost modal-cancel">Cancel</button><button type="button" class="btn btn-ghost" id="btn-check-port">Check port</button><button class="btn" id="btn-create-route">Create route</button></div>
+    </form>`);
+  $('.modal-cancel').addEventListener('click', closeModal);
+  const form = $('#route-form');
+  const body = () => ({
+    name: form.name.value.trim(), iran_server_id: Number(form.iran_server_id.value),
+    foreign_server_id: Number(form.foreign_server_id.value), panel_id: Number(form.panel_id.value),
+    client_name: form.client_name.value.trim(), port: form.port.value ? Number(form.port.value) : undefined,
+    range_start: 3000, range_end: 3999,
+  });
+  $('#btn-check-port').addEventListener('click', async () => {
+    const btn = $('#btn-check-port'); btn.disabled = true; btn.textContent = 'Checking…';
+    try {
+      const r = await api('/api/gre-routes/recommend-port', { method: 'POST', body: body() });
+      form.port.value = r.port;
+      $('#port-result').innerHTML = `<span class="badge green">${r.port} FREE</span> TCP: FREE · UDP: FREE · 3x-ui: FREE · GRE registry: FREE`;
+    } catch (err) { $('#route-error').textContent = err.message; }
+    finally { btn.disabled = false; btn.textContent = 'Check port'; }
+  });
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = $('#btn-create-route'); btn.disabled = true; btn.textContent = 'Creating…';
+    $('#route-error').textContent = '';
+    try {
+      const result = await api('/api/gre-routes', { method: 'POST', body: body() });
+      closeModal(); await loadRoutes();
+      openModal(`<h2>Route active</h2><p class="sub">${esc(result.name)} — ${esc(result.capability)}</p><div class="output-pane" style="max-height:none; user-select:all">${esc(result.link)}</div><div class="foot"><button class="btn modal-cancel">Done</button></div>`);
+      $('.modal-cancel').addEventListener('click', closeModal);
+    } catch (err) {
+      const rollback = err.data && err.data.rollback && err.data.rollback.length ? ` Rollback: ${err.data.rollback.join(', ')}` : '';
+      $('#route-error').textContent = err.message + rollback;
+      btn.disabled = false; btn.textContent = 'Create route';
+    }
+  });
 });
 
 // ---------- action log page ----------------------------------------------

@@ -76,6 +76,27 @@ Configuration via environment variables:
 - **Terminal** — full SSH shell in the browser (xterm.js), bridged over a
   WebSocket authenticated by a short-lived one-time ticket.
 
+### Automatic GRE + 3x-ui routes
+
+The **Auto routes** page accepts an IRAN server, a FOREIGN server, a saved
+3x-ui panel and a route name. Before changing either server it checks TCP and
+UDP listeners, nftables, iptables, Docker-published ports, 3x-ui inbounds and
+the Hub's persistent port registry. The chosen port is reserved before GRE is
+created.
+
+The panel adapter detects capabilities instead of comparing version strings:
+
+- Managed Hosts available: create the Shadowsocks inbound, then create a Host
+  mapping to `IRAN_PUBLIC_IP:PORT`.
+- Managed Hosts unavailable: put the legacy `externalProxy` mapping in the
+  inbound's `streamSettings`.
+
+The Hub asks 3x-ui for the final client link and verifies its address, port,
+method and **client password** before marking the route `ACTIVE`. A failed
+stage removes the partial inbound/Host, removes the GRE peer and releases the
+reservation. Reconcile never reuses an apparently idle `ACTIVE` port; missing
+runtime state changes the route to `NEEDS_REVIEW`.
+
 ## Security model
 
 - **Hub password**: min 12 chars, scrypt hash. Changeable in Settings (requires

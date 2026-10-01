@@ -6,7 +6,8 @@
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
-    "smoke": "node scripts/connectivity-test.js && node scripts/smoke.js",
+    "smoke": "node scripts/connectivity-test.js && node scripts/route-test.js && node scripts/smoke.js",
+    "test:routes": "node scripts/route-test.js",
     "test:connectivity": "node scripts/connectivity-test.js"
   },
   "engines": {

@@ -69,9 +69,53 @@ function openDb(dataDir) {
       checked_at                INTEGER NOT NULL,
       UNIQUE (iran_server_id, foreign_server_id)
     );
+    CREATE TABLE IF NOT EXISTS xui_panels (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      name        TEXT NOT NULL UNIQUE,
+      base_url    TEXT NOT NULL,
+      username    TEXT NOT NULL,
+      password_enc TEXT NOT NULL,
+      created_at  INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS gre_routes (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      name              TEXT NOT NULL UNIQUE,
+      iran_server_id    INTEGER NOT NULL REFERENCES servers(id) ON DELETE RESTRICT,
+      foreign_server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE RESTRICT,
+      panel_id          INTEGER NOT NULL REFERENCES xui_panels(id) ON DELETE RESTRICT,
+      port              INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+      protocol          TEXT NOT NULL DEFAULT 'tcp,udp',
+      method            TEXT NOT NULL,
+      client_email      TEXT NOT NULL,
+      client_password_enc TEXT,
+      inbound_id        INTEGER,
+      capability        TEXT CHECK (capability IN ('managed_hosts','external_proxy')),
+      share_link_enc    TEXT,
+      status            TEXT NOT NULL CHECK (status IN ('RESERVED','ACTIVE','FAILED','STALE','NEEDS_REVIEW')),
+      last_error        TEXT,
+      created_at        INTEGER NOT NULL,
+      updated_at        INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS port_allocations (
+      id                INTEGER PRIMARY KEY AUTOINCREMENT,
+      route_id          INTEGER NOT NULL UNIQUE REFERENCES gre_routes(id) ON DELETE CASCADE,
+      iran_server_id    INTEGER NOT NULL REFERENCES servers(id) ON DELETE RESTRICT,
+      foreign_server_id INTEGER NOT NULL REFERENCES servers(id) ON DELETE RESTRICT,
+      port              INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+      protocols         TEXT NOT NULL DEFAULT 'tcp,udp',
+      status            TEXT NOT NULL CHECK (status IN ('RESERVED','ACTIVE','FAILED','STALE','NEEDS_REVIEW','RELEASED')),
+      created_at        INTEGER NOT NULL,
+      updated_at        INTEGER NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS idx_action_log_created ON action_log(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_connectivity_iran ON connectivity_checks(iran_server_id);
     CREATE INDEX IF NOT EXISTS idx_connectivity_foreign ON connectivity_checks(foreign_server_id);
+    CREATE INDEX IF NOT EXISTS idx_routes_pair ON gre_routes(iran_server_id, foreign_server_id);
+    CREATE INDEX IF NOT EXISTS idx_ports_status ON port_allocations(status);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_ports_live_iran
+      ON port_allocations(iran_server_id, port) WHERE status != 'RELEASED';
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_ports_live_foreign
+      ON port_allocations(foreign_server_id, port) WHERE status != 'RELEASED';
   `);
 
   // Migrations for v1 databases.

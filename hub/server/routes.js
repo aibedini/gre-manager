@@ -13,6 +13,8 @@ const provision = require('./provision');
 const connectivity = require('./connectivity');
 const { encrypt, decrypt } = require('./crypto');
 const { audit } = require('./db');
+const { normalizeBaseUrl } = require('./xui');
+const { RouteOrchestrator } = require('./route-orchestrator');
 
 const SECURE = process.env.HUB_SECURE === '1';
 
@@ -101,6 +103,7 @@ function createRouter(db, cryptKey, dataDir) {
 
   // ssh options: host-key TOFU pinning + optional fallback password.
   const sshOptsFor = makeSshOpts(db, cryptKey);
+  const routeOrchestrator = new RouteOrchestrator({ db, cryptKey, sshOptsFor });
 
   const getSnapshot = (id) => {
     const row = db.prepare('SELECT json, taken_at FROM snapshots WHERE server_id = ?').get(id);
@@ -496,6 +499,87 @@ function createRouter(db, cryptKey, dataDir) {
     } catch {
       res.status(400).json({ error: 'could not parse suggest output as JSON', raw: result.stdout.slice(0, 500) });
     }
+  }));
+
+  // --- Automatic GRE + 3x-ui routes --------------------------------------
+  authed.get('/xui-panels', (req, res) => {
+    const rows = db.prepare('SELECT id, name, base_url, username, created_at FROM xui_panels ORDER BY name').all();
+    res.json(rows);
+  });
+
+  authed.post('/xui-panels', (req, res) => {
+    const { name, base_url: baseUrl, username, password } = req.body || {};
+    if (!name || !username || typeof password !== 'string' || !password) {
+      return res.status(400).json({ error: 'name, base_url, username and password are required' });
+    }
+    let normalized;
+    try { normalized = normalizeBaseUrl(baseUrl); } catch (err) { return res.status(400).json({ error: err.message }); }
+    try {
+      const result = db.prepare(`
+        INSERT INTO xui_panels (name, base_url, username, password_enc, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(String(name).slice(0, 80), normalized, String(username).slice(0, 120), encrypt(cryptKey, password), Date.now());
+      auditEvent(null, 'hub', 'xui_panel_add', { name, base_url: normalized }, 0, '3x-ui panel saved');
+      res.status(201).json({ id: Number(result.lastInsertRowid), name, base_url: normalized, username });
+    } catch (err) {
+      res.status(err.code === 'SQLITE_CONSTRAINT_UNIQUE' ? 409 : 400).json({ error: err.message });
+    }
+  });
+
+  authed.delete('/xui-panels/:id', (req, res) => {
+    try {
+      const result = db.prepare('DELETE FROM xui_panels WHERE id = ?').run(req.params.id);
+      if (!result.changes) return res.status(404).json({ error: 'not found' });
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(409).json({ error: 'panel is used by one or more routes' });
+    }
+  });
+
+  authed.post('/gre-routes/recommend-port', wrap(async (req, res) => {
+    const result = await routeOrchestrator.recommend({
+      iranServerId: Number(req.body && req.body.iran_server_id),
+      foreignServerId: Number(req.body && req.body.foreign_server_id),
+      panelId: Number(req.body && req.body.panel_id),
+      start: req.body && req.body.range_start,
+      end: req.body && req.body.range_end,
+      preferredPort: req.body && req.body.port,
+    });
+    res.json(result);
+  }));
+
+  authed.get('/gre-routes', (req, res) => {
+    res.json(routeOrchestrator.listRoutes(req.query.reveal === '1'));
+  });
+
+  authed.post('/gre-routes', wrap(async (req, res) => {
+    const body = req.body || {};
+    try {
+      const result = await routeOrchestrator.create({
+        name: body.name,
+        iranServerId: Number(body.iran_server_id),
+        foreignServerId: Number(body.foreign_server_id),
+        panelId: Number(body.panel_id),
+        port: body.port,
+        start: body.range_start,
+        end: body.range_end,
+        method: body.method,
+        clientName: body.client_name,
+      });
+      auditEvent(null, 'hub', 'gre_route_create', {
+        name: result.name, port: result.port, capability: result.capability,
+      }, 0, `route ${result.id} active`);
+      res.status(201).json(result);
+    } catch (err) {
+      auditEvent(null, 'hub', 'gre_route_create', { name: body.name, rollback: err.rollback || [] }, 1, err.message);
+      res.status(409).json({ error: err.message, rollback: err.rollback || [] });
+    }
+  }));
+
+  authed.post('/gre-routes/:id/reconcile', wrap(async (req, res) => {
+    const result = await routeOrchestrator.reconcile(Number(req.params.id));
+    auditEvent(null, 'hub', 'gre_route_reconcile', result, result.healthy ? 0 : 1, result.status);
+    res.json(result);
   }));
 
   // --- Terminal ticket -----------------------------------------------------
