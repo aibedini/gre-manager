@@ -79,6 +79,23 @@ async function main() {
     assert(lock.packages[''], 'packages[""] block is required by lockfileVersion 3');
   });
 
+  check('the hub ships the install policy that lets native modules build', () => {
+    // Regression guard: without this file npm 11+ silently skips dependency
+    // install scripts and better-sqlite3 ends up with no compiled binding, so a
+    // freshly deployed hub cannot open its database.
+    const npmrcPath = path.join(HUB_ROOT, '.npmrc');
+    assert(fs.existsSync(npmrcPath), 'hub/.npmrc is missing from the package');
+    const body = fs.readFileSync(npmrcPath, 'utf8');
+    assert(/^\s*allow-scripts\s*=\s*true\s*$/m.test(body),
+      'hub/.npmrc must enable allow-scripts so better-sqlite3 compiles');
+    // The released tarball is produced from the working tree, so a top-level
+    // .gitignore entry would silently drop it from the artifact.
+    const rootIgnore = fs.readFileSync(path.join(REPO_ROOT, '.gitignore'), 'utf8');
+    assert(!/^\s*\.npmrc\s*$/m.test(rootIgnore), '.gitignore must not exclude .npmrc');
+    const hubIgnore = fs.readFileSync(path.join(HUB_ROOT, '.gitignore'), 'utf8');
+    assert(!/^\s*\.npmrc\s*$/m.test(hubIgnore), 'hub/.gitignore must not exclude .npmrc');
+  });
+
   console.log('\nresolution order:');
 
   check('build-info.json wins over every other source', () => {

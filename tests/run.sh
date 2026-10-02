@@ -732,9 +732,20 @@ JSON
   # server/index.js is the marker the CLI uses to decide a hub is installed,
   # so every fixture release must carry it.
   printf '// index\n' > "$dir/hub/server/index.js"
+  printf '// version\n' > "$dir/hub/server/version.js"
   printf '// orchestrator\n' > "$dir/hub/server/route-orchestrator.js"
   printf '// routes\n' > "$dir/hub/server/routes.js"
   printf '// app\n' > "$dir/hub/public/app.js"
+  # The runtime install policy. Without it npm 11+ skips dependency install
+  # scripts and better-sqlite3 gets no compiled binding.
+  printf 'allow-scripts=true\n' > "$dir/hub/.npmrc"
+}
+
+# Guard the artifact the release workflow actually publishes: a hub tarball
+# without .npmrc installs "successfully" and then cannot open its database.
+build_hub_tarball_like_release() { # build_hub_tarball_like_release SRCDIR OUT
+  local src="$1" out="$2"
+  ( cd "$src" && tar czf "$out" hub )
 }
 
 build_hub_fixtures() { # build_hub_fixtures RELEASES_DIR
@@ -891,6 +902,17 @@ assert "gre hub update restarted the service" test -f "$R/state/hub-restarted"
 assert_not "gre hub update never falls back to the main tarball" grep -q 'archive/refs/heads/main' "$R/state/hub-urls"
 assert_not "gre hub update never falls back to raw.githubusercontent" grep -q 'raw.githubusercontent' "$R/state/hub-urls"
 assert "gre hub update asked for the latest release" grep -q 'releases/latest' "$R/state/hub-urls"
+
+# The published artifact must carry the install policy, so a fresh deployment on
+# a modern npm still compiles better-sqlite3 instead of silently skipping it.
+build_hub_tarball_like_release "$R/hub-releases/2.13.0" "$R/artifact-probe.tar.gz"
+tar tzf "$R/artifact-probe.tar.gz" > "$R/artifact-list.txt" 2>&1
+assert "a hub release artifact ships .npmrc" grep -qx 'hub/.npmrc' "$R/artifact-list.txt"
+assert "a hub release artifact ships hub/VERSION" grep -qx 'hub/VERSION' "$R/artifact-list.txt"
+assert "a hub release artifact ships build-info.json" grep -qx 'hub/build-info.json' "$R/artifact-list.txt"
+assert "a hub release artifact ships server/version.js" grep -qx 'hub/server/version.js' "$R/artifact-list.txt"
+assert "the artifact's .npmrc enables install scripts" \
+  grep -q 'allow-scripts=true' <(tar xzOf "$R/artifact-probe.tar.gz" hub/.npmrc)
 
 # Drop the installed hub back to the older release so the remaining negative
 # cases are not short-circuited by the "already at the target version" guard.

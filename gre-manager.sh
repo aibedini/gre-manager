@@ -1918,9 +1918,16 @@ EOF
     systemctl enable gre-hub.service >/dev/null 2>&1 || true
 }
 
+# Install runtime dependencies. better-sqlite3 is a NATIVE module: if its install
+# script does not run, npm still reports success but the hub then dies with
+# "Could not locate the bindings file". Recent npm versions refuse to run
+# dependency install scripts unless the package allows them, which is why the
+# hub ships an .npmrc with `allow-scripts=true`. A plain `npm ci` is therefore
+# not sufficient on its own, and `--allow-scripts` is deliberately NOT passed on
+# the command line: npm 11 rejects it for project-scoped installs.
 hub_npm_ci() { # hub_npm_ci DIR
     local dir="$1"
-    local -a cmd=(npm ci --omit=dev --no-audit --no-fund)
+
     # Explicit opt-out for air-gapped hosts and for the test suite.
     if [[ "${HUB_SKIP_NPM:-0}" == "1" ]]; then
         info "HUB_SKIP_NPM=1: skipping dependency installation."
@@ -1931,11 +1938,19 @@ hub_npm_ci() { # hub_npm_ci DIR
         (cd "$dir" && $HUB_TEST_NPM_CMD)
         return $?
     fi
+
+    if [[ ! -f "$dir/.npmrc" ]]; then
+        warn "The hub package has no .npmrc; native modules may not build."
+    fi
+
     info "Installing dependencies (npm ci)..."
-    if (cd "$dir" && "${cmd[@]}"); then
+    if (cd "$dir" && npm ci --omit=dev --no-audit --no-fund); then
         return 0
     fi
-    warn "npm ci failed; installing build tools and retrying (better-sqlite3 compiles natively)..."
+
+    # The native module compiles from source when no prebuilt binary matches, so
+    # make sure a toolchain exists before retrying.
+    warn "Dependency install failed; installing build tools and retrying..."
     if command -v apt-get >/dev/null 2>&1; then
         apt-get install -y build-essential python3
     elif command -v dnf >/dev/null 2>&1; then
@@ -1943,7 +1958,20 @@ hub_npm_ci() { # hub_npm_ci DIR
     elif command -v yum >/dev/null 2>&1; then
         yum install -y gcc-c++ make python3
     fi
-    (cd "$dir" && "${cmd[@]}")
+    if (cd "$dir" && npm ci --omit=dev --no-audit --no-fund); then
+        return 0
+    fi
+
+    # Last resort: install the tree without lifecycle scripts so the dashboard
+    # can start for diagnosis, then build the native modules separately.
+    warn "Falling back to an install without lifecycle scripts."
+    if (cd "$dir" && npm install --omit=dev --no-audit --no-fund --ignore-scripts); then
+        warn "Rebuilding native modules (better-sqlite3, ssh2)..."
+        (cd "$dir" && npm rebuild better-sqlite3 ssh2 --no-audit --no-fund) && return 0
+        warn "Native rebuild failed; the hub will not be able to open its database."
+        return 0
+    fi
+    return 1
 }
 
 # Download a release tarball + its checksum and verify them. Prints nothing on

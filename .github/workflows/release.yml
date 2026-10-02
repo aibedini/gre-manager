@@ -73,10 +73,17 @@ jobs:
           VERSION="$(cat VERSION | tr -d '[:space:]')"
           TMP="$(mktemp -d)"
           tar xzf gre-hub.tar.gz -C "$TMP"
-          for f in hub/VERSION hub/build-info.json hub/server/xui.js hub/server/route-orchestrator.js hub/public/app.js hub/package.json hub/package-lock.json; do
+          for f in hub/VERSION hub/build-info.json hub/.npmrc hub/package.json hub/package-lock.json \
+                   hub/server/index.js hub/server/version.js hub/server/xui.js \
+                   hub/server/route-orchestrator.js hub/server/routes.js hub/server/db.js \
+                   hub/public/app.js hub/public/index.html hub/public/style.css; do
             [ -f "$TMP/$f" ] || { echo "::error::gre-hub.tar.gz is missing $f"; exit 1; }
           done
           [ "$(tr -d '[:space:]' < "$TMP/hub/VERSION")" = "$VERSION" ] || { echo "::error::tarball hub/VERSION mismatch"; exit 1; }
+          # better-sqlite3 is native: without this policy npm 11+ skips its
+          # install script and the deployed hub cannot open its database.
+          grep -qE '^[[:space:]]*allow-scripts[[:space:]]*=[[:space:]]*true[[:space:]]*$' "$TMP/hub/.npmrc" \
+            || { echo "::error::hub/.npmrc does not enable allow-scripts"; exit 1; }
           node -e '
             const info = require(process.argv[1]);
             const version = process.argv[2];
