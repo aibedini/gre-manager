@@ -99,12 +99,24 @@ function panelFailureDetail(data, status) {
   return body && (body.msg || body.error) || `HTTP ${status}`;
 }
 
+function endpointUnavailable(err) {
+  const status = Number(err && err.status) || 0;
+  const text = String(err && err.message || '').toLowerCase();
+  return status === 404 || status === 405 || /unexpected request|unknown route|not found|no route/.test(text);
+}
+
 async function listInboundPortIndex(client) {
   const previousTimeout = Number(client.timeoutMs) || XUI_TIMEOUT_MS;
   client.timeoutMs = Math.min(previousTimeout, PORT_XUI_TIMEOUT_MS);
   try {
     for (const path of ['/panel/api/inbounds/options', '/panel/api/inbounds/list/slim']) {
-      const result = await client.request(path, { allowFailure: true });
+      let result;
+      try {
+        result = await client.request(path, { allowFailure: true });
+      } catch (err) {
+        if (timeoutLike(err) || !endpointUnavailable(err)) throw err;
+        continue;
+      }
       if (result && result.ok) {
         const rows = unwrapPanelPayload(result.data);
         return { rows: Array.isArray(rows) ? rows : [], source: path };
