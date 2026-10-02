@@ -259,8 +259,16 @@ class RouteOrchestrator {
 
   event(routeId, stage, status, detail = '') {
     const safe = String(detail || '').replace(/ss:\/\/\S+/gi, '[redacted-link]').slice(0, 4000);
-    const info = this.db.prepare('INSERT INTO route_events (route_id, stage, status, detail, created_at) VALUES (?, ?, ?, ?, ?)')
-      .run(routeId, stage, status, safe, Date.now());
+    // Stamp every row with the attempt it belongs to, so a retried route keeps
+    // every previous attempt in the same persistent log and the UI can group
+    // and label them instead of showing one confusing stream.
+    let attempt = 1;
+    try {
+      const row = this.db.prepare('SELECT attempt_no FROM gre_routes WHERE id = ?').get(Number(routeId));
+      if (row && Number(row.attempt_no) > 0) attempt = Number(row.attempt_no);
+    } catch { /* fall back to attempt 1 */ }
+    const info = this.db.prepare('INSERT INTO route_events (route_id, stage, status, detail, created_at, attempt_no) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(routeId, stage, status, safe, Date.now(), attempt);
     // A promise-based waiter is enough for the in-process SSE endpoint and
     // costs nothing when nobody is watching.
     const waiters = this.eventWaiters.get(Number(routeId));
@@ -275,11 +283,11 @@ class RouteOrchestrator {
   events(routeId, afterId = null) {
     const id = Number(routeId);
     if (afterId === null || afterId === undefined || afterId === '') {
-      return this.db.prepare('SELECT id, stage, status, detail, created_at FROM route_events WHERE route_id=? ORDER BY id').all(id);
+      return this.db.prepare('SELECT id, stage, status, detail, created_at, attempt_no FROM route_events WHERE route_id=? ORDER BY id').all(id);
     }
     const after = Number(afterId);
     if (!Number.isFinite(after)) throw new Error('after_id must be a number');
-    return this.db.prepare('SELECT id, stage, status, detail, created_at FROM route_events WHERE route_id=? AND id > ? ORDER BY id').all(id, after);
+    return this.db.prepare('SELECT id, stage, status, detail, created_at, attempt_no FROM route_events WHERE route_id=? AND id > ? ORDER BY id').all(id, after);
   }
 
   waitForEvent(routeId, afterId, timeoutMs = EVENT_WAITERS_MS) {
@@ -315,9 +323,52 @@ class RouteOrchestrator {
     return this.db.prepare('SELECT * FROM gre_routes WHERE id = ?').get(Number(routeId));
   }
 
-  // Safe single-route view. Secrets are never included here: the share link is
-  // only ever served through the explicit reveal path (GET /api/gre-routes
-  // ?reveal=1) or the in-memory completed-result path of a run this hub made.
+  // --- ownership + progress tracking --------------------------------------
+  //
+  // A route must be able to answer "which remote objects did I create, and
+  // which step am I on?" long after the process that created it is gone. These
+  // helpers keep that metadata current; every one of them is best-effort so a
+  // tracking failure can never abort provisioning itself.
+  ownership(routeId, patch = {}) {
+    const fields = Object.keys(patch);
+    if (!fields.length) return;
+    try {
+      this.db.prepare(`UPDATE gre_routes SET ${fields.map((f) => `${f} = ?`).join(', ')}, updated_at = ? WHERE id = ?`)
+        .run(...fields.map((f) => patch[f]), Date.now(), Number(routeId));
+    } catch { /* tracking is not allowed to break provisioning */ }
+  }
+
+  // Emit RUNNING, remember the stage as current, and hand back a completion
+  // callback that writes PASS/FAIL and clears current_stage on success.
+  stage(routeId, name, detail = '') {
+    this.event(routeId, name, 'RUNNING', detail);
+    try {
+      this.db.prepare('UPDATE gre_routes SET current_stage = ?, updated_at = ? WHERE id = ?')
+        .run(name, Date.now(), Number(routeId));
+    } catch { /* see above */ }
+    let done = false;
+    return {
+      pass: (text = '') => {
+        if (done) return;
+        done = true;
+        this.event(routeId, name, 'PASS', text || detail);
+        try { this.db.prepare('UPDATE gre_routes SET current_stage = NULL WHERE id = ?').run(Number(routeId)); } catch { /* ignore */ }
+      },
+      fail: (text = '') => {
+        if (done) return;
+        done = true;
+        // Keep current_stage set to the failing stage: Reconcile and the UI
+        // use it to say exactly where provisioning stopped.
+        this.event(routeId, name, 'FAIL', text || detail);
+      },
+      info: (text = '') => {
+        if (done) return;
+        done = true;
+        this.event(routeId, name, 'INFO', text || detail);
+      },
+    };
+  }
+
   safeRoute(routeId) {
     const row = this.route(routeId);
     if (!row) return null;
@@ -383,6 +434,10 @@ class RouteOrchestrator {
 
     const capabilities = await client.resolveCapabilities();
     const clientModel = capabilities.clientModel;
+    // Diagnostic only, and never allowed to fail the preflight: the exact panel
+    // version is nice to have, the API-derived capability is authoritative.
+    const panelVersion = await client.detectPanelVersion().catch(() => null);
+    const versionText = panelVersion && panelVersion.version ? `3x-ui v${panelVersion.version}` : '3x-ui version unknown';
 
     // Preflight the client BEFORE any mutation. For a first-class panel we can
     // ask the panel directly; for an embedded panel we can only look at the
@@ -420,12 +475,17 @@ class RouteOrchestrator {
     const routeId = this.reserve({ ...body, iranServerId, foreignServerId, panelId }, port, method, clientEmail, clientMode, clientModel);
 
     this.event(routeId, 'request_validated', 'PASS', `${clientMode === 'new' ? 'new' : 'existing'} client '${clientEmail}'; method ${method}`);
+    this.event(routeId, 'panel_probe', 'PASS', `${versionText}; client=${clientModel}; hosts=${capabilities.hostMode}`);
     this.event(routeId, 'client_model_detected', 'PASS', `client=${clientModel}; hosts=${capabilities.hostMode}`);
     this.event(routeId, 'xui_capability', 'PASS', `client=${clientModel}; hosts=${capabilities.hostMode}`);
     this.event(routeId, 'client_preflight', 'PASS', clientMode === 'existing'
       ? `client '${clientEmail}' exists on the panel (${clientModel})`
       : `email '${clientEmail}' is free on the panel (${clientModel})`);
     this.event(routeId, 'port_reserved', 'PASS', `TCP+UDP port ${port} reserved`);
+
+    // Freeze what the panel looked like when this route was created.
+    this.ownership(routeId, { panel_version_snapshot: panelVersion && panelVersion.version ? panelVersion.version : null });
+    this.reportPanelMetadata(panel, { version: panelVersion, clientModel, hostMode: capabilities.hostMode });
 
     return {
       route_id: routeId,
@@ -437,8 +497,30 @@ class RouteOrchestrator {
       client_mode: clientMode,
       client_model: clientModel,
       host_mode: capabilities.hostMode,
+      panel_version: panelVersion && panelVersion.version ? panelVersion.version : null,
       panel,
     };
+  }
+
+  // Keep the panel row's diagnostics current whenever we talk to it. Best
+  // effort: this is display metadata, never a precondition for provisioning.
+  reportPanelMetadata(panel, { version, clientModel, hostMode }) {
+    try {
+      const current = this.db.prepare('SELECT last_probe_at FROM xui_panels WHERE id = ?').get(panel.id);
+      const fresh = current && current.last_probe_at && (Date.now() - current.last_probe_at) < 5 * 60 * 1000;
+      if (fresh) return;
+      this.db.prepare(`
+        UPDATE xui_panels
+           SET panel_version = COALESCE(?, panel_version),
+               panel_version_source = COALESCE(?, panel_version_source),
+               client_model = ?, host_mode = ?, capability = ?, last_probe_at = ?, last_probe_error = NULL
+         WHERE id = ?
+      `).run(
+        version && version.version ? version.version : null,
+        version && version.source ? version.source : null,
+        clientModel, hostMode, hostMode, Date.now(), panel.id
+      );
+    } catch { /* display metadata only */ }
   }
 
   // Legacy first-class client credential resolution is unsafe only when the
@@ -528,26 +610,46 @@ class RouteOrchestrator {
       if (clientModel !== (route.client_model || clientModel)) {
         this.event(routeId, 'client_model_detected', 'INFO', `panel client model changed to ${clientModel}`);
       }
+      const attempt = Number(route.attempt_no) || 1;
+      if (attempt > 1) this.event(routeId, 'attempt', 'INFO', `Attempt #${attempt}`);
 
+      const ipStage = this.stage(routeId, 'public_ip', 'Detecting public IPv4 on both sides');
       const [iranIp, foreignIp] = await Promise.all([this.publicIp(iran), this.publicIp(foreign)]);
-      this.event(routeId, 'public_ip', 'PASS', `IRAN ${iranIp}; FOREIGN ${foreignIp}`);
+      ipStage.pass(`IRAN ${iranIp}; FOREIGN ${foreignIp}`);
+
+      const connStage = this.stage(routeId, 'connectivity', 'Checking bidirectional reachability');
       const connectivity = await Promise.all([
         this.remote(iran, `ping -c 1 -W 3 ${shellQuote(foreignIp)}`, 10000),
         this.remote(foreign, `ping -c 1 -W 3 ${shellQuote(iranIp)}`, 10000),
       ]);
-      if (connectivity.some((result) => result.rc !== 0)) throw new Error('IRAN and FOREIGN servers are not reachable in both directions');
-      this.event(routeId, 'connectivity', 'PASS', 'Bidirectional public-IP reachability passed');
+      if (connectivity.some((result) => result.rc !== 0)) {
+        connStage.fail('IRAN and FOREIGN servers are not reachable in both directions');
+        throw new Error('IRAN and FOREIGN servers are not reachable in both directions');
+      }
+      connStage.pass('Bidirectional public-IP reachability passed');
 
+      const pairStage = this.stage(routeId, 'gre_pairing', 'Allocating a collision-free GRE identity');
       const allocation = await this.pairing(iran, foreign);
+      pairStage.pass(`${allocation.subnet_base}/${allocation.idx}`);
       peer = allocation.name || peerName(routeName);
+      // Persist the GRE identity before creating anything: rollback, reconcile
+      // and delete all need to find these objects later.
+      this.ownership(routeId, { peer_name: peer });
+
+      const nodeStage = this.stage(routeId, 'foreign_node_add', `${foreign.name}`);
       const nodeCommand = actions.buildAction('node_add', {
         name: peer, ip: iranIp, idx: allocation.idx, key: allocation.key, subnet_base: allocation.subnet_base,
       });
       const nodeResult = await this.remote(foreign, nodeCommand, 300000);
-      if (nodeResult.rc !== 0) throw new Error(`FOREIGN GRE setup failed: ${nodeResult.stderr || nodeResult.stdout || `rc=${nodeResult.rc}`}`);
+      if (nodeResult.rc !== 0) {
+        nodeStage.fail(nodeResult.stderr || nodeResult.stdout || `rc=${nodeResult.rc}`);
+        throw new Error(`FOREIGN GRE setup failed: ${nodeResult.stderr || nodeResult.stdout || `rc=${nodeResult.rc}`}`);
+      }
       foreignCreated = true;
-      this.event(routeId, 'foreign_node_add', 'PASS', `${foreign.name}: ${peer} (${allocation.subnet_base}/${allocation.idx})`);
+      this.ownership(routeId, { rollback_state: 'NONE' });
+      nodeStage.pass(`${foreign.name}: ${peer} (${allocation.subnet_base}/${allocation.idx})`);
 
+      const peerStage = this.stage(routeId, 'iran_peer_add', `${iran.name}; TCP+UDP ${port}`);
       const greCommand = actions.buildAction('peer_add', {
         name: peer,
         foreign_ip: foreignIp,
@@ -559,9 +661,12 @@ class RouteOrchestrator {
         udp_ports: String(port),
       });
       const greResult = await this.remote(iran, greCommand, 300000);
-      if (greResult.rc !== 0) throw new Error(`GRE setup failed: ${greResult.stderr || greResult.stdout || `rc=${greResult.rc}`}`);
+      if (greResult.rc !== 0) {
+        peerStage.fail(greResult.stderr || greResult.stdout || `rc=${greResult.rc}`);
+        throw new Error(`GRE setup failed: ${greResult.stderr || greResult.stdout || `rc=${greResult.rc}`}`);
+      }
       iranCreated = true;
-      this.event(routeId, 'iran_peer_add', 'PASS', `${iran.name}: ${peer}; TCP+UDP ${port}`);
+      peerStage.pass(`${iran.name}: ${peer}; TCP+UDP ${port}`);
 
       // The inbound itself NEVER embeds a client for a first-class panel.
       // Embedding one would make upstream reject the inbound with
@@ -593,27 +698,38 @@ class RouteOrchestrator {
         clients: embeddedClients,
         externalProxy: hostMode === 'external_proxy' ? { host: iranIp, port } : null,
       });
-      inboundId = await client.addInbound(payload);
-      this.event(routeId, 'inbound_add', 'PASS', `Shadowsocks inbound ${inboundId}`);
+      const inboundStage = this.stage(routeId, 'inbound_add', `Shadowsocks on ${port}`);
+      try {
+        inboundId = await client.addInbound(payload);
+      } catch (err) {
+        inboundStage.fail(err.message);
+        throw err;
+      }
+      this.ownership(routeId, { inbound_id: inboundId });
+      inboundStage.pass(`Shadowsocks inbound ${inboundId}`);
 
       if (clientModel === 'first_class' && clientMode === 'existing') {
+        const attachStage = this.stage(routeId, 'client_attach', `Attaching existing client ${email} to inbound ${inboundId}`);
         try {
           await client.attachClient(email, [inboundId]);
         } catch (err) {
-          this.event(routeId, 'client_attach', 'FAIL', err.message);
+          attachStage.fail(err.message);
           throw new Error(`attaching existing 3x-ui client '${email}' to inbound ${inboundId} failed: ${err.message}`);
         }
         clientAttached = true;
-        this.event(routeId, 'client_attach', 'PASS', `Attached existing client ${email} to inbound ${inboundId}`);
+        this.ownership(routeId, { client_attached_by_route: 1, client_created_by_route: 0 });
+        attachStage.pass(`Attached existing client ${email} to inbound ${inboundId}`);
       } else if (clientModel === 'first_class' && clientMode === 'new') {
+        const createStage = this.stage(routeId, 'client_create', `Creating client ${email} on inbound ${inboundId}`);
         try {
           await client.createClient({ email, password: newClientPassword, method, enable: true }, [inboundId]);
         } catch (err) {
-          this.event(routeId, 'client_create', 'FAIL', err.message);
+          createStage.fail(err.message);
           throw new Error(`creating 3x-ui client '${email}' failed: ${err.message}`);
         }
         clientCreated = true;
-        this.event(routeId, 'client_create', 'PASS', `Created client ${email} on inbound ${inboundId}`);
+        this.ownership(routeId, { client_created_by_route: 1, client_attached_by_route: 0 });
+        createStage.pass(`Created client ${email} on inbound ${inboundId}`);
       } else {
         this.event(routeId, clientMode === 'new' ? 'client_create' : 'client_attach', 'PASS',
           clientMode === 'new'
@@ -622,35 +738,56 @@ class RouteOrchestrator {
       }
 
       if (hostMode === 'managed_hosts') {
-        const response = await client.addHost({
-          inboundIds: [inboundId], remark: `GRE-${routeName}`, hosts: [iranIp], port, security: 'same', tags: [],
-        });
+        const hostStage = this.stage(routeId, 'managed_host_add', `${iranIp}:${port}`);
+        let response;
+        try {
+          response = await client.addHost({
+            inboundIds: [inboundId], remark: `GRE-${routeName}`, hosts: [iranIp], port, security: 'same', tags: [],
+          });
+        } catch (err) {
+          hostStage.fail(err.message);
+          throw err;
+        }
         const host = response && (response.obj || response.data || response);
         hostGroupId = host && (host.groupId || host.id) || null;
-        this.event(routeId, 'managed_host_add', 'PASS', `${iranIp}:${port}`);
+        this.ownership(routeId, { host_group_id: hostGroupId, host_mode: hostMode });
+        hostStage.pass(`${iranIp}:${port}${hostGroupId ? ` (${hostGroupId})` : ''}`);
       } else {
+        this.ownership(routeId, { host_mode: hostMode });
         this.event(routeId, 'external_proxy', 'PASS', `${iranIp}:${port}`);
       }
 
-      const credential = await this.resolveClientCredential({
-        client,
-        clientModel,
-        inboundId,
-        email,
-        host: iranIp,
-        port,
-        method,
-        createdByRoute: clientCreatedByRoute,
-        knownPassword: newClientPassword,
-      });
+      const linkStage = this.stage(routeId, 'link_fetch', `Requesting the panel-issued share link for ${email}`);
+      let credential;
+      try {
+        credential = await this.resolveClientCredential({
+          client,
+          clientModel,
+          inboundId,
+          email,
+          host: iranIp,
+          port,
+          method,
+          createdByRoute: clientCreatedByRoute,
+          knownPassword: newClientPassword,
+        });
+      } catch (err) {
+        linkStage.fail(err.message);
+        throw err;
+      }
       effectivePassword = credential.password;
       const link = credential.link;
+      linkStage.pass(credential.rebuilt ? 'Credential rebuilt from the password this route created' : 'Panel link received');
       this.event(routeId, 'link_validate', 'PASS', credential.rebuilt
         ? 'Endpoint and method validated; credential rebuilt from the password created by this route'
         : 'Endpoint, method and client credential validated against the panel-issued link');
 
+      const runtimeStage = this.stage(routeId, 'runtime_validation', 'GRE state, listeners, inbound and end-to-end TCP');
       const greHealth = await this.remote(iran, `ip link show ${shellQuote(`gre-${peer}`)} 2>/dev/null | grep -q '<[^>]*UP'`, 15000);
-      if (greHealth.rc !== 0) throw new Error('GRE tunnel was created but its link is not UP');
+      if (greHealth.rc !== 0) {
+        runtimeStage.fail('GRE tunnel was created but its link is not UP');
+        throw new Error('GRE tunnel was created but its link is not UP');
+      }
       const runtime = await this.collectUsage(iran, foreign, client);
       const iranRules = portEvidence(runtime.iranOutput, port);
       const foreignListeners = portEvidence(runtime.foreignOutput, port);
@@ -658,17 +795,21 @@ class RouteOrchestrator {
       const hasUdp = foreignListeners.some((line) => /^udp\b/i.test(line));
       const liveInbound = runtime.inbounds.some((item) => Number(item.id) === inboundId && Number(item.port) === port);
       if (!iranRules.length || !hasTcp || !hasUdp || !liveInbound) {
+        runtimeStage.fail('expected GRE forwarding, TCP+UDP listeners and the 3x-ui inbound were not all present');
         throw new Error('runtime validation failed: expected GRE forwarding, TCP+UDP listeners, and 3x-ui inbound were not all present');
       }
       const tcpProbe = await this.remote(foreign,
         `timeout 8 bash -c ${shellQuote(`exec 3<>/dev/tcp/${iranIp}/${port}`)}`, 15000);
-      if (tcpProbe.rc !== 0) throw new Error(`end-to-end TCP probe to ${iranIp}:${port} failed`);
-      this.event(routeId, 'runtime_validation', 'PASS', 'GRE UP; TCP+UDP listeners; inbound; end-to-end TCP');
+      if (tcpProbe.rc !== 0) {
+        runtimeStage.fail(`end-to-end TCP probe to ${iranIp}:${port} failed`);
+        throw new Error(`end-to-end TCP probe to ${iranIp}:${port} failed`);
+      }
+      runtimeStage.pass('GRE UP; TCP+UDP listeners; inbound; end-to-end TCP');
 
       const now = Date.now();
       this.db.transaction(() => {
-        this.db.prepare(`UPDATE gre_routes SET inbound_id=?, capability=?, client_model=?, client_password_enc=?, share_link_enc=?, status='ACTIVE', last_error=NULL, updated_at=? WHERE id=?`)
-          .run(inboundId, hostMode, clientModel, encrypt(this.cryptKey, effectivePassword), encrypt(this.cryptKey, link), now, routeId);
+        this.db.prepare(`UPDATE gre_routes SET inbound_id=?, capability=?, host_mode=?, client_model=?, client_password_enc=?, share_link_enc=?, status='ACTIVE', last_error=NULL, current_stage=NULL, rollback_state='NONE', updated_at=? WHERE id=?`)
+          .run(inboundId, hostMode, hostMode, clientModel, encrypt(this.cryptKey, effectivePassword), encrypt(this.cryptKey, link), now, routeId);
         this.db.prepare(`UPDATE port_allocations SET status='ACTIVE', updated_at=? WHERE route_id=?`).run(now, routeId);
       })();
       this.event(routeId, 'active', 'PASS', 'Route marked ACTIVE');
@@ -696,19 +837,32 @@ class RouteOrchestrator {
         checks: { gre: 'UP', tcp: 'PASS', udp: 'LISTENING', xui: 'PASS', link: 'PASS' },
       };
     } catch (err) {
+      const failedStage = (() => {
+        try {
+          const row = this.db.prepare('SELECT current_stage FROM gre_routes WHERE id = ?').get(Number(routeId));
+          return row ? row.current_stage : null;
+        } catch { return null; }
+      })();
       const rollback = await this.rollback({
         routeId, client, clientModel, inboundId, hostGroupId, email,
         clientAttached, clientCreated, iranCreated, foreignCreated, peer, iran, foreign,
       });
+      const rollbackFailed = rollback.some((entry) => /failed/i.test(String(entry)));
       const now = Date.now();
       this.db.transaction(() => {
-        this.db.prepare(`UPDATE gre_routes SET inbound_id=?, status='FAILED', last_error=?, updated_at=? WHERE id=?`)
-          .run(inboundId, err.message, now, routeId);
+        this.db.prepare(`UPDATE gre_routes SET inbound_id=?, status='FAILED', last_error=?, current_stage=?, rollback_state=?, updated_at=? WHERE id=?`)
+          .run(inboundId, err.message, failedStage, rollbackFailed ? 'PARTIAL' : 'CLEAN', now, routeId);
         this.db.prepare(`UPDATE port_allocations SET status='RELEASED', updated_at=? WHERE route_id=?`).run(now, routeId);
       })();
-      this.event(routeId, 'failed', 'FAIL', err.message);
+      // Lead with the exact step: "failed at inbound_add: Duplicate email: navid"
+      // is far more useful than a bare "failed" at the end of the log.
+      this.event(routeId, 'failed', 'FAIL', failedStage
+        ? `Failed at ${failedStage}: ${err.message}`
+        : err.message);
       err.rollback = rollback;
       err.routeId = routeId;
+      err.failedStage = failedStage;
+      err.attemptNo = Number(route.attempt_no) || 1;
       err.events = this.events(routeId);
       throw err;
     }
@@ -823,9 +977,11 @@ class RouteOrchestrator {
   listRoutes(includeSecrets = false) {
     const rows = this.db.prepare(`
       SELECT r.*, i.name AS iran_name, i.host AS iran_host, f.name AS foreign_name,
-             p.name AS panel_name, p.base_url AS panel_url
+             p.name AS panel_name, p.base_url AS panel_url,
+             p.panel_version AS panel_version, p.client_model AS panel_client_model
       FROM gre_routes r JOIN servers i ON i.id=r.iran_server_id
       JOIN servers f ON f.id=r.foreign_server_id JOIN xui_panels p ON p.id=r.panel_id
+      WHERE r.deleted_at IS NULL
       ORDER BY r.created_at DESC
     `).all();
     return rows.map((row) => {
@@ -838,28 +994,633 @@ class RouteOrchestrator {
     });
   }
 
-  async reconcile(routeId) {    const route = this.db.prepare('SELECT * FROM gre_routes WHERE id = ?').get(routeId);
+  // ------------------------------------------------------------------
+  // Reconciliation
+  //
+  // Desired-state, component by component. The expected state depends on what
+  // the route is supposed to be, not on what happens to exist:
+  //   ACTIVE / RESERVED  -> every component must be PRESENT
+  //   FAILED             -> every route-owned component must be ABSENT
+  //                         (rollback ran). A surviving object is a leftover.
+  //   STALE              -> read-only discovery; never judged, never touched.
+  // Reconcile never deletes anything: unknown remote state is reported, not
+  // destroyed.
+  // ------------------------------------------------------------------
+
+  component(name, expected, actual, detail = '') {
+    const pass = String(expected) === String(actual);
+    return { name, expected: String(expected), actual: String(actual), status: pass ? 'PASS' : 'FAIL', detail: String(detail || '') };
+  }
+
+  // ------------------------------------------------------------------
+  // Editing the desired specification
+  //
+  // Editing never provisions. It rewrites what the route is *supposed* to be,
+  // so a later Retry (or a fresh Create) uses the new values. While a route is
+  // ACTIVE only purely cosmetic fields may move; anything that describes remote
+  // infrastructure is refused, because the database would then disagree with
+  // the tunnel that is actually running.
+  // ------------------------------------------------------------------
+
+  static EDITABLE_INFRA_FIELDS = ['iran_server_id', 'foreign_server_id', 'panel_id', 'port', 'method', 'client_mode', 'client_email', 'client_model'];
+  static EDITABLE_COSMETIC_FIELDS = ['name'];
+
+  async editRoute(routeId, patch = {}) {
+    const id = Number(routeId);
+    const route = this.route(id);
+    if (!route) {
+      const err = new Error('route not found');
+      err.status = 404;
+      throw err;
+    }
+    if (route.deleted_at) {
+      const err = new Error('route is deleted');
+      err.status = 409;
+      throw err;
+    }
+    if (this.running && this.running.has(id)) {
+      const err = new Error('route is provisioning right now; wait for it to finish before editing');
+      err.status = 409;
+      throw err;
+    }
+
+    const next = {};
+    const changed = [];
+    const want = (value) => value !== undefined && value !== null && value !== '';
+
+    // Cosmetic first: always allowed.
+    if (want(patch.name)) {
+      const name = String(patch.name).trim();
+      if (!ROUTE_NAME_RE.test(name)) {
+        const err = new Error('route name must be 1-40 letters, digits, _ or -');
+        err.status = 400;
+        throw err;
+      }
+      if (name !== route.name) { next.name = name; changed.push('name'); }
+    }
+
+    // Infrastructure.
+    const infraTouched = [];
+    if (want(patch.iranServerId)) infraTouched.push('iran_server_id');
+    if (want(patch.foreignServerId)) infraTouched.push('foreign_server_id');
+    if (want(patch.panelId)) infraTouched.push('panel_id');
+    if (want(patch.port)) infraTouched.push('port');
+    if (want(patch.method)) infraTouched.push('method');
+    if (want(patch.client_mode) || want(patch.client_email) || want(patch.client_name)) {
+      infraTouched.push('client');
+    }
+
+    if (infraTouched.length && route.status === 'ACTIVE') {
+      const err = new Error('this route is ACTIVE: its servers, panel, port, method and client cannot be changed while the tunnel is live. Delete or reconcile it first, then create a new route.');
+      err.status = 409;
+      err.locked = route.status;
+      err.fields = infraTouched;
+      throw err;
+    }
+
+    // Validate the resulting specification before writing anything.
+    const iranServerId = want(patch.iranServerId) ? Number(patch.iranServerId) : route.iran_server_id;
+    const foreignServerId = want(patch.foreignServerId) ? Number(patch.foreignServerId) : route.foreign_server_id;
+    const panelId = want(patch.panelId) ? Number(patch.panelId) : route.panel_id;
+    const port = want(patch.port) ? validatePort(patch.port) : route.port;
+    const method = want(patch.method) ? String(patch.method) : route.method;
+    if (!SS_METHODS.includes(method)) {
+      const err = new Error('unsupported Shadowsocks method');
+      err.status = 400;
+      throw err;
+    }
+    const iran = this.server(iranServerId);
+    const foreign = this.server(foreignServerId);
+    if (iran.id === foreign.id) {
+      const err = new Error('IRAN and FOREIGN servers must be different');
+      err.status = 400;
+      throw err;
+    }
+    const panel = this.panel(panelId);
+
+    let clientMode = route.client_mode || 'new';
+    let clientEmail = route.client_email;
+    if (want(patch.client_mode) || want(patch.client_email) || want(patch.client_name)) {
+      const intent = parseClientIntent({
+        client_mode: want(patch.client_mode) ? patch.client_mode : route.client_mode,
+        client_email: want(patch.client_email) ? patch.client_email : (want(patch.client_name) ? patch.client_name : route.client_email),
+      });
+      clientMode = intent.clientMode;
+      clientEmail = intent.clientEmail;
+    }
+
+    // Re-run the read-only preflight for whatever the edit implies, so a bad
+    // selection is rejected here instead of at the next Retry.
+    const client = this.client(panel);
+    const capabilities = await client.resolveCapabilities();
+    const clientModel = capabilities.clientModel;
+    if (clientModel === 'first_class') {
+      const existing = await client.getFirstClassClient(clientEmail);
+      if (clientMode === 'existing' && !existing) {
+        const err = new Error(`Selected 3x-ui client '${clientEmail}' no longer exists. Refresh clients and retry.`);
+        err.status = 409;
+        throw err;
+      }
+      if (clientMode === 'new' && existing) {
+        const err = new Error(`A 3x-ui client with email '${clientEmail}' already exists. Select it from Existing clients instead of creating it again.`);
+        err.status = 409;
+        throw err;
+      }
+    } else if (clientMode === 'existing') {
+      const embedded = await client.findEmbeddedClient(clientEmail);
+      if (!embedded) {
+        const err = new Error(`Selected 3x-ui client '${clientEmail}' no longer exists. Refresh clients and retry.`);
+        err.status = 409;
+        throw err;
+      }
+    } else if (await client.findEmbeddedClient(clientEmail)) {
+      const err = new Error(`A 3x-ui client with email '${clientEmail}' already exists. Select it from Existing clients instead of creating it again.`);
+      err.status = 409;
+      throw err;
+    }
+
+    if (iranServerId !== route.iran_server_id) { next.iran_server_id = iranServerId; changed.push('iran_server_id'); }
+    if (foreignServerId !== route.foreign_server_id) { next.foreign_server_id = foreignServerId; changed.push('foreign_server_id'); }
+    if (panelId !== route.panel_id) { next.panel_id = panelId; changed.push('panel_id'); }
+    if (port !== route.port) {
+      // A port change on a non-ACTIVE route must not silently steal a port that
+      // another non-released route already holds.
+      const conflict = this.registryConflict(iranServerId, foreignServerId, port, id);
+      if (conflict) {
+        const err = new Error(`port ${port} is already reserved by route '${conflict.route_name}'`);
+        err.status = 409;
+        throw err;
+      }
+      next.port = port;
+      changed.push('port');
+    }
+    if (method !== route.method) { next.method = method; changed.push('method'); }
+    if (clientEmail !== route.client_email) { next.client_email = clientEmail; changed.push('client_email'); }
+    if (clientMode !== (route.client_mode || 'new')) { next.client_mode = clientMode; changed.push('client_mode'); }
+    if (clientModel !== route.client_model) { next.client_model = clientModel; changed.push('client_model'); }
+
+    if (changed.length) {
+      next.updated_at = Date.now();
+      const fields = Object.keys(next);
+      this.db.prepare(`UPDATE gre_routes SET ${fields.map((f) => `${f} = ?`).join(', ')} WHERE id = ?`)
+        .run(...fields.map((f) => next[f]), id);
+      // Keep the allocation row consistent with the spec it mirrors.
+      if (next.port !== undefined || next.iran_server_id !== undefined || next.foreign_server_id !== undefined) {
+        this.db.prepare('UPDATE port_allocations SET iran_server_id = ?, foreign_server_id = ?, port = ?, updated_at = ? WHERE route_id = ?')
+          .run(next.iran_server_id || route.iran_server_id, next.foreign_server_id || route.foreign_server_id,
+            next.port || route.port, Date.now(), id);
+      }
+      this.event(id, 'edited', 'INFO', `specification updated: ${changed.join(', ')}`);
+    }
+
+    return { route: this.safeRoute(id), changed };
+  }
+
+  // ------------------------------------------------------------------
+  // Retry
+  // ------------------------------------------------------------------
+
+  async prepareForRetry(routeId) {
+    const id = Number(routeId);
+    const route = this.route(id);
+    if (!route) throw new Error('route not found');
+
+    // Step 1: find out what is actually left over before touching anything.
+    const reconciled = await this.reconcile(id);
+    const leftovers = (reconciled.components || [])
+      .filter((item) => item.status === 'FAIL' && !/^client$/.test(item.name))
+      .map((item) => item.name);
+
+    // A leftover that belongs to THIS route would collide with the new attempt.
+    // The exception is the client: an existing client is supposed to survive.
+    const blocking = leftovers.filter((name) => name !== 'client' && name !== 'client_attachment');
+    if (blocking.length) {
+      const err = new Error(`previous attempt left resources behind (${blocking.join(', ')}); clean them up with Reconcile before retrying`);
+      err.status = 409;
+      err.leftover = blocking;
+      throw err;
+    }
+
+    // Step 2: free the previous reservation so the port can be re-chosen.
+    const now = Date.now();
+    this.db.prepare("UPDATE port_allocations SET status = 'RELEASED', updated_at = ? WHERE route_id = ?").run(now, id);
+
+    const attempt = (Number(route.attempt_no) || 1) + 1;
+    const recommendation = await this.recommend({
+      iranServerId: route.iran_server_id,
+      foreignServerId: route.foreign_server_id,
+      panelId: route.panel_id,
+      start: DEFAULT_RANGE[0],
+      end: DEFAULT_RANGE[1],
+      preferredPort: route.port,
+    });
+    const port = recommendation.port;
+
+    this.db.transaction(() => {
+      this.db.prepare(`
+        UPDATE gre_routes
+           SET status = 'RESERVED', port = ?, last_error = NULL, inbound_id = NULL,
+               attempt_no = ?, current_stage = NULL, rollback_state = 'NONE',
+               updated_at = ?
+         WHERE id = ?
+      `).run(port, attempt, now, id);
+      this.db.prepare(`
+        INSERT INTO port_allocations (route_id, iran_server_id, foreign_server_id, port, protocols, status, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'tcp,udp', 'RESERVED', ?, ?)
+        ON CONFLICT(route_id) DO UPDATE SET port = excluded.port, status = 'RESERVED', updated_at = excluded.updated_at
+      `).run(id, route.iran_server_id, route.foreign_server_id, port, now, now);
+    })();
+
+    this.event(id, 'retry_started', 'INFO', `Attempt #${attempt} (attempt #${attempt - 1} ended ${route.status})`);
+
+    return {
+      route_id: id,
+      status: 'RESERVED',
+      name: route.name,
+      port,
+      method: route.method,
+      client_email: route.client_email,
+      client_mode: route.client_mode || 'new',
+      client_model: route.client_model,
+      host_mode: route.host_mode || route.capability || null,
+      attempt_no: attempt,
+      leftover: [],
+      panel: this.panel(route.panel_id),
+    };
+  }
+
+  // ------------------------------------------------------------------
+  // Delete
+  // ------------------------------------------------------------------
+
+  // What WOULD be removed, and what is preserved. Used by the confirmation
+  // dialog so the operator sees the client-safety promise before committing.
+  async deletePreview(routeId) {
+    const route = this.route(Number(routeId));
+    if (!route) throw new Error('route not found');
+    const removes = [];
+    const preserves = [];
+    const clientModel = route.client_model || null;
+
+    if (route.client_attached_by_route) {
+      removes.push(`3x-ui client "${route.client_email}" attachment to inbound ${route.inbound_id || '(none)'}`);
+      preserves.push(`3x-ui client "${route.client_email}" — WILL NOT BE DELETED`);
+    } else if (route.client_created_by_route) {
+      removes.push(`3x-ui client "${route.client_email}" (created by this route)`);
+      preserves.push('any other client on the panel');
+    } else {
+      preserves.push(`3x-ui client "${route.client_email}" — ownership unknown, so it is never deleted`);
+    }
+    if (route.host_group_id) removes.push(`managed host ${route.host_group_id}`);
+    if (route.inbound_id) removes.push(`3x-ui inbound ${route.inbound_id}`);
+    if (route.peer_name) {
+      removes.push(`IRAN GRE peer "${route.peer_name}"`);
+      removes.push(`FOREIGN GRE node "${route.peer_name}"`);
+    }
+    removes.push(`port allocation ${route.port}`);
+    removes.push('the route row (soft delete; its event history is kept)');
+    preserves.push('all route_events / timeline history');
+
+    return {
+      routeId: route.id,
+      name: route.name,
+      status: route.status,
+      clientModel,
+      removes,
+      preserves,
+      requiresConfirmation: true,
+      warning: route.status === 'ACTIVE'
+        ? 'This route is ACTIVE: its tunnel, inbound and host will be torn down.'
+        : 'This route is not ACTIVE; delete verifies the cleanup that was already attempted.',
+    };
+  }
+
+  /**
+   * Delete a route: remove exactly the resources this route owns, in a safe
+   * order, then soft-delete the row. Soft delete keeps the event history.
+   *
+   * NEVER deletes a pre-existing client globally: for an attached client only
+   * the attachment to this route's inbound is removed. A route-created client
+   * is removed only when no other inbound still uses it.
+   */
+  async deleteRoute(routeId) {
+    const id = Number(routeId);
+    const route = this.route(id);
     if (!route) throw new Error('route not found');
     const iran = this.server(route.iran_server_id);
     const foreign = this.server(route.foreign_server_id);
     const client = this.client(this.panel(route.panel_id));
-    const usage = await this.collectUsage(iran, foreign, client);
-    const iranEvidence = portEvidence(usage.iranOutput, route.port);
-    const foreignEvidence = portEvidence(usage.foreignOutput, route.port);
-    const inbound = usage.inbounds.find((item) => Number(item.id) === Number(route.inbound_id) && Number(item.port) === route.port);
-    const healthy = iranEvidence.length > 0 && foreignEvidence.length > 0 && !!inbound;
-    const status = healthy ? 'ACTIVE' : 'NEEDS_REVIEW';
-    const detail = healthy ? null : JSON.stringify({
+    const removed = [];
+    const failures = [];
+    const clientModel = route.client_model || null;
+
+    const step = async (name, fn) => {
+      try {
+        const detail = await fn();
+        removed.push(name);
+        this.event(id, `delete_${name}`, 'PASS', detail || name);
+      } catch (err) {
+        failures.push({ name, error: err.message });
+        this.event(id, `delete_${name}`, 'FAIL', err.message);
+      }
+    };
+
+    // 1. Client relationship.
+    if (clientModel === 'first_class') {
+      if (route.client_attached_by_route) {
+        await step('client_attachment', async () => {
+          if (!route.inbound_id) return 'no inbound recorded; nothing to detach';
+          await client.detachClient(route.client_email, [route.inbound_id]);
+          this.ownership(id, { client_attached_by_route: 0 });
+          return `detached ${route.client_email} from inbound ${route.inbound_id} (client preserved)`;
+        });
+      } else if (route.client_created_by_route) {
+        await step('client', async () => {
+          // Only safe when nothing else still references it.
+          let otherAttachments = [];
+          try {
+            const record = await client.getFirstClassClient(route.client_email);
+            const ids = record ? (record.inboundIds || []).map(Number) : [];
+            otherAttachments = ids.filter((inboundId) => Number(inboundId) !== Number(route.inbound_id));
+          } catch { otherAttachments = []; }
+          if (otherAttachments.length) {
+            if (route.inbound_id) await client.detachClient(route.client_email, [route.inbound_id]);
+            this.ownership(id, { client_attached_by_route: 0, client_created_by_route: 0 });
+            return `${route.client_email} is still used by inbound(s) ${otherAttachments.join(', ')}; detached from ${route.inbound_id} instead of deleting`;
+          }
+          await client.deleteClient(route.client_email);
+          this.ownership(id, { client_created_by_route: 0 });
+          return `deleted route-created client ${route.client_email}`;
+        });
+      }
+    }
+
+    // 2. Managed host.
+    if (route.host_group_id) {
+      await step('managed_host', async () => {
+        await client.deleteHost(route.host_group_id);
+        this.ownership(id, { host_group_id: null });
+        return `removed host ${route.host_group_id}`;
+      });
+    }
+
+    // 3. Inbound (also removes any embedded legacy client entry).
+    if (route.inbound_id) {
+      await step('inbound', async () => {
+        await client.deleteInbound(route.inbound_id);
+        return `removed inbound ${route.inbound_id}`;
+      });
+    }
+
+    // 4. GRE, IRAN first then FOREIGN (mirrors the rollback order).
+    if (route.peer_name) {
+      await step('iran_peer', async () => {
+        const result = await this.remote(iran, actions.buildAction('peer_remove', { name: route.peer_name }), 300000);
+        if (result.rc !== 0) throw new Error(result.stderr || result.stdout || `rc=${result.rc}`);
+        return `removed IRAN peer ${route.peer_name}`;
+      });
+      await step('foreign_node', async () => {
+        const result = await this.remote(foreign, actions.buildAction('node_remove', { name: route.peer_name }), 300000);
+        if (result.rc !== 0) throw new Error(result.stderr || result.stdout || `rc=${result.rc}`);
+        return `removed FOREIGN node ${route.peer_name}`;
+      });
+    }
+
+    // 5. Port allocation.
+    await step('port_allocation', async () => {
+      this.db.prepare("UPDATE port_allocations SET status = 'RELEASED', updated_at = ? WHERE route_id = ?").run(Date.now(), id);
+      return `released port ${route.port}`;
+    });
+
+    const now = Date.now();
+    const ok = failures.length === 0;
+    if (ok) {
+      this.db.prepare("UPDATE gre_routes SET deleted_at = ?, status = 'STALE', current_stage = NULL, rollback_state = 'CLEAN', updated_at = ? WHERE id = ?")
+        .run(now, now, id);
+      this.event(id, 'deleted', 'PASS', 'Route removed; event history is preserved');
+    } else {
+      this.db.prepare("UPDATE gre_routes SET status = 'NEEDS_REVIEW', last_error = ?, updated_at = ? WHERE id = ?")
+        .run(JSON.stringify({ deleteFailures: failures }), now, id);
+      this.event(id, 'deleted', 'FAIL',
+        `Deletion incomplete: ${failures.map((f) => `${f.name} (${f.error})`).join('; ')}`);
+    }
+
+    return {
+      ok,
+      route_id: id,
+      name: route.name,
+      deleted: ok,
+      removed,
+      failures,
+      preserved: route.client_attached_by_route
+        ? [`3x-ui client "${route.client_email}" (only the attachment was removed)`]
+        : [],
+    };
+  }
+
+  async reconcile(routeId) {
+    const route = this.db.prepare('SELECT * FROM gre_routes WHERE id = ?').get(routeId);
+    if (!route) throw new Error('route not found');
+    const iran = this.server(route.iran_server_id);
+    const foreign = this.server(route.foreign_server_id);
+    const panel = this.panel(route.panel_id);
+    const client = this.client(panel);
+    const desiredState = route.status;
+    const components = [];
+    const notes = [];
+
+    // --- read-only gathering -------------------------------------------
+    let usage = null;
+    let probeError = null;
+    try {
+      usage = await this.collectUsage(iran, foreign, client);
+    } catch (err) {
+      probeError = err.message;
+    }
+
+    const port = Number(route.port);
+    const iranEvidence = usage ? portEvidence(usage.iranOutput, port) : [];
+    const foreignEvidence = usage ? portEvidence(usage.foreignOutput, port) : [];
+    const inbounds = usage ? usage.inbounds : [];
+    const inbound = inbounds.find((item) => Number(item.id) === Number(route.inbound_id));
+    const registry = this.db.prepare(`
+      SELECT p.*, r.name AS route_name FROM port_allocations p
+      JOIN gre_routes r ON r.id = p.route_id
+      WHERE p.route_id = ?
+    `).get(route.id);
+
+    // GRE interface state needs a dedicated probe; it is the one thing that
+    // distinguishes "peer exists" from "peer actually forwards".
+    let greUp = null;
+    if (route.peer_name) {
+      try {
+        const probe = await this.remote(iran, `ip link show ${shellQuote(`gre-${route.peer_name}`)} 2>/dev/null | grep -q '<[^>]*UP'`, 15000);
+        greUp = probe.rc === 0;
+      } catch { greUp = null; }
+    }
+
+    // Client relationship, asked of the panel itself where the API allows it.
+    let clientPresent = null;
+    let clientAttached = null;
+    let clientAttachedToInbound = null;
+    try {
+      if ((route.client_model || '') === 'first_class') {
+        const record = await client.getFirstClassClient(route.client_email);
+        clientPresent = !!record;
+        if (record) {
+          const ids = (record.inboundIds || []).map(Number);
+          clientAttached = ids.length > 0;
+          clientAttachedToInbound = route.inbound_id ? ids.includes(Number(route.inbound_id)) : false;
+        } else {
+          clientAttached = false;
+          clientAttachedToInbound = false;
+        }
+      } else if (inbound) {
+        const settings = XuiClient.normalizeSettings(inbound.settings);
+        const embedded = (settings && Array.isArray(settings.clients) ? settings.clients : [])
+          .some((c) => String(c && c.email || '') === String(route.client_email));
+        clientPresent = embedded;
+        clientAttached = embedded;
+        clientAttachedToInbound = embedded;
+      }
+    } catch (err) {
+      notes.push(`client probe failed: ${err.message}`);
+    }
+
+    const hasHost = !!route.host_group_id;
+    const hostMode = route.host_mode || route.capability || null;
+
+    // --- build the component table -------------------------------------
+    const isCleanupState = desiredState === 'FAILED';
+    const isReadOnly = desiredState === 'STALE';
+
+    if (isReadOnly) {
+      components.push(this.component('registry', 'UNKNOWN', registry ? registry.status : 'ABSENT',
+        registry ? `allocation ${registry.port} is ${registry.status}` : 'no allocation row'));
+      components.push(this.component('iran_peer', 'UNKNOWN', greUp === null ? 'UNKNOWN' : (greUp ? 'PRESENT' : 'ABSENT'),
+        route.peer_name ? `gre-${route.peer_name}` : 'peer name not recorded'));
+      components.push(this.component('foreign_node', 'UNKNOWN', iranEvidence.length ? 'PRESENT' : 'UNKNOWN', 'read-only discovery'));
+      components.push(this.component('xui_inbound', 'UNKNOWN', inbound ? 'PRESENT' : 'ABSENT',
+        route.inbound_id ? `inbound ${route.inbound_id}` : 'no inbound recorded'));
+      components.push(this.component('client', 'UNKNOWN', clientPresent === null ? 'UNKNOWN' : (clientPresent ? 'EXISTS' : 'ABSENT'),
+        route.client_email));
+    } else if (isCleanupState) {
+      // Rollback ran, so route-owned objects are EXPECTED to be gone. Their
+      // absence is success, not a reason to cry NEEDS_REVIEW.
+      components.push(this.component('port_allocation', 'RELEASED', registry ? registry.status : 'RELEASED',
+        registry ? `allocation ${registry.port}` : 'no allocation row'));
+      components.push(this.component('iran_peer', 'ABSENT', greUp === null ? 'UNKNOWN' : (greUp ? 'PRESENT' : 'ABSENT'),
+        route.peer_name ? `gre-${route.peer_name}` : 'no peer recorded'));
+      components.push(this.component('iran_forwarding', 'ABSENT', iranEvidence.length ? 'PRESENT' : 'ABSENT', 'IRAN nat rules'));
+      components.push(this.component('foreign_listener', 'ABSENT', foreignEvidence.length ? 'LISTENING' : 'ABSENT', 'FOREIGN listeners'));
+      components.push(this.component('xui_inbound', 'ABSENT', inbound ? 'PRESENT' : 'ABSENT',
+        route.inbound_id ? `inbound ${route.inbound_id}` : 'no inbound recorded'));
+      // A client that pre-existed this route MUST still exist. One this route
+      // created should have been removed with the rollback.
+      if (route.client_attached_by_route) {
+        components.push(this.component('client', 'EXISTS', clientPresent === null ? 'UNKNOWN' : (clientPresent ? 'EXISTS' : 'ABSENT'),
+          `${route.client_email} (pre-existing: must never be deleted)`));
+        components.push(this.component('client_attachment', 'DETACHED', clientAttachedToInbound ? 'ATTACHED' : 'DETACHED',
+          'detached from the rolled-back inbound only'));
+      } else if (route.client_created_by_route) {
+        components.push(this.component('client', 'ABSENT', clientPresent === null ? 'UNKNOWN' : (clientPresent ? 'EXISTS' : 'ABSENT'),
+          `${route.client_email} was created by this route`));
+      } else {
+        components.push(this.component('client', 'KEEP', clientPresent === null ? 'UNKNOWN' : (clientPresent ? 'EXISTS' : 'ABSENT'),
+          `${route.client_email} (ownership not recorded)`));
+      }
+      if (hasHost) {
+        components.push(this.component('managed_host', 'ABSENT', 'UNKNOWN',
+          `host ${route.host_group_id} could not be verified remotely`));
+      }
+    } else {
+      // ACTIVE / RESERVED: everything must be present.
+      components.push(this.component('registry', 'ACTIVE', registry ? registry.status : 'ABSENT',
+        registry ? `allocation ${registry.port}` : 'no allocation row'));
+      components.push(this.component('iran_peer', 'PRESENT', greUp === null ? 'UNKNOWN' : (greUp ? 'PRESENT' : 'ABSENT'),
+        route.peer_name ? `gre-${route.peer_name} link state` : 'peer name not recorded'));
+      components.push(this.component('iran_forwarding', 'PRESENT', iranEvidence.length ? 'PRESENT' : 'ABSENT', 'IRAN nat rules'));
+      components.push(this.component('foreign_listener', 'LISTENING', foreignEvidence.length ? 'LISTENING' : 'ABSENT', 'FOREIGN TCP+UDP listeners'));
+      components.push(this.component('xui_inbound', 'PRESENT', inbound ? 'PRESENT' : 'ABSENT',
+        route.inbound_id ? `inbound ${route.inbound_id}` : 'no inbound recorded'));
+      if (inbound) {
+        components.push(this.component('inbound_port', String(port), String(inbound.port), `inbound ${inbound.id}`));
+        components.push(this.component('inbound_protocol', 'shadowsocks', String(inbound.protocol || ''), 'protocol'));
+      }
+      if ((route.client_model || '') === 'first_class') {
+        components.push(this.component('client', 'EXISTS', clientPresent === null ? 'UNKNOWN' : (clientPresent ? 'EXISTS' : 'ABSENT'),
+          route.client_email));
+        components.push(this.component('client_attachment', 'ATTACHED', clientAttachedToInbound ? 'ATTACHED' : 'DETACHED',
+          `inbound ${route.inbound_id}`));
+      } else {
+        components.push(this.component('client_embedded', 'PRESENT', clientPresent === null ? 'UNKNOWN' : (clientPresent ? 'PRESENT' : 'ABSENT'),
+          `${route.client_email} in inbound settings`));
+      }
+      if (hostMode === 'managed_hosts') {
+        components.push(this.component('managed_host', 'RECORDED', hasHost ? 'RECORDED' : 'ABSENT',
+          route.host_group_id || 'no host group recorded'));
+      } else {
+        components.push(this.component('external_proxy', 'CONFIGURED', inbound ? 'CONFIGURED' : 'UNKNOWN',
+          'streamSettings.externalProxy'));
+      }
+    }
+
+    const failed = components.filter((item) => item.status === 'FAIL');
+    const unknown = components.filter((item) => item.actual === 'UNKNOWN');
+    let healthy;
+    if (isReadOnly) healthy = true;
+    else if (isCleanupState) healthy = failed.length === 0;
+    else healthy = failed.length === 0 && unknown.length === 0;
+
+    const leftovers = isCleanupState ? failed.map((item) => item.name) : [];
+    const summary = isReadOnly
+      ? 'Read-only discovery; no judgement is made about unknown remote state.'
+      : isCleanupState
+        ? (healthy ? 'FAILED — rollback clean. No remote leftovers detected.' : `FAILED with leftovers: ${leftovers.join(', ')}`)
+        : (healthy ? 'All expected components are present.' : `Missing or mismatched: ${failed.map((item) => item.name).join(', ') || 'unknown state'}`);
+
+    const nextStatus = isReadOnly
+      ? 'STALE'
+      : (healthy ? (desiredState === 'RESERVED' ? 'RESERVED' : (isCleanupState ? 'FAILED' : 'ACTIVE')) : 'NEEDS_REVIEW');
+
+    const now = Date.now();
+    const detail = {
+      desiredState,
+      summary,
+      leftovers,
+      failedStage: route.current_stage || null,
+      probedAt: now,
+      probeError: probeError || undefined,
+    };
+    this.db.transaction(() => {
+      this.db.prepare('UPDATE gre_routes SET status=?, last_error=?, updated_at=? WHERE id=?')
+        .run(nextStatus, JSON.stringify(detail), now, route.id);
+      if (!isReadOnly) {
+        const allocationStatus = isCleanupState ? 'RELEASED' : nextStatus;
+        this.db.prepare('UPDATE port_allocations SET status=?, updated_at=? WHERE route_id=?')
+          .run(allocationStatus, now, route.id);
+      }
+    })();
+
+    return {
+      id: route.id,
+      name: route.name,
+      desiredState,
+      status: nextStatus,
+      healthy,
+      cleanup_complete: isCleanupState ? healthy : null,
+      leftovers,
+      failedStage: route.current_stage || null,
+      attemptNo: Number(route.attempt_no) || 1,
+      summary,
+      notes,
+      probeError,
+      components,
+      // Kept for backward compatibility with the previous flat response.
       iran_forwarding: iranEvidence.length > 0,
       foreign_listener: foreignEvidence.length > 0,
       xui_inbound: !!inbound,
-    });
-    const now = Date.now();
-    this.db.transaction(() => {
-      this.db.prepare('UPDATE gre_routes SET status=?, last_error=?, updated_at=? WHERE id=?').run(status, detail, now, route.id);
-      this.db.prepare('UPDATE port_allocations SET status=?, updated_at=? WHERE route_id=?').run(status, now, route.id);
-    })();
-    return { id: route.id, status, healthy, iran_forwarding: !!iranEvidence.length, foreign_listener: !!foreignEvidence.length, xui_inbound: !!inbound };
+    };
   }
 }
 

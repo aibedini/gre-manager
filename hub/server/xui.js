@@ -65,6 +65,50 @@ function errorStatus(err) {
   return Number(err && err.status) || 0;
 }
 
+// 3x-ui panel versions look like "3.8.5" (optionally tagged "v3.8.5").
+// Xray-core versions also look like semver, which is exactly why the HTML
+// fallback must only accept a version that is presented as the PANEL version.
+const PANEL_VERSION_RE = /^v?(\d{1,3}\.\d{1,3}\.\d{1,3})$/;
+
+function normalizePanelVersion(value) {
+  const text = String(value === undefined || value === null ? '' : value).trim();
+  if (!text) return null;
+  const match = text.match(PANEL_VERSION_RE);
+  return match ? match[1] : null;
+}
+
+// Conservative HTML scan. Anything we cannot attribute to the panel itself
+// returns null: reporting the Xray-core version as the panel version would be
+// worse than reporting nothing.
+function extractPanelVersionFromHtml(html) {
+  const text = String(html || '');
+  // Drop Xray version hints so they can never be mistaken for the panel's.
+  const scrub = (chunk) => chunk
+    .replace(/xray[\s\S]{0,60}?v?\d{1,3}\.\d{1,3}\.\d{1,3}/gi, ' ')
+    .replace(/v?\d{1,3}\.\d{1,3}\.\d{1,3}[\s\S]{0,40}?xray/gi, ' ');
+
+  const patterns = [
+    // <title>3x-ui v3.8.5</title> / "3x-ui" followed by a version
+    /3x[\s-]?ui[^0-9v]{0,40}v?(\d{1,3}\.\d{1,3}\.\d{1,3})/i,
+    // a dedicated panel-version element or JSON field
+    /(?:panelVersion|panel_version|currentVersion|current_version)["'\s:=]{1,12}v?(\d{1,3}\.\d{1,3}\.\d{1,3})/i,
+    // <meta name="version" content="3.8.5"> / data-version="3.8.5"
+    // The version must be the value of the attribute, not merely nearby.
+    /(?:name|id|data-[\w-]*version)\s*=\s*["']?[^"'>]{0,24}?version["']?[^>]{0,80}?\b(?:content|value)\s*=\s*["']v?(\d{1,3}\.\d{1,3}\.\d{1,3})["']/i,
+    /(?:name|id|data-[\w-]*version)\s*=\s*["']v?(\d{1,3}\.\d{1,3}\.\d{1,3})["']/i,
+  ];
+
+  const head = scrub(text.slice(0, 200000));
+  for (const pattern of patterns) {
+    const match = head.match(pattern);
+    if (match) {
+      const version = normalizePanelVersion(match[1]);
+      if (version) return version;
+    }
+  }
+  return null;
+}
+
 function capabilityError(kind, path, detail) {
   const err = new Error(`3x-ui capability probe for ${path} failed: ${detail}`);
   err.capability = kind;
@@ -254,6 +298,67 @@ class XuiClient {
   deleteHost(groupId) {
     if (!groupId) return Promise.resolve();
     return this.request(`/panel/api/hosts/del/${encodeURIComponent(groupId)}`, { method: 'POST' });
+  }
+
+  // ---------------------------------------------------------------------
+  // Panel version — DIAGNOSTIC ONLY.
+  //
+  // The capability axes above stay API-driven and never consult a version
+  // number. This method exists purely so the UI can show "3x-ui v3.8.5"
+  // next to a panel and so a support report can quote it.
+  //
+  // Order: /panel/api/server/getPanelUpdateInfo (3.0+) then, for older
+  // panels, a conservative scan of the authenticated index HTML.
+  // Anything ambiguous resolves to null rather than a wrong version.
+  // ---------------------------------------------------------------------
+
+  async detectPanelVersion() {
+    const viaApi = await this.panelVersionFromUpdateInfo();
+    if (viaApi && viaApi.version) return viaApi;
+    const viaHtml = await this.panelVersionFromHtml();
+    if (viaHtml && viaHtml.version) return viaHtml;
+    return { version: null, source: null, latestVersion: (viaApi && viaApi.latestVersion) || null };
+  }
+
+  async panelVersionFromUpdateInfo() {
+    let data;
+    try {
+      data = await this.request('/panel/api/server/getPanelUpdateInfo', { allowFailure: true });
+    } catch {
+      // 2.x has no such route; 3.x older builds answer success:false.
+      return null;
+    }
+    if (!data || !data.ok) return null;
+    const body = data.data;
+    if (!body || body.success === false) return null;
+    const obj = unwrap(body);
+    if (!obj || typeof obj !== 'object') return null;
+    const current = normalizePanelVersion(obj.currentVersion);
+    const latest = normalizePanelVersion(obj.latestVersion);
+    if (!current) return { version: null, source: null, latestVersion: latest };
+    return { version: current, source: 'api', latestVersion: latest };
+  }
+
+  async panelVersionFromHtml() {
+    let res;
+    let text = '';
+    try {
+      await this.authenticate();
+      res = await this.raw('/', {
+        headers: {
+          accept: 'text/html',
+          ...(this.authType === 'token' ? { authorization: `Bearer ${this.token}` } : {}),
+          // Ask for the panel page, not an XHR JSON response.
+          'x-requested-with': '',
+        },
+      });
+      text = String(res.text || '');
+    } catch {
+      return null;
+    }
+    if (!res || !res.res || !res.res.ok || !text) return null;
+    const found = extractPanelVersionFromHtml(text);
+    return found ? { version: found, source: 'html', latestVersion: null } : null;
   }
 
   // ---------------------------------------------------------------------
@@ -500,6 +605,8 @@ module.exports = {
   buildShadowsocksLink,
   selectShadowsocksLink,
   isValidShadowsocksPassword,
+  normalizePanelVersion,
+  extractPanelVersionFromHtml,
   unwrap,
   CLIENT_MODELS,
   HOST_MODES,

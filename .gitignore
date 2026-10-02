@@ -1,3 +1,4 @@
 .tools/
 *.bak
 graphify-out/cost.json
+.v2-scratch/

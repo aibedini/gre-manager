@@ -12,9 +12,10 @@ const totp = require('./totp');
 const provision = require('./provision');
 const connectivity = require('./connectivity');
 const { encrypt, decrypt } = require('./crypto');
-const { audit } = require('./db');
+const { audit, schemaVersion } = require('./db');
 const { XuiClient, normalizeBaseUrl } = require('./xui');
 const { RouteOrchestrator } = require('./route-orchestrator');
+const versionInfo = require('./version');
 
 const SECURE = process.env.HUB_SECURE === '1';
 
@@ -176,6 +177,18 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     });
 
   // --- Auth (mounted without requireAuth) -------------------------------
+  // Build/runtime identity. Deliberately unauthenticated except for the
+  // database-backed schema number, because it is how an operator (and the
+  // browser) can tell whether the running server matches the release they
+  // think they deployed. No secrets, no host paths, no credentials.
+  router.get('/meta', (req, res) => {
+    res.json({
+      name: 'gre-hub',
+      ...versionInfo.resolveMeta({ schemaVersion: schemaVersion(db) }),
+      uptimeSeconds: Math.round(process.uptime()),
+    });
+  });
+
   router.get('/setup', (req, res) => {
     res.json({ needs_setup: !auth.hasPassword(db) });
   });
@@ -526,10 +539,101 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
   }));
 
   // --- Automatic GRE + 3x-ui routes --------------------------------------
-  authed.get('/xui-panels', (req, res) => {
-    const rows = db.prepare('SELECT id, name, base_url, username, auth_type, capability, created_at FROM xui_panels ORDER BY name').all();
-    res.json(rows);
+
+  // Panel metadata older than this is refreshed opportunistically on read.
+  const PANEL_PROBE_STALE_MS = 10 * 60 * 1000;
+
+  const panelPublic = (row) => ({
+    id: row.id,
+    name: row.name,
+    base_url: row.base_url,
+    username: row.username,
+    auth_type: row.auth_type,
+    // `capability` is the historical host-mode column; host_mode is the new
+    // explicit name. Both are reported so older clients keep working.
+    capability: row.host_mode || row.capability || null,
+    host_mode: row.host_mode || row.capability || null,
+    client_model: row.client_model || null,
+    panel_version: row.panel_version || null,
+    panel_version_source: row.panel_version_source || null,
+    last_probe_at: row.last_probe_at || null,
+    last_probe_error: row.last_probe_error || null,
+    created_at: row.created_at,
   });
+
+  /**
+   * Probe one panel: authenticate, detect the exact 3x-ui version and both
+   * capability axes, then persist the diagnostics. A failed probe records the
+   * error but deliberately leaves the last known-good metadata in place, so a
+   * temporarily unreachable panel does not erase what we already learned.
+   */
+  const probePanel = async (panel, { audit = false } = {}) => {
+    const client = routeOrchestrator.client(panel);
+    const result = {
+      id: panel.id,
+      panel_version: null,
+      panel_version_source: null,
+      client_model: null,
+      host_mode: null,
+      error: null,
+    };
+    try {
+      const capabilities = await client.resolveCapabilities();
+      result.client_model = capabilities.clientModel;
+      result.host_mode = capabilities.hostMode;
+      const version = await client.detectPanelVersion().catch(() => null);
+      if (version) {
+        result.panel_version = version.version;
+        result.panel_version_source = version.source;
+      }
+    } catch (err) {
+      result.error = err.message;
+    }
+    const now = Date.now();
+    if (result.error) {
+      db.prepare('UPDATE xui_panels SET last_probe_at = ?, last_probe_error = ? WHERE id = ?')
+        .run(now, String(result.error).slice(0, 500), panel.id);
+    } else {
+      db.prepare(`
+        UPDATE xui_panels
+           SET panel_version = ?, panel_version_source = ?, client_model = ?, host_mode = ?,
+               capability = ?, last_probe_at = ?, last_probe_error = NULL
+         WHERE id = ?
+      `).run(result.panel_version, result.panel_version_source, result.client_model, result.host_mode,
+        result.host_mode, now, panel.id);
+    }
+    if (audit) {
+      auditEvent(null, 'hub', 'xui_panel_probe', { panel: panel.name }, result.error ? 1 : 0,
+        result.error
+          ? `probe failed: ${result.error}`
+          : `version=${result.panel_version || '?'} client=${result.client_model} hosts=${result.host_mode}`);
+    }
+    return result;
+  };
+
+  authed.get('/xui-panels', wrap(async (req, res) => {
+    const rows = db.prepare('SELECT * FROM xui_panels ORDER BY name').all();
+    // Never block the list on a probe: refresh stale metadata in the
+    // background and let the next poll show it.
+    if (req.query.probe !== '0') {
+      const stale = rows.filter((row) => !row.last_probe_at || (Date.now() - row.last_probe_at) > PANEL_PROBE_STALE_MS);
+      if (stale.length) {
+        Promise.all(stale.map((panel) => probePanel(panel))).catch(() => { /* diagnostics only */ });
+      }
+    }
+    res.json(rows.map(panelPublic));
+  }));
+
+  authed.post('/xui-panels/:id/probe', wrap(async (req, res) => {
+    const panel = db.prepare('SELECT * FROM xui_panels WHERE id = ?').get(req.params.id);
+    if (!panel) return res.status(404).json({ error: 'not found' });
+    const result = await probePanel(panel, { audit: true });
+    const fresh = db.prepare('SELECT * FROM xui_panels WHERE id = ?').get(panel.id);
+    if (result.error) {
+      return res.status(502).json({ error: result.error, probe: { ...result, panel: panelPublic(fresh) } });
+    }
+    res.json({ ok: true, probe: { ...result, panel: panelPublic(fresh) } });
+  }));
 
   authed.post('/xui-panels', wrap(async (req, res) => {
     const { name, base_url: baseUrl } = req.body || {};
@@ -552,22 +656,36 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
       token: authType === 'token' ? credential : '',
     });
     let capabilities;
+    let version = null;
     try {
       await probe.authenticate();
-      [, capabilities] = await Promise.all([probe.listInbounds(), probe.detectCapabilities()]);
+      [, capabilities] = await Promise.all([probe.listInbounds(), probe.resolveCapabilities()]);
+      // Diagnostic only: a panel that cannot report its version is still saved.
+      version = await probe.detectPanelVersion().catch(() => null);
     } catch (err) {
       return res.status(400).json({ error: `panel connection failed: ${err.message}` });
     }
     try {
+      const now = Date.now();
       const result = db.prepare(`
-        INSERT INTO xui_panels (name, base_url, username, auth_type, capability, password_enc, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO xui_panels
+          (name, base_url, username, auth_type, capability, client_model, host_mode,
+           panel_version, panel_version_source, last_probe_at, last_probe_error, password_enc, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
       `).run(String(name).slice(0, 80), normalized, username.slice(0, 120), authType,
-        capabilities.mode, encrypt(cryptKey, credential), Date.now());
-      auditEvent(null, 'hub', 'xui_panel_add', { name, base_url: normalized, auth_type: authType }, 0, '3x-ui panel saved');
+        capabilities.hostMode, capabilities.clientModel, capabilities.hostMode,
+        version ? version.version : null, version ? version.source : null,
+        now, encrypt(cryptKey, credential), now);
+      auditEvent(null, 'hub', 'xui_panel_add', { name, base_url: normalized, auth_type: authType }, 0,
+        `3x-ui panel saved (version=${version && version.version ? version.version : '?'}, client=${capabilities.clientModel}, hosts=${capabilities.hostMode})`);
       res.status(201).json({
         id: Number(result.lastInsertRowid), name, base_url: normalized, username,
-        auth_type: authType, capability: capabilities.mode,
+        auth_type: authType, capability: capabilities.hostMode, host_mode: capabilities.hostMode,
+        client_model: capabilities.clientModel,
+        panel_version: version ? version.version : null,
+        panel_version_source: version ? version.source : null,
+        last_probe_at: now,
+        last_probe_error: null,
       });
     } catch (err) {
       res.status(err.code === 'SQLITE_CONSTRAINT_UNIQUE' ? 409 : 400).json({ error: err.message });
@@ -714,8 +832,93 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
 
   authed.post('/gre-routes/:id/reconcile', wrap(async (req, res) => {
     const result = await routeOrchestrator.reconcile(Number(req.params.id));
-    auditEvent(null, 'hub', 'gre_route_reconcile', result, result.healthy ? 0 : 1, result.status);
+    const failed = result.components.filter((item) => item.status === 'FAIL').map((item) => item.name);
+    auditEvent(null, 'hub', 'gre_route_reconcile', { id: result.id, desired: result.desiredState, status: result.status },
+      result.healthy ? 0 : 1,
+      `${result.summary}${failed.length ? ` [${failed.join(', ')}]` : ''}`);
     res.json(result);
+  }));
+
+  // Change the desired specification of a route WITHOUT provisioning it.
+  // Infrastructure changes are refused while the route is ACTIVE: editing the
+  // stored intent of a live tunnel would make the database disagree with
+  // reality, and rolling it back later would delete objects the user forgot
+  // they had asked for.
+  authed.patch('/gre-routes/:id', wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const body = req.body || {};
+    try {
+      const result = await routeOrchestrator.editRoute(id, {
+        name: body.name,
+        iranServerId: body.iran_server_id,
+        foreignServerId: body.foreign_server_id,
+        panelId: body.panel_id,
+        port: body.port,
+        method: body.method,
+        client_mode: body.client_mode,
+        client_email: body.client_email,
+        client_name: body.client_name,
+      });
+      auditEvent(null, 'hub', 'gre_route_edit', { id, fields: result.changed }, 0,
+        `updated ${result.changed.join(', ') || 'nothing'}`);
+      res.json(result.route);
+    } catch (err) {
+      auditEvent(null, 'hub', 'gre_route_edit', { id }, 1, err.message);
+      res.status(err.status || 400).json({ error: err.message, locked: err.locked || null, fields: err.fields || null });
+    }
+  }));
+
+  // Re-run provisioning for a route that is not ACTIVE. Reconcile runs first so
+  // a retry never blindly collides with leftovers from the previous attempt.
+  authed.post('/gre-routes/:id/retry', wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const route = routeOrchestrator.route(id);
+    if (!route) return res.status(404).json({ error: 'not found' });
+    if (route.deleted_at) return res.status(409).json({ error: 'route is deleted' });
+    if (route.status === 'ACTIVE') {
+      return res.status(409).json({ error: 'route is already ACTIVE; use Reconcile instead of Retry' });
+    }
+    if (routeOrchestrator.running && routeOrchestrator.running.has(id)) {
+      return res.status(409).json({ error: 'route is already provisioning' });
+    }
+    try {
+      const prepared = await routeOrchestrator.prepareForRetry(id);
+      routeOrchestrator.startProvisioning(id, prepared);
+      auditEvent(null, 'hub', 'gre_route_retry', { id, attempt: prepared.attempt_no }, 0, `attempt #${prepared.attempt_no} started`);
+      return res.status(202).json({
+        route_id: id,
+        status: 'RESERVED',
+        attempt_no: prepared.attempt_no,
+        leftover: prepared.leftover || [],
+      });
+    } catch (err) {
+      auditEvent(null, 'hub', 'gre_route_retry', { id }, 1, err.message);
+      return res.status(err.status || 409).json({ error: err.message, leftover: err.leftover || [] });
+    }
+  }));
+
+  // Dry run for the delete confirmation dialog: exactly what would be removed
+  // and exactly what will be preserved.
+  authed.get('/gre-routes/:id/delete-preview', wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const route = routeOrchestrator.route(id);
+    if (!route) return res.status(404).json({ error: 'not found' });
+    if (route.deleted_at) return res.status(409).json({ error: 'route is already deleted' });
+    res.json(await routeOrchestrator.deletePreview(id));
+  }));
+
+  authed.delete('/gre-routes/:id', wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const route = routeOrchestrator.route(id);
+    if (!route) return res.status(404).json({ error: 'not found' });
+    if (route.deleted_at) return res.status(409).json({ error: 'route is already deleted' });
+    if (routeOrchestrator.running && routeOrchestrator.running.has(id)) {
+      return res.status(409).json({ error: 'route is provisioning right now; wait for it to finish before deleting' });
+    }
+    const result = await routeOrchestrator.deleteRoute(id);
+    auditEvent(null, 'hub', 'gre_route_delete', { id, removed: result.removed }, result.ok ? 0 : 1,
+      result.ok ? 'route removed and soft-deleted' : `cleanup incomplete: ${result.failures.map((f) => f.name).join(', ')}`);
+    res.status(result.ok ? 200 : 409).json(result);
   }));
 
   // --- Terminal ticket -----------------------------------------------------

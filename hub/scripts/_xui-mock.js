@@ -156,6 +156,11 @@ function makeMockPanel(options = {}) {
   const clientModel = options.clientModel === FIRST_CLASS ? FIRST_CLASS : EMBEDDED;
   const hostname = options.host || '37.202.247.77';
   let hostsApi = !!options.hostsApi;
+  // Panel version reporting: the API route exists from 3.0 on; older panels
+  // only expose the version in their authenticated HTML.
+  const panelVersion = options.panelVersion || '3.8.0';
+  const reportVersionViaApi = options.reportVersionViaApi !== false;
+  const htmlVersion = options.htmlVersion || null;
   const linkDelayMs = Number(options.linkDelayMs ?? 0);
   const linksPaused = { value: linkDelayMs > 0 };
 
@@ -246,6 +251,18 @@ function makeMockPanel(options = {}) {
     // --- auth ---------------------------------------------------------
     if (lower === '/csrf-token') return json({ success: false }, 404);
     if (lower === '/login') return json({ success: true }, 200, { 'set-cookie': '3x-ui=session; Path=/' });
+
+    // --- panel version diagnostics ------------------------------------
+    if (lower === '/panel/api/server/getPanelUpdateInfo') {
+      if (!reportVersionViaApi) return fail('update check unavailable');
+      return ok({ currentVersion: panelVersion, latestVersion: panelVersion, updateAvailable: false });
+    }
+    // The authenticated index page, used only by the HTML version fallback.
+    if (lower === '/' || lower === '/index.html' || lower === '/panel' || lower === '/panel/') {
+      const title = htmlVersion ? `<title>3x-ui v${htmlVersion}</title>` : '<title>3x-ui</title>';
+      return new Response(`<!doctype html><html><head>${title}</head><body>Xray 25.9.11<div id="app"></div></body></html>`,
+        { status: 200, headers: { 'content-type': 'text/html' } });
+    }
 
     // --- capability probes -------------------------------------------
     if (lower === '/panel/api/hosts/list') {

@@ -212,9 +212,21 @@ async function main() {
         'managed_host_add', 'link_validate', 'runtime_validation', 'active']) {
         if (!stages.includes(required)) throw new Error(`missing stage ${required} (got ${stages.join(', ')})`);
       }
-      const attach = all.find((e) => e.stage === 'client_attach');
-      if (attach.status !== 'PASS') throw new Error('client_attach did not pass');
+      const attach = all.find((e) => e.stage === 'client_attach' && e.status === 'PASS');
+      if (!attach) {
+        const seen = all.filter((e) => e.stage === 'client_attach').map((e) => `${e.status}: ${e.detail}`);
+        throw new Error(`client_attach never reported PASS (${seen.join(' | ') || 'no client_attach event at all'})`);
+      }
       if (!/Attached existing client navid/.test(attach.detail)) throw new Error(`unexpected detail: ${attach.detail}`);
+    });
+    check('every mutable stage announced RUNNING before its verdict', () => {
+      for (const stageName of ['public_ip', 'connectivity', 'gre_pairing', 'foreign_node_add', 'iran_peer_add',
+        'inbound_add', 'client_attach', 'managed_host_add', 'link_fetch', 'runtime_validation']) {
+        const forStage = all.filter((e) => e.stage === stageName);
+        if (!forStage.length) throw new Error(`missing stage ${stageName}`);
+        if (!forStage.some((e) => e.status === 'RUNNING')) throw new Error(`${stageName} never announced RUNNING`);
+        if (!forStage.some((e) => e.status === 'PASS')) throw new Error(`${stageName} never reached PASS`);
+      }
     });
     check('no event exposes a password or a share link', () => {
       const dump = JSON.stringify(all);

@@ -20,6 +20,7 @@ const state = {
   csrf: '',
   totpEnabled: false,
   logKind: '',
+  meta: null,         // GET /api/meta (running build identity)
   autoRefreshTimer: null,
   autoRefreshRunning: false,
   lastRefreshAt: null,
@@ -216,6 +217,38 @@ $$('.nav button[data-page]').forEach((btn) => {
   });
 });
 
+// ---------- build identity -------------------------------------------------
+
+// The running build is shown permanently in the top bar so a stale deployment
+// is visible at a glance instead of being inferred from odd behaviour.
+function renderBuildStamp() {
+  const el = $('#brand-version');
+  if (!el) return;
+  const meta = state.meta;
+  if (!meta || !meta.version) { el.textContent = ''; return; }
+  const short = meta.shortCommit || meta.commit || null;
+  el.textContent = `v${meta.version}${short ? ` · ${short}` : ''}`;
+  const details = [
+    `version: ${meta.version} (${meta.versionSource})`,
+    short ? `commit: ${short}` : 'commit: unknown',
+    meta.builtAt ? `built: ${meta.builtAt}` : 'built: unknown',
+    `node: ${meta.node}`,
+    meta.schemaVersion !== null && meta.schemaVersion !== undefined ? `db schema: ${meta.schemaVersion}` : null,
+    meta.mixed ? 'WARNING: version sources disagree (mixed deployment)' : null,
+  ].filter(Boolean).join('\n');
+  el.title = details;
+  el.classList.toggle('stale', !!meta.mixed || !short);
+}
+
+async function loadMeta() {
+  try {
+    state.meta = await api('/api/meta');
+  } catch {
+    state.meta = null;
+  }
+  renderBuildStamp();
+}
+
 async function enterMain() {
   $('#view-auth').classList.add('hidden');
   $('#view-main').classList.remove('hidden');
@@ -224,6 +257,7 @@ async function enterMain() {
     state.csrf = me.csrf;
     state.totpEnabled = me.totp_enabled;
   } catch { /* csrf already set from login */ }
+  await loadMeta();
   await loadServers();
   startAutoRefresh();
 }
@@ -1232,14 +1266,19 @@ function panelsHtml() {
       <h3>Saved 3x-ui panels</h3>
       ${state.panels.length ? `
         <table class="data">
-          <thead><tr><th>Name</th><th>URL</th><th>Authentication</th><th>Capability</th><th></th></tr></thead>
+          <thead><tr><th>Name</th><th>URL</th><th>3x-ui</th><th>Client model</th><th>Host model</th><th>Checked</th><th></th></tr></thead>
           <tbody>${state.panels.map((panel) => `
             <tr>
-              <td><strong>${esc(panel.name)}</strong></td>
+              <td><strong>${esc(panel.name)}</strong><div class="muted">${esc(panel.auth_type === 'token' ? 'API token' : 'Username + password')}</div></td>
               <td>${esc(panel.base_url)}</td>
-              <td><span class="badge blue">${panel.auth_type === 'token' ? 'API token' : 'Username + password'}</span></td>
-              <td>${esc(panel.capability || 'detected on next save')}</td>
-              <td><button class="btn btn-danger btn-sm btn-delete-panel" data-id="${panel.id}">Delete</button></td>
+              <td>${panel.panel_version ? `<span class="badge blue">v${esc(panel.panel_version)}</span>` : '<span class="badge gray">unknown</span>'}
+                  ${panel.last_probe_error ? `<div class="muted" title="${esc(panel.last_probe_error)}">probe failed</div>` : ''}</td>
+              <td>${esc(clientModelLabel(panel.client_model))}</td>              <td>${esc(hostModelLabel(panel.host_mode))}</td>
+              <td class="muted">${panel.last_probe_at ? timeAgo(panel.last_probe_at) : 'never'}</td>
+              <td class="row-actions">
+                <button class="btn btn-ghost btn-sm btn-probe-panel" data-id="${panel.id}">Probe</button>
+                <button class="btn btn-danger btn-sm btn-delete-panel" data-id="${panel.id}">Delete</button>
+              </td>
             </tr>`).join('')}</tbody>
         </table>` : '<div class="empty">No 3x-ui panel saved yet.</div>'}
     </div>`;
@@ -1254,6 +1293,15 @@ function bindPanelActions(wrap) {
       toast('Panel deleted');
       await loadRoutes();
     } catch (err) { toast(err.message, true); btn.disabled = false; }
+  }));
+  $$('.btn-probe-panel', wrap).forEach((btn) => btn.addEventListener('click', async () => {
+    btn.disabled = true; btn.textContent = 'Probing…';
+    try {
+      const result = await api(`/api/xui-panels/${btn.dataset.id}/probe`, { method: 'POST' });
+      const panel = result.probe && result.probe.panel;
+      toast(panel ? `Panel: ${panel.panel_version ? `v${panel.panel_version}` : 'version unknown'} · ${clientModelLabel(panel.client_model)}` : 'Panel probed');
+      await loadRoutes();
+    } catch (err) { toast(err.message, true); btn.disabled = false; btn.textContent = 'Probe'; }
   }));
 }
 
@@ -1271,32 +1319,66 @@ async function loadRoutes() {
         <thead><tr><th>Route</th><th>IRAN endpoint</th><th>FOREIGN</th><th>Panel</th><th>Mode</th><th>Status</th><th>Created</th><th></th></tr></thead>
         <tbody>${state.routes.map((r) => `
           <tr>
-            <td><strong>${esc(r.name)}</strong><div class="muted">${esc(r.method)}</div></td>
+            <td><strong>${esc(r.name)}</strong><div class="muted">${esc(r.method)}</div>${Number(r.attempt_no) > 1 ? `<div class="muted">attempt #${Number(r.attempt_no)}</div>` : ''}</td>
             <td>${esc(r.iran_host)}:${esc(r.port)}<div class="muted">TCP + UDP</div></td>
             <td>${esc(r.foreign_name)}</td>
-            <td>${esc(r.panel_name)}<div class="muted">${esc(clientModelLabel(r.client_model))}</div></td>
-            <td>${esc(r.capability || 'pending')}</td>
-            <td><span class="badge ${routeStatusClass(r.status)}">${esc(r.status)}</span>${r.last_error ? `<div class="muted">${esc(r.last_error)}</div>` : ''}</td>
+            <td>${esc(r.panel_name)}<div class="muted">${esc(r.panel_version ? `3x-ui v${r.panel_version}` : 'version unknown')}</div><div class="muted">${esc(clientModelLabel(r.client_model))}</div></td>
+            <td>${esc(hostModelLabel(r.host_mode || r.capability) || 'pending')}</td>
+            <td><span class="badge ${routeStatusClass(r.status)}">${esc(r.status)}</span>${r.current_stage ? `<div class="muted">at ${esc(r.current_stage)}</div>` : ''}${r.last_error ? `<div class="muted">${esc(routeErrorText(r.last_error))}</div>` : ''}</td>
             <td>${timeAgo(r.created_at)}</td>
             <td class="row-actions">
               <button class="btn btn-ghost btn-sm btn-timeline" data-id="${r.id}" data-name="${esc(r.name)}">Timeline</button>
               <button class="btn btn-ghost btn-sm btn-reconcile" data-id="${r.id}">Reconcile</button>
+              <button class="btn btn-ghost btn-sm btn-edit-route" data-id="${r.id}">Edit</button>
+              ${r.status === 'ACTIVE' ? '' : `<button class="btn btn-ghost btn-sm btn-retry-route" data-id="${r.id}">Retry</button>`}
+              <button class="btn btn-danger btn-sm btn-delete-route" data-id="${r.id}">Delete</button>
             </td>
           </tr>`).join('')}</tbody>
       </table>`;
     $$('.btn-timeline', wrap).forEach((btn) => btn.addEventListener('click', () => {
       openRouteTimeline({ id: Number(btn.dataset.id), name: btn.dataset.name });
     }));
-    $$('.btn-reconcile', wrap).forEach((btn) => btn.addEventListener('click', async () => {
-      btn.disabled = true; btn.textContent = 'Checking…';
+    $$('.btn-reconcile', wrap).forEach((btn) => btn.addEventListener('click', () => {
+      openReconcileModal(Number(btn.dataset.id), btn);
+    }));
+    $$('.btn-edit-route', wrap).forEach((btn) => btn.addEventListener('click', () => {
+      openEditRouteModal(Number(btn.dataset.id));
+    }));
+    $$('.btn-retry-route', wrap).forEach((btn) => btn.addEventListener('click', async () => {
+      const route = state.routes.find((r) => Number(r.id) === Number(btn.dataset.id));
+      if (!confirm(`Retry provisioning for ${route ? route.name : `route ${btn.dataset.id}`}?\n\nReconcile runs first; a retry is refused if the previous attempt left resources behind.`)) return;
+      btn.disabled = true; btn.textContent = 'Retrying…';
       try {
-        const result = await api(`/api/gre-routes/${btn.dataset.id}/reconcile`, { method: 'POST' });
-        toast(result.healthy ? 'Route is healthy' : 'Conflict found — route needs review', !result.healthy);
-        await loadRoutes();
-      } catch (err) { toast(err.message, true); btn.disabled = false; btn.textContent = 'Reconcile'; }
+        const result = await api(`/api/gre-routes/${btn.dataset.id}/retry`, { method: 'POST' });
+        toast(`Attempt #${result.attempt_no} started`);
+        startProvisioningTimeline({
+          route_id: Number(btn.dataset.id),
+          name: route ? route.name : '',
+          port: route ? route.port : null,
+          status: 'RESERVED',
+          client_email: route ? route.client_email : null,
+          client_mode: route ? route.client_mode : null,
+          client_model: route ? route.client_model : null,
+        });
+      } catch (err) { toast(err.message, true); btn.disabled = false; btn.textContent = 'Retry'; }
+    }));
+    $$('.btn-delete-route', wrap).forEach((btn) => btn.addEventListener('click', () => {
+      openDeleteRouteModal(Number(btn.dataset.id));
     }));
     bindPanelActions(wrap);
   } catch (err) { wrap.innerHTML = `<div class="empty">${esc(err.message)}</div>`; }
+}
+
+// last_error may be a JSON blob (reconcile detail) or a plain message.
+function routeErrorText(value) {
+  const text = String(value || '');
+  if (!text.startsWith('{')) return text;
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed.summary) return parsed.summary;
+    if (parsed.deleteFailures) return `delete incomplete: ${parsed.deleteFailures.map((f) => f.name).join(', ')}`;
+  } catch { /* fall through */ }
+  return text.slice(0, 200);
 }
 
 $('#btn-add-panel').addEventListener('click', () => {
@@ -1368,7 +1450,9 @@ $('#btn-add-route').addEventListener('click', async () => {
       <div class="field"><label>Route name</label><input name="name" required maxlength="40" placeholder="IR05-DE02" /></div>
       <div class="field"><label>IRAN server</label><select name="iran_server_id">${options(iranServers)}</select></div>
       <div class="field"><label>FOREIGN server</label><select name="foreign_server_id">${options(foreignServers)}</select></div>
-      <div class="field"><label>3x-ui panel</label><select name="panel_id">${state.panels.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></div>
+      <div class="field"><label>3x-ui panel</label><select name="panel_id">${state.panels.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select>
+        <div class="hint" id="panel-info"></div>
+      </div>
       <div class="field">
         <label>3x-ui client</label>
         <select name="client_choice"><option value="__new__">Add new client...</option></select>
@@ -1401,10 +1485,33 @@ $('#btn-add-route').addEventListener('click', async () => {
     // Helper copy for the currently selected intent, shown next to the select.
     const fieldHint = $('#client-choice-hint');
     if (fieldHint) fieldHint.textContent = isNew ? '' : clientHint();
+    renderPanelInfo();
+  };
+  // Everything we know about the selected panel, before anything is created.
+  const renderPanelInfo = () => {
+    const box = $('#panel-info');
+    if (!box) return;
+    const panel = state.panels.find((p) => String(p.id) === String(form.panel_id.value)) || {};
+    const isNew = form.client_choice.value === '__new__';
+    const rows = [
+      `Panel: ${panel.name || '—'}`,
+      `3x-ui: ${panel.panel_version ? `v${panel.panel_version}` : 'version unknown'}`,
+      `Client model: ${clientModelLabel(panel.client_model || clientModel)}`,
+      `Host model: ${hostModelLabel(panel.host_mode)}`,
+    ];
+    if (!isNew) {
+      rows.push(panel.client_model === 'embedded' || clientModel === 'embedded'
+        ? 'Legacy embedded client model: the selected client\'s real credential is reused from its inbound.'
+        : 'Existing client will be attached to the new inbound. It will not be recreated.');
+    }
+    box.innerHTML = rows.map((line) => esc(line)).join('<br>');
     const model = $('#client-model');
-    if (clientModel === 'first_class') model.textContent = '3x-ui client model: First-class / multi-inbound';
-    else if (clientModel === 'embedded') model.textContent = '3x-ui client model: Legacy embedded';
-    else model.textContent = 'Detecting 3x-ui client model…';
+    if (model) {
+      const resolved = panel.client_model || clientModel;
+      if (resolved === 'first_class') model.textContent = '3x-ui client model: First-class / multi-inbound';
+      else if (resolved === 'embedded') model.textContent = '3x-ui client model: Legacy embedded';
+      else model.textContent = 'Detecting 3x-ui client model…';
+    }
   };
   const loadClients = async () => {
     $('#client-load').textContent = 'Loading clients from 3x-ui...';
@@ -1471,6 +1578,157 @@ $('#btn-add-route').addEventListener('click', async () => {
   });
 });
 
+// ---------- reconcile modal ----------------------------------------------
+
+function componentRow(component) {
+  const cls = component.status === 'PASS' ? 'green' : 'red';
+  return `<tr>
+    <td><strong>${esc(component.name)}</strong></td>
+    <td class="mono">${esc(component.expected)}</td>
+    <td class="mono">${esc(component.actual)}</td>
+    <td><span class="badge ${cls}">${esc(component.status)}</span></td>
+    <td class="muted">${esc(component.detail || '')}</td>
+  </tr>`;
+}
+
+async function openReconcileModal(routeId, button = null) {
+  if (button) { button.disabled = true; button.textContent = 'Checking…'; }
+  let result;
+  try {
+    result = await api(`/api/gre-routes/${routeId}/reconcile`, { method: 'POST' });
+  } catch (err) {
+    toast(err.message, true);
+    if (button) { button.disabled = false; button.textContent = 'Reconcile'; }
+    return;
+  }
+  const summaryClass = result.healthy ? 'green' : 'red';
+  openModal(`
+    <h2>Reconcile ${esc(result.name || `route ${routeId}`)}</h2>
+    <p class="sub">Desired state: <strong>${esc(result.desiredState)}</strong> · current: <strong>${esc(result.status)}</strong>
+      ${Number(result.attemptNo) > 1 ? `· attempt #${Number(result.attemptNo)}` : ''}</p>
+    <div class="tl-summary ${result.healthy ? 'ok' : ''}" style="background:var(--${summaryClass}-bg); border-color:var(--${summaryClass}-fg); color:var(--${summaryClass}-fg)">
+      <span class="badge ${summaryClass}">${result.healthy ? 'HEALTHY' : 'ACTION NEEDED'}</span>
+      <span>${esc(result.summary || '')}</span>
+    </div>
+    ${result.failedStage ? `<div class="hint" style="margin-bottom:10px">Last provisioning stage reached: <strong>${esc(result.failedStage)}</strong></div>` : ''}
+    ${result.probeError ? `<div class="form-error">probe error: ${esc(result.probeError)}</div>` : ''}
+    ${(result.notes || []).length ? `<div class="hint">${result.notes.map((n) => esc(n)).join('<br>')}</div>` : ''}
+    <table class="data">
+      <thead><tr><th>Component</th><th>Expected</th><th>Actual</th><th>Result</th><th>Detail</th></tr></thead>
+      <tbody>${(result.components || []).map(componentRow).join('')}</tbody>
+    </table>
+    <div class="foot"><button class="btn modal-cancel">Close</button></div>`);
+  $('.modal-cancel').addEventListener('click', () => { closeModal(); loadRoutes(); });
+}
+
+// ---------- edit route modal ----------------------------------------------
+
+async function openEditRouteModal(routeId) {
+  const route = await api(`/api/gre-routes/${routeId}`).catch(() => null);
+  if (!route) { toast('Route not found', true); return; }
+  const isActive = route.status === 'ACTIVE';
+  const roleHas = (server, role) => ((server.snapshot && server.snapshot.roles) || []).map((x) => String(x).toUpperCase()).includes(role);
+  if (!state.servers.length) await loadServers();
+  const iranServers = state.servers.filter((s) => roleHas(s, 'IRAN'));
+  const foreignServers = state.servers.filter((s) => roleHas(s, 'FOREIGN'));
+  if (!state.panels.length) state.panels = await api('/api/xui-panels');
+  const options = (rows, selected) => rows.map((x) => `<option value="${x.id}"${Number(x.id) === Number(selected) ? ' selected' : ''}>${esc(x.name)} — ${esc(x.host)}</option>`).join('');
+  const disabled = isActive ? ' disabled' : '';
+
+  openModal(`
+    <h2>Edit ${esc(route.name)}</h2>
+    <p class="sub">Editing changes the route's intended specification only — it never provisions.
+      ${isActive ? '<strong>This route is ACTIVE, so infrastructure fields are locked.</strong>' : 'Retry afterwards to apply the new specification.'}</p>
+    <form id="edit-route-form">
+      <div class="field"><label>Route name</label><input name="name" required maxlength="40" value="${esc(route.name)}" /></div>
+      <div class="field"><label>IRAN server</label><select name="iran_server_id"${disabled}>${options(iranServers, route.iran_server_id)}</select></div>
+      <div class="field"><label>FOREIGN server</label><select name="foreign_server_id"${disabled}>${options(foreignServers, route.foreign_server_id)}</select></div>
+      <div class="field"><label>3x-ui panel</label><select name="panel_id"${disabled}>${state.panels.map((p) => `<option value="${p.id}"${Number(p.id) === Number(route.panel_id) ? ' selected' : ''}>${esc(p.name)}</option>`).join('')}</select></div>
+      <div class="field"><label>3x-ui client</label><select name="client_mode"${disabled}>
+        <option value="existing"${route.client_mode === 'existing' ? ' selected' : ''}>Existing client</option>
+        <option value="new"${route.client_mode === 'new' ? ' selected' : ''}>New client</option>
+      </select><div class="hint">Changing this re-runs the read-only client preflight when you save.</div></div>
+      <div class="field"><label>Client email</label><input name="client_email" maxlength="80" value="${esc(route.client_email || '')}"${disabled} /></div>
+      <div class="form-row">
+        <div class="field"><label>Preferred port</label><input name="port" type="number" min="1024" max="65535" value="${esc(route.port)}"${disabled} /></div>
+        <div class="field"><label>Method</label><select name="method"${disabled}>
+          ${['chacha20-ietf-poly1305', 'aes-256-gcm', 'aes-128-gcm'].map((m) => `<option value="${m}"${m === route.method ? ' selected' : ''}>${m}</option>`).join('')}
+        </select></div>
+      </div>
+      <div class="form-error" id="edit-route-error"></div>
+      <div class="foot"><button type="button" class="btn btn-ghost modal-cancel">Cancel</button><button class="btn">Save specification</button></div>
+    </form>`);
+  $('.modal-cancel').addEventListener('click', closeModal);
+  $('#edit-route-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    const body = { name: form.name.value.trim() };
+    if (!isActive) {
+      Object.assign(body, {
+        iran_server_id: Number(form.iran_server_id.value),
+        foreign_server_id: Number(form.foreign_server_id.value),
+        panel_id: Number(form.panel_id.value),
+        client_mode: form.client_mode.value,
+        client_email: form.client_email.value.trim(),
+        port: Number(form.port.value),
+        method: form.method.value,
+      });
+    }
+    try {
+      await api(`/api/gre-routes/${routeId}`, { method: 'PATCH', body });
+      closeModal();
+      await loadRoutes();
+      toast('Route specification updated (nothing was provisioned)');
+    } catch (err) {
+      const locked = err.data && err.data.fields ? ` (locked: ${err.data.fields.join(', ')})` : '';
+      $('#edit-route-error').textContent = err.message + locked;
+    }
+  });
+}
+
+// ---------- delete route modal --------------------------------------------
+
+async function openDeleteRouteModal(routeId) {
+  let preview;
+  try {
+    preview = await api(`/api/gre-routes/${routeId}/delete-preview`);
+  } catch (err) { toast(err.message, true); return; }
+
+  openModal(`
+    <h2>Delete ${esc(preview.name)}?</h2>
+    <p class="sub">${esc(preview.warning)}</p>
+    <div class="section" style="margin-bottom:18px">
+      <h3>Will remove</h3>
+      <ul class="plain-list">${preview.removes.map((item) => `<li>${esc(item)}</li>`).join('')}</ul>
+    </div>
+    <div class="section" style="margin-bottom:18px">
+      <h3>Will preserve</h3>
+      <ul class="plain-list">${preview.preserves.map((item) => `<li><strong>${esc(item)}</strong></li>`).join('')}</ul>
+    </div>
+    <div class="form-error" id="delete-route-error"></div>
+    <div class="foot">
+      <button type="button" class="btn btn-ghost modal-cancel">Cancel</button>
+      <button class="btn btn-danger" id="btn-confirm-delete-route">Delete route</button>
+    </div>`);
+  $('.modal-cancel').addEventListener('click', closeModal);
+  $('#btn-confirm-delete-route').addEventListener('click', async () => {
+    const btn = $('#btn-confirm-delete-route');
+    btn.disabled = true; btn.textContent = 'Deleting…';
+    try {
+      const result = await api(`/api/gre-routes/${routeId}`, { method: 'DELETE' });
+      closeModal();
+      await loadRoutes();
+      toast(`${result.name} deleted${result.removed.length ? ` — removed ${result.removed.join(', ')}` : ''}`);
+    } catch (err) {
+      const data = err.data || {};
+      const failures = (data.failures || []).map((f) => `${f.name}: ${f.error}`).join('; ');
+      $('#delete-route-error').textContent = `${err.message}${failures ? ` — ${failures}` : ''}`;
+      btn.disabled = false; btn.textContent = 'Delete route';
+      loadRoutes();
+    }
+  });
+}
+
 // ---------- live provisioning timeline ------------------------------------
 
 const TERMINAL_STATUSES = ['ACTIVE', 'FAILED', 'STALE', 'NEEDS_REVIEW'];
@@ -1485,14 +1743,21 @@ function routeStatusClass(status) {
 }
 
 function clientModelLabel(model) {
-  if (model === 'first_class') return 'client model: first-class';
-  if (model === 'embedded') return 'client model: legacy embedded';
-  return 'client model: unknown';
+  if (model === 'first_class') return 'First-class / multi-inbound';
+  if (model === 'embedded') return 'Legacy embedded';
+  return 'unknown';
+}
+
+function hostModelLabel(mode) {
+  if (mode === 'managed_hosts') return 'Managed hosts';
+  if (mode === 'external_proxy') return 'Legacy externalProxy';
+  return 'unknown';
 }
 
 function eventKind(event) {
   if (event.status === 'FAIL') return { cls: 'red', icon: '✗', color: 'var(--red-fg)' };
-  if (event.status === 'INFO' || event.status === 'RUNNING') return { cls: 'blue', icon: '›', color: 'var(--blue-fg)' };
+  if (event.status === 'RUNNING') return { cls: 'blue', icon: '●', color: 'var(--blue-fg)' };
+  if (event.status === 'INFO') return { cls: 'blue', icon: '›', color: 'var(--blue-fg)' };
   if (event.status === 'WARN') return { cls: 'yellow', icon: '!', color: 'var(--yellow-fg)' };
   if (/^rollback_/.test(String(event.stage || ''))) return { cls: 'yellow', icon: '↩', color: 'var(--yellow-fg)' };
   return { cls: 'green', icon: '✓', color: 'var(--green-fg)' };
@@ -1501,11 +1766,19 @@ function eventKind(event) {
 function eventRowHtml(event) {
   const kind = eventKind(event);
   const when = new Date(Number(event.created_at) || Date.now()).toLocaleTimeString();
-  return `<div class="tl-row ${kind.cls}" data-event-id="${Number(event.id)}">
+  return `<div class="tl-row ${kind.cls}" data-event-id="${Number(event.id)}" data-attempt="${Number(event.attempt_no) || 1}">
     <span class="tl-time">${esc(when)}</span>
     <span class="tl-icon" style="color:${kind.color}">${kind.icon}</span>
     <span class="tl-stage"><strong>${esc(event.stage)}</strong><span class="tl-detail">${esc(event.detail || '')}</span></span>
   </div>`;
+}
+
+// A retried route accumulates several attempts in one log. Mark the boundaries
+// so "which run failed" is never ambiguous.
+let timelineAttemptSeen = 1;
+
+function attemptSeparatorHtml(attempt) {
+  return `<div class="tl-attempt" data-attempt-sep="${attempt}">Attempt #${attempt}</div>`;
 }
 
 function timelineShellHtml(header) {
@@ -1526,6 +1799,7 @@ function headerFor(route) {
     <span class="tl-chip">port ${esc(route.port ?? '—')}</span>
     <span class="tl-chip">${esc(route.client_mode === 'existing' ? `existing client ${route.client_email || ''}` : `new client ${route.client_email || ''}`)}</span>
     <span class="tl-chip">${esc(clientModelLabel(route.client_model))}</span>
+    ${Number(route.attempt_no) > 1 ? `<span class="tl-chip">attempt #${Number(route.attempt_no)}</span>` : ''}
     <span class="badge gray" id="tl-status">${esc(route.status || 'RESERVED')}</span>`;
 }
 
@@ -1538,6 +1812,11 @@ function renderTimelineEvents(routeId, events) {
   for (const event of events) {
     const id = Number(event.id) || 0;
     if (id && $(`.tl-row[data-event-id="${id}"]`, scroll)) { lastId = Math.max(lastId, id); continue; }
+    const attempt = Number(event.attempt_no) || 1;
+    if (attempt !== timelineAttemptSeen) {
+      scroll.insertAdjacentHTML('beforeend', attemptSeparatorHtml(attempt));
+      timelineAttemptSeen = attempt;
+    }
     scroll.insertAdjacentHTML('beforeend', eventRowHtml(event));
     lastId = Math.max(lastId, id);
   }
@@ -1563,9 +1842,26 @@ function stopProvisioningTimeline() {
 function renderFailureSummary(route) {
   const box = $('#tl-summary');
   if (!box) return;
-  const text = route.last_error || 'Provisioning failed. See the timeline below for the exact step.';
+  const raw = String(route.last_error || '');
+  // A reconcile run stores structured JSON in last_error; the live run stores a
+  // plain message. Show whichever we have without ever dumping raw JSON.
+  let reason = raw;
+  let stage = route.current_stage || null;
+  if (raw.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(raw);
+      reason = parsed.summary || reason;
+      stage = stage || parsed.failedStage || null;
+    } catch { /* keep the raw text */ }
+  }
+  const failedMatch = !stage && raw.match(/^Failed at ([a-z_]+):/i);
+  if (failedMatch) { stage = failedMatch[1]; reason = raw.slice(failedMatch[0].length).trim(); }
   box.className = 'tl-summary';
-  box.innerHTML = `<span class="badge red">FAILED</span> <span>${esc(text)}</span>`;
+  box.innerHTML = `<div class="tl-failure">
+    <div class="row"><span class="label">Failed at</span><span><strong>${esc(stage || 'unknown stage')}</strong></span></div>
+    <div class="row"><span class="label">Reason</span><span>${esc(reason)}</span></div>
+    ${Number(route.attempt_no) > 1 ? `<div class="row"><span class="label">Attempt</span><span>#${Number(route.attempt_no)}</span></div>` : ''}
+  </div>`;
 }
 
 async function openRouteTimeline(route) {
@@ -1742,7 +2038,25 @@ $('#btn-refresh-log').addEventListener('click', loadLog);
 
 function renderSettings() {
   const el = $('#settings-body');
+  const meta = state.meta || {};
+  const metaRow = (label, value) => `<dt>${esc(label)}</dt><dd>${esc(value === null || value === undefined || value === '' ? 'unknown' : value)}</dd>`;
   el.innerHTML = `
+    <div class="section">
+      <h3>Application</h3>
+      <p class="muted" style="font-size:13px; margin-bottom:14px">Exactly which gre-hub build this server is running. If the version here differs from the release you installed, the deployment is stale.</p>
+      <dl class="kv" style="margin-bottom:12px">
+        ${metaRow('Version', meta.version ? `v${meta.version}` : null)}
+        ${metaRow('Version source', meta.versionSource)}
+        ${metaRow('Build commit', meta.shortCommit || meta.commit)}
+        ${metaRow('Built at', meta.builtAt)}
+        ${metaRow('Release tag', meta.tag)}
+        ${metaRow('Node', meta.node)}
+        ${metaRow('DB schema', meta.schemaVersion)}
+        ${metaRow('Uptime', typeof meta.uptimeSeconds === 'number' ? `${Math.floor(meta.uptimeSeconds / 60)}m ${meta.uptimeSeconds % 60}s` : null)}
+      </dl>
+      ${meta.mixed ? '<p class="badge yellow" style="display:inline-block; margin-bottom:10px">version sources disagree — mixed deployment</p>' : ''}
+      <button class="btn btn-ghost btn-sm" id="btn-refresh-meta">Refresh</button>
+    </div>
     <div class="section">
       <h3>Change hub password</h3>
       <form id="pw-form">
@@ -1770,6 +2084,11 @@ function renderSettings() {
       <p class="muted" style="font-size:13px; margin-bottom:14px">Sessions expire after 1 hour idle and 12 hours maximum. Sign out everywhere except this browser:</p>
       <button class="btn btn-ghost btn-sm" id="btn-logout-all">Log out all other sessions</button>
     </div>`;
+
+  $('#btn-refresh-meta').addEventListener('click', async () => {
+    await loadMeta();
+    renderSettings();
+  });
 
   $('#pw-form').addEventListener('submit', async (e) => {
     e.preventDefault();

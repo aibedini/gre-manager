@@ -49,11 +49,16 @@ function makeHarness() {
 /**
  * Scripted SSH transport. `getState()` lets the script react to provisioning
  * progress (for example, listeners only exist once the inbound was created).
+ * `failCommandTest(command)` makes any matching remote command fail, which is
+ * how leftover-resource scenarios are modelled.
  */
-function makeSshMock({ getState = () => ({}), log = [] } = {}) {
+function makeSshMock({ getState = () => ({}), log = [], failCommandTest = null } = {}) {
   // The route picks an auto port; evidence must quote the port the peer was
   // actually created for, exactly like the remote gre/ss output would.
   let activePort = null;
+  // Track whether a GRE link exists, so reconcile sees a peer disappear after
+  // a successful rollback the same way the real system would.
+  let greExists = false;
   const sshExec = async (server, secret, command, opts = {}) => {
     const entry = { server: server.name, command, opts };
     log.push(entry);
@@ -62,6 +67,14 @@ function makeSshMock({ getState = () => ({}), log = [] } = {}) {
 
     const portMatch = command.match(/--tcp-ports\s+'(\d+)'/);
     if (portMatch) activePort = Number(portMatch[1]);
+
+    // Remote mutations change the modelled GRE state.
+    if (/^gre (foreign-setup|iran-setup)\b/.test(command) || /^gre node add\b/.test(command) || /^gre iran peer add\b/.test(command)) {
+      greExists = true;
+    }
+    if (/^gre node remove\b/.test(command) || /^gre iran peer remove\b/.test(command) || /^gre purge\b/.test(command)) {
+      greExists = false;
+    }
 
     if (command.includes('ss -H')) {
       if (!inboundCreated || !activePort) return { rc: 0, stdout: '' };
@@ -73,8 +86,15 @@ function makeSshMock({ getState = () => ({}), log = [] } = {}) {
       return { rc: 0, stdout: JSON.stringify({ name: 'ir01', subnet_base: '10.200', idx: 1, key: 1001 }) };
     }
     if (command.startsWith('ping ') || command.startsWith('gre ') || command.startsWith('ip link') || command.startsWith('timeout 8')) {
-      if (state.failCommandTest && state.failCommandTest(command)) {
+      const shouldFail = failCommandTest || state.failCommandTest;
+      if (shouldFail && shouldFail(command)) {
         return { rc: 1, stdout: '', stderr: 'simulated failure' };
+      }
+      // Reconcile asks whether the GRE link is up. `state.greUp === false`
+      // models a peer that exists but is not forwarding.
+      if (command.startsWith('ip link')) {
+        if (state.greUp === false) return { rc: 1, stdout: '', stderr: '' };
+        if (state.greEnabled === true && !greExists) return { rc: 1, stdout: '', stderr: '' };
       }
       return { rc: 0, stdout: 'UP' };
     }
@@ -83,7 +103,7 @@ function makeSshMock({ getState = () => ({}), log = [] } = {}) {
     }
     throw new Error(`unexpected SSH command on ${server.name}: ${command}`);
   };
-  return { sshExec, log };
+  return { sshExec, log, greExists: () => greExists };
 }
 
 function makeOrchestrator(harness, { fetchImpl, sshExec, runTimeoutMs } = {}) {

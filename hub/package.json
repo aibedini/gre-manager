@@ -1,16 +1,18 @@
 {
   "name": "gre-hub",
-  "version": "1.0.0",
+  "version": "2.12.0",
   "private": true,
   "description": "Central web dashboard and SSH hub for gre-manager servers",
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
-    "test": "node scripts/connectivity-test.js && node scripts/route-test.js && node scripts/compatibility-test.js && node scripts/migration-test.js && node scripts/routes-events-test.js && node scripts/smoke.js",
+    "test": "node scripts/connectivity-test.js && node scripts/route-test.js && node scripts/compatibility-test.js && node scripts/lifecycle-test.js && node scripts/migration-test.js && node scripts/version-test.js && node scripts/routes-events-test.js && node scripts/smoke.js",
     "smoke": "node scripts/connectivity-test.js && node scripts/route-test.js && node scripts/smoke.js",
     "test:routes": "node scripts/route-test.js",
     "test:compat": "node scripts/compatibility-test.js",
+    "test:lifecycle": "node scripts/lifecycle-test.js",
     "test:migration": "node scripts/migration-test.js",
+    "test:version": "node scripts/version-test.js",
     "test:events": "node scripts/routes-events-test.js",
     "test:connectivity": "node scripts/connectivity-test.js"
   },

@@ -46,3 +46,19 @@ jobs:
           V_SCRIPT="$(grep -m1 -E '^VERSION=' gre-manager.sh | cut -d'"' -f2)"
           [ "$V_FILE" = "$V_SCRIPT" ] || { echo "VERSION file ($V_FILE) != script ($V_SCRIPT)"; exit 1; }
           grep -q "^## \[$V_SCRIPT\]" CHANGELOG.md || { echo "CHANGELOG has no section for $V_SCRIPT"; exit 1; }
+
+      - name: Version consistency (all five sources must agree)
+        run: |
+          set -e
+          V_FILE="$(cat VERSION | tr -d '[:space:]')"
+          V_SCRIPT="$(grep -m1 -E '^VERSION=' gre-manager.sh | cut -d'"' -f2)"
+          V_PKG="$(node -p "require('./hub/package.json').version")"
+          V_LOCK="$(node -p "require('./hub/package-lock.json').version")"
+          V_LOCK_ROOT="$(node -p "require('./hub/package-lock.json').packages[''].version")"
+          V_HUB="$(tr -d '[:space:]' < hub/VERSION)"
+          echo "VERSION=$V_FILE script=$V_SCRIPT package.json=$V_PKG lock=$V_LOCK lockRoot=$V_LOCK_ROOT hub/VERSION=$V_HUB"
+          for pair in "gre-manager.sh:$V_SCRIPT" "hub/package.json:$V_PKG" "hub/package-lock.json:$V_LOCK" "hub/package-lock.json#packages[\"\"]:$V_LOCK_ROOT" "hub/VERSION:$V_HUB"; do
+            name="${pair%%:*}"; value="${pair#*:}"
+            [ "$V_FILE" = "$value" ] || { echo "::error::VERSION ($V_FILE) != $name ($value)"; exit 1; }
+          done
+          echo "all five version sources agree on $V_FILE"

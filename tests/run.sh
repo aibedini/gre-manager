@@ -632,10 +632,6 @@ NEWER_VERSION="$(awk -F. '{ printf "%d.%d.%d", $1, $2, $3 + 1 }' <<< "$CURRENT_V
 cat > "$R/update-fixtures/current" <<EOF
 #!/usr/bin/env bash
 VERSION="$CURRENT_VERSION"
-if [[ "\${1:-}" == "hub" && "\${2:-}" == "install" && "\${3:-}" == "--yes" ]]; then
-    touch "\$TEST_ROOT/state/hub-updated"
-    exit 0
-fi
 EOF
 cat > "$R/update-fixtures/older" <<'EOF'
 #!/usr/bin/env bash
@@ -644,14 +640,17 @@ EOF
 cat > "$R/update-fixtures/newer" <<EOF
 #!/usr/bin/env bash
 VERSION="$NEWER_VERSION"
-if [[ "\${1:-}" == "hub" && "\${2:-}" == "install" && "\${3:-}" == "--yes" ]]; then
-    touch "\$TEST_ROOT/state/hub-updated"
-    exit 0
-fi
 EOF
 cat > "$R/update-fixtures/failure" <<'EOF'
 #!/usr/bin/env bash
 VERSION="2.8.0"
+EOF
+# A NEWER release whose assets are not actually downloadable. This is the only
+# way to reach the "assets unavailable" branch: an older tag is refused earlier
+# as a downgrade.
+cat > "$R/update-fixtures/newer-missing" <<EOF
+#!/usr/bin/env bash
+VERSION="$NEWER_VERSION"
 EOF
 cat > "$UPDATE_STUBS/curl" <<'EOF'
 #!/usr/bin/env bash
@@ -667,30 +666,34 @@ printf '%s\n' "$url" >> "$TEST_ROOT/state/update-urls"
 mode="$(cat "$TEST_ROOT/state/update-mode")"
 if [[ "$url" == */releases/latest ]]; then
   printf '{"tag_name":"v%s"}\n' "$(grep -m1 '^VERSION=' "$TEST_ROOT/update-fixtures/${mode}" | cut -d'"' -f2)"
-elif [[ "$mode" == "failure" ]]; then
-  exit 22
+elif [[ "$url" == */api/meta ]]; then
+  # The running-hub version reported by the service.
+  cat "$TEST_ROOT/state/hub-running" 2>/dev/null | sed 's/.*/{"version":"&"}/'
 elif [[ "$url" == */gre.sha256 ]]; then
   printf 'test-checksum  gre\n' > "$out"
 elif [[ "$url" == */gre ]]; then
+  if [[ "$mode" == "newer-missing" ]]; then exit 22; fi
   cp "$TEST_ROOT/update-fixtures/${mode}" "$out"
 else
+  # Hub assets are not served in this section: it covers the CLI contract.
   exit 22
 fi
 EOF
 cat > "$UPDATE_STUBS/sha256sum" <<'EOF'
 #!/usr/bin/env bash
+# Real verification against the fixture's own checksum file.
 [[ "${1:-}" == "-c" ]]
 EOF
 chmod +x "$UPDATE_STUBS/curl" "$UPDATE_STUBS/sha256sum"
 
+# No hub installed in this section: the CLI behaviour stands alone.
 cp "$R/update-fixtures/current" "$R/usr/local/sbin/gre"
 chmod +x "$R/usr/local/sbin/gre"
-mkdir -p "$R/opt/gre-hub"
 printf 'current\n' > "$R/state/update-mode"
 PATH="$UPDATE_STUBS:$PATH" gre update --yes
-assert "same-version update still syncs installed hub" test "$GRE_RC" -eq 0
-assert "same-version hub sync invoked" test -f "$R/state/hub-updated"
-rm -f "$R/state/hub-updated"
+assert "same-version update succeeds with no hub installed" test "$GRE_RC" -eq 0
+assert "same-version update reports the release summary" grep -q 'release:' <<< "$GRE_OUT"
+assert "same-version update names the gre-manager version" grep -q 'gre-manager:' <<< "$GRE_OUT"
 
 printf 'sentinel\n' > "$R/usr/local/sbin/gre"
 printf 'older\n' > "$R/state/update-mode"
@@ -699,18 +702,379 @@ assert "update refuses a downgrade" grep -q "refusing to downgrade" <<< "$GRE_OU
 assert "downgrade leaves installed file unchanged" grep -qx "sentinel" "$R/usr/local/sbin/gre"
 
 : > "$R/state/update-urls"
-printf 'failure\n' > "$R/state/update-mode"
+printf 'newer-missing\n' > "$R/state/update-mode"
 PATH="$UPDATE_STUBS:$PATH" gre update --yes
 assert_not "missing release assets fail the update" test "$GRE_RC" -eq 0
 assert "asset failure leaves installed file unchanged" grep -qx "sentinel" "$R/usr/local/sbin/gre"
+assert "asset failure is explained" grep -qi 'unavailable' <<< "$GRE_OUT"
 assert_not "updater never falls back to raw main" grep -q "raw.githubusercontent.com" "$R/state/update-urls"
 
 printf 'newer\n' > "$R/state/update-mode"
-mkdir -p "$R/opt/gre-hub"
 PATH="$UPDATE_STUBS:$PATH" gre update --yes
 assert "newer release update succeeds" test "$GRE_RC" -eq 0
 assert "newer release replaces installed file" grep -q "^VERSION=\"$NEWER_VERSION\"" "$R/usr/local/sbin/gre"
-assert "installed hub updates with matching release" test -f "$R/state/hub-updated"
+rm -rf "$R"
+
+# ======================================================================
+sect "17. gre hub update resolves the LATEST release and verifies the package"
+
+# Fixture releases: one directory per simulated GitHub release asset set.
+mk_hub_release() { # mk_hub_release DIR VERSION
+  local dir="$1" version="$2"
+  mkdir -p "$dir/hub/server" "$dir/hub/public" "$dir/hub/scripts"
+  printf '%s\n' "$version" > "$dir/hub/VERSION"
+  cat > "$dir/hub/build-info.json" <<JSON
+{"version":"$version","commit":"fixturecommit","shortCommit":"fixtur","builtAt":"2026-01-01T00:00:00Z","tag":"v$version"}
+JSON
+  printf '{"name":"gre-hub","version":"%s"}\n' "$version" > "$dir/hub/package.json"
+  printf '{}\n' > "$dir/hub/package-lock.json"
+  printf '// xui\n' > "$dir/hub/server/xui.js"
+  # server/index.js is the marker the CLI uses to decide a hub is installed,
+  # so every fixture release must carry it.
+  printf '// index\n' > "$dir/hub/server/index.js"
+  printf '// orchestrator\n' > "$dir/hub/server/route-orchestrator.js"
+  printf '// routes\n' > "$dir/hub/server/routes.js"
+  printf '// app\n' > "$dir/hub/public/app.js"
+}
+
+build_hub_fixtures() { # build_hub_fixtures RELEASES_DIR
+  local rel="$1"
+  mk_hub_release "$rel/2.12.0" "2.12.0"
+  mk_hub_release "$rel/2.13.0" "2.13.0"
+  ( cd "$rel/2.12.0" && tar czf "$rel/gre-hub-2.12.0.tar.gz" hub )
+  ( cd "$rel/2.13.0" && tar czf "$rel/gre-hub-2.13.0.tar.gz" hub )
+  ( cd "$rel" && sha256sum gre-hub-2.12.0.tar.gz | sed 's|gre-hub-2.12.0.tar.gz|gre-hub.tar.gz|' > gre-hub-2.12.0.sha256 )
+  ( cd "$rel" && sha256sum gre-hub-2.13.0.tar.gz | sed 's|gre-hub-2.13.0.tar.gz|gre-hub.tar.gz|' > gre-hub-2.13.0.sha256 )
+}
+
+# curl stub: /releases/latest + /api/meta are synthetic, every other URL comes
+# from the fixture directory for the currently selected mode.
+#
+# It must model BOTH calling conventions the script uses: the test hook pipes a
+# body to stdout (redirected by hub_curl_get), while the plain-curl path passes
+# `-o FILE`. Writing to whichever one the caller used is what makes the stub a
+# faithful stand-in rather than a stub that only satisfies one code path.
+mk_hub_curl_stub() { # mk_hub_curl_stub STUB_DIR FIXTURES_DIR
+  local dir="$1" fix="$2"
+  cat > "$dir/curl" <<EOF
+#!/usr/bin/env bash
+out="" url=""
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    -o|--output) out="\$2"; shift 2 ;;
+    http*) url="\$1"; shift ;;
+    *) shift ;;
+  esac
+done
+emit() { # emit FILE_OR_STDIN -> destination the caller asked for
+  if [[ -n "\$out" ]]; then cat > "\$out"; else cat; fi
+}
+printf '%s\n' "\$url" >> "\$TEST_ROOT/state/hub-urls"
+mode="\$(cat "\$TEST_ROOT/state/hub-mode" 2>/dev/null || echo valid)"
+if [[ "\$url" == */releases/latest ]]; then
+  if [[ "\$mode" == "norelease" ]]; then exit 22; fi
+  printf '{"tag_name":"v%s"}\n' "\$(cat "\$TEST_ROOT/state/hub-latest")" | emit
+  exit 0
+fi
+if [[ "\$url" == */api/meta ]]; then
+  printf '{"name":"gre-hub","version":"%s"}\n' "\$(cat "\$TEST_ROOT/state/hub-running" 2>/dev/null || cat "\$TEST_ROOT/state/hub-latest")" | emit
+  exit 0
+fi
+if [[ "\$url" == */gre-hub.tar.gz.sha256 ]]; then
+  if [[ "\$mode" == "badchecksum" ]]; then
+    printf '0000000000000000000000000000000000000000000000000000000000000000  gre-hub.tar.gz\n' | emit
+    exit 0
+  fi
+  if [[ "\$mode" == "badsumpath" ]]; then
+    printf 'abc123  something-else.tar.gz\n' | emit
+    exit 0
+  fi
+  cat "$fix/gre-hub-\$(cat "\$TEST_ROOT/state/hub-latest").sha256" 2>/dev/null | emit || exit 22
+  exit 0
+fi
+if [[ "\$url" == */gre-hub.tar.gz ]]; then
+  if [[ "\$mode" == "fetchfail" ]]; then exit 22; fi
+  cat "$fix/gre-hub-\$(cat "\$TEST_ROOT/state/hub-latest").tar.gz" 2>/dev/null | emit || exit 22
+  exit 0
+fi
+if [[ "\$url" == */gre.sha256 ]]; then
+  printf 'test-checksum  gre\n' | emit; exit 0
+fi
+if [[ "\$url" == */gre ]]; then
+  cat "\$TEST_ROOT/update-fixtures/\$(cat "\$TEST_ROOT/state/update-mode")" 2>/dev/null | emit || exit 22
+  exit 0
+fi
+exit 22
+EOF
+  chmod +x "$dir/curl"
+}
+
+mkroot
+HUB_REL="$R/hub-releases"
+mkdir -p "$HUB_REL"
+build_hub_fixtures "$HUB_REL"
+HUB_STUBS="$R/hub-stubs"
+mkdir -p "$HUB_STUBS"
+mk_hub_curl_stub "$HUB_STUBS" "$HUB_REL"
+
+# npm/systemctl stubs; the npm hook is the documented HUB_TEST_NPM_CMD escape.
+# NOTE: do NOT stub `node` here. hub_ensure_node runs `<node> -v` first, and a
+# silent stub makes it fall through to installing Node from the network, which
+# aborts the update before it ever reaches the download.
+cat > "$HUB_STUBS/npm-stub" <<'EOF'
+#!/usr/bin/env bash
+# Simulate a successful dependency install without touching the network.
+mkdir -p "$PWD/node_modules"
+touch "$PWD/node_modules/.installed"
+echo "stub npm: $*"
+EOF
+cat > "$HUB_STUBS/systemctl" <<'EOF'
+#!/usr/bin/env bash
+verb="${1:-}"
+case "$verb" in
+  daemon-reload) exit 0 ;;
+  enable) exit 0 ;;
+  is-active)
+      # The hub only counts as active when its health endpoint answers, which
+      # the curl stub decides via state/hub-running.
+      [[ -f "$TEST_ROOT/state/hub-running" ]] && exit 0
+      exit 3 ;;
+  restart|start)
+      if [[ -f "$TEST_ROOT/state/hub-restart-fails" ]]; then
+          printf 'Job for gre-hub.service failed\n' >&2
+          exit 1
+      fi
+      cat "$TEST_ROOT/opt/gre-hub/VERSION" > "$TEST_ROOT/state/hub-running"
+      touch "$TEST_ROOT/state/hub-restarted"
+      exit 0 ;;
+  stop|status) exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$HUB_STUBS"/*
+
+export HUB_TEST_NPM_CMD="$HUB_STUBS/npm-stub"
+# Without this the helper falls back to the real curl and reaches GitHub, which
+# would make the test depend on network state instead of the fixtures.
+export HUB_TEST_CURL_CMD="$HUB_STUBS/curl"
+export HUB_SKIP_HEALTHCHECK=0
+# An existing installation at the OLD version, with data that must survive.
+mkdir -p "$R/opt/gre-hub/data" "$R/opt/gre-hub/server"
+cp "$HUB_REL/2.12.0/hub/VERSION" "$R/opt/gre-hub/VERSION"
+cp "$HUB_REL/2.12.0/hub/build-info.json" "$R/opt/gre-hub/build-info.json"
+cp "$HUB_REL/2.12.0/hub/server/xui.js" "$R/opt/gre-hub/server/xui.js"
+printf '{"name":"gre-hub","version":"2.12.0"}\n' > "$R/opt/gre-hub/package.json"
+mkdir -p "$R/opt/gre-hub/node_modules"
+printf 'DBDATA' > "$R/opt/gre-hub/data/hub.db"
+printf 'MASTERKEY' > "$R/opt/gre-hub/data/master.key"
+printf '2.12.0' > "$R/state/hub-running"
+printf '2.13.0' > "$R/state/hub-latest"
+printf 'valid' > "$R/state/hub-mode"
+: > "$R/state/hub-urls"
+assert "the hub curl stub is present and executable" test -x "$HUB_TEST_CURL_CMD"
+# Prove the stub itself works and records what it served, in this environment.
+TEST_ROOT="$R" "$HUB_TEST_CURL_CMD" 'https://example.test/releases/latest' > "$R/stub-probe.json" 2>/dev/null
+assert "the hub curl stub answers a latest-release query" grep -q 'tag_name' "$R/stub-probe.json"
+assert "the hub curl stub records its calls" grep -q 'example.test' "$R/state/hub-urls"
+: > "$R/state/hub-urls"
+
+PATH="$HUB_STUBS:$STUBS:$PATH" TEST_ROOT="$R" HUB_TEST_CURL_CMD="$HUB_STUBS/curl" HUB_TEST_NPM_CMD="$HUB_STUBS/npm-stub" bash "$SUT" hub update > "$R/hub-update.out" 2>&1
+HUB_RC=$?
+assert "gre hub update succeeds against the latest release" test "$HUB_RC" -eq 0
+assert "the hub updater used the offline curl stub" grep -q 'releases/latest' "$R/state/hub-urls"
+assert "gre hub update installs the latest version" grep -q '^2.13.0' "$R/opt/gre-hub/VERSION"
+assert "gre hub update wrote build-info for the new version" grep -q '"version":"2.13.0"' "$R/opt/gre-hub/build-info.json"
+assert "gre hub update installed dependencies" test -f "$R/opt/gre-hub/node_modules/.installed"
+assert "gre hub update preserved hub.db" grep -qx 'DBDATA' "$R/opt/gre-hub/data/hub.db"
+assert "gre hub update preserved master.key" grep -qx 'MASTERKEY' "$R/opt/gre-hub/data/master.key"
+assert "gre hub update restarted the service" test -f "$R/state/hub-restarted"
+assert_not "gre hub update never falls back to the main tarball" grep -q 'archive/refs/heads/main' "$R/state/hub-urls"
+assert_not "gre hub update never falls back to raw.githubusercontent" grep -q 'raw.githubusercontent' "$R/state/hub-urls"
+assert "gre hub update asked for the latest release" grep -q 'releases/latest' "$R/state/hub-urls"
+
+# Drop the installed hub back to the older release so the remaining negative
+# cases are not short-circuited by the "already at the target version" guard.
+# The data directory must survive every one of these runs.
+reset_installed_hub() {
+    cp "$HUB_REL/2.12.0/hub/VERSION" "$R/opt/gre-hub/VERSION"
+    cp "$HUB_REL/2.12.0/hub/build-info.json" "$R/opt/gre-hub/build-info.json"
+    cp "$HUB_REL/2.12.0/hub/package.json" "$R/opt/gre-hub/package.json"
+    cp "$HUB_REL/2.12.0/hub/server/index.js" "$R/opt/gre-hub/server/index.js"
+    rm -rf "$R/opt/gre-hub/node_modules"
+    mkdir -p "$R/opt/gre-hub/node_modules"
+}
+reset_installed_hub
+
+# A checksum mismatch must refuse the install and leave everything alone.
+rm -f "$R/state/hub-restarted"
+printf 'badchecksum' > "$R/state/hub-mode"
+PATH="$HUB_STUBS:$STUBS:$PATH" TEST_ROOT="$R" HUB_TEST_CURL_CMD="$HUB_STUBS/curl" HUB_TEST_NPM_CMD="$HUB_STUBS/npm-stub" bash "$SUT" hub update > "$R/hub-badsum.out" 2>&1
+HUB_RC=$?
+assert_not "a checksum mismatch fails the update" test "$HUB_RC" -eq 0
+assert "a checksum mismatch leaves the installed version untouched" grep -q '^2.12.0' "$R/opt/gre-hub/VERSION"
+assert "a checksum mismatch still preserves hub.db" grep -qx 'DBDATA' "$R/opt/gre-hub/data/hub.db"
+assert "a checksum mismatch is explained" grep -qi 'checksum' "$R/hub-badsum.out"
+assert_not "a checksum mismatch did not install dependencies" test -f "$R/opt/gre-hub/node_modules/.installed"
+
+# A checksum file that names a different file is unusable, not a pass.
+printf 'badsumpath' > "$R/state/hub-mode"
+PATH="$HUB_STUBS:$STUBS:$PATH" TEST_ROOT="$R" HUB_TEST_CURL_CMD="$HUB_STUBS/curl" HUB_TEST_NPM_CMD="$HUB_STUBS/npm-stub" bash "$SUT" hub update > "$R/hub-badpath.out" 2>&1
+HUB_RC=$?
+assert_not "a checksum naming another file is refused" test "$HUB_RC" -eq 0
+assert "the unusable checksum is explained" grep -qi 'checksum' "$R/hub-badpath.out"
+assert "the unusable checksum left the installation alone" grep -q '^2.12.0' "$R/opt/gre-hub/VERSION"
+
+# A download failure must not disturb the working installation.
+printf 'fetchfail' > "$R/state/hub-mode"
+PATH="$HUB_STUBS:$STUBS:$PATH" TEST_ROOT="$R" HUB_TEST_CURL_CMD="$HUB_STUBS/curl" HUB_TEST_NPM_CMD="$HUB_STUBS/npm-stub" bash "$SUT" hub update > "$R/hub-fetch.out" 2>&1
+HUB_RC=$?
+assert_not "a failed hub download fails the command" test "$HUB_RC" -eq 0
+assert "a failed hub download preserves the installation" test -f "$R/opt/gre-hub/server/xui.js"
+assert "a failed hub download preserves hub.db" grep -qx 'DBDATA' "$R/opt/gre-hub/data/hub.db"
+assert "a failed hub download is explained" grep -qi 'could not download' "$R/hub-fetch.out"
+
+# A restart that never comes up must roll the deployment directory back. This
+# case needs a real target, so it uses the next release explicitly.
+printf 'valid' > "$R/state/hub-mode"
+printf '2.12.0' > "$R/state/hub-running"
+printf '2.14.0' > "$R/state/hub-latest"
+mk_hub_release "$HUB_REL/2.14.0" "2.14.0"
+( cd "$HUB_REL/2.14.0" && tar czf "$HUB_REL/gre-hub-2.14.0.tar.gz" hub )
+( cd "$HUB_REL" && sha256sum gre-hub-2.14.0.tar.gz | sed 's|gre-hub-2.14.0.tar.gz|gre-hub.tar.gz|' > gre-hub-2.14.0.sha256 )
+rm -f "$R/opt/gre-hub/node_modules/.installed"
+touch "$R/state/hub-restart-fails"
+PATH="$HUB_STUBS:$STUBS:$PATH" TEST_ROOT="$R" HUB_TEST_CURL_CMD="$HUB_STUBS/curl" HUB_TEST_NPM_CMD="$HUB_STUBS/npm-stub" bash "$SUT" hub update v2.14.0 > "$R/hub-restart.out" 2>&1
+HUB_RC=$?
+assert_not "a hub that cannot restart fails the update" test "$HUB_RC" -eq 0
+assert "a failed restart rolls the deployment back" grep -q '^2.12.0' "$R/opt/gre-hub/VERSION"
+assert "a failed restart preserves hub.db" grep -qx 'DBDATA' "$R/opt/gre-hub/data/hub.db"
+assert "a failed restart preserves master.key" grep -qx 'MASTERKEY' "$R/opt/gre-hub/data/master.key"
+assert "a failed restart is explained" grep -qi 'did not restart' "$R/hub-restart.out"
+rm -f "$R/state/hub-restart-fails"
+: > "$R/state/hub-urls"
+
+unset HUB_TEST_NPM_CMD
+rm -rf "$R"
+
+# ======================================================================
+sect "18. gre update moves the CLI and the hub to the SAME release"
+
+mkroot
+HUB_REL2="$R/hub-releases"
+mkdir -p "$HUB_REL2"
+build_hub_fixtures "$HUB_REL2"
+HUB_STUBS2="$R/hub-stubs"
+mkdir -p "$HUB_STUBS2"
+
+# The new CLI fixture is the real script with the bumped version, so the whole
+# upgrade path is exercised. Its true digest is what the stub publishes.
+NEW_CLI="$R/update-fixtures-new"
+sed "s|^VERSION=\"2.12.0\"|VERSION=\"2.13.0\"|" "$SUT" > "$NEW_CLI"
+chmod +x "$NEW_CLI"
+mkdir -p "$R/update-fixtures"
+cp "$NEW_CLI" "$R/update-fixtures/newer"
+NEW_CLI_SHA="$(/usr/bin/sha256sum "$NEW_CLI" | cut -d' ' -f1)"
+printf 'newer' > "$R/state/update-mode"
+
+# One stub serves BOTH the CLI assets and the hub assets, because `gre update`
+# downloads the CLI and then immediately syncs the hub to the same release.
+cat > "$HUB_STUBS2/curl" <<EOF
+#!/usr/bin/env bash
+out="" url=""
+while [[ \$# -gt 0 ]]; do
+  case "\$1" in
+    -o|--output) out="\$2"; shift 2 ;;
+    http*) url="\$1"; shift ;;
+    *) shift ;;
+  esac
+done
+emit() { if [[ -n "\$out" ]]; then cat > "\$out"; else cat; fi; }
+printf '%s\n' "\$url" >> "\$TEST_ROOT/state/hub-urls"
+case "\$url" in
+  */releases/latest) printf '{"tag_name":"v%s"}\n' "\$(cat "\$TEST_ROOT/state/hub-latest")" | emit ;;
+  */api/meta) printf '{"version":"%s"}\n' "\$(cat "\$TEST_ROOT/state/hub-running" 2>/dev/null || cat "\$TEST_ROOT/state/hub-latest")" | emit ;;
+  */gre-hub.tar.gz.sha256) cat "$HUB_REL2/gre-hub-\$(cat "\$TEST_ROOT/state/hub-latest").sha256" 2>/dev/null | emit ;;
+  */gre-hub.tar.gz) cat "$HUB_REL2/gre-hub-\$(cat "\$TEST_ROOT/state/hub-latest").tar.gz" 2>/dev/null | emit ;;
+  */gre.sha256) printf '%s  gre\n' "$NEW_CLI_SHA" | emit ;;
+  */gre) cat "\$TEST_ROOT/update-fixtures/\$(cat "\$TEST_ROOT/state/update-mode")" 2>/dev/null | emit ;;
+  *) exit 22 ;;
+esac
+EOF
+chmod +x "$HUB_STUBS2/curl"
+# The CLI is checksum-verified for real: the stub must publish the true digest
+# of the fixture it serves, and the checker must actually verify.
+cat > "$HUB_STUBS2/sha256sum" <<'EOF'
+#!/usr/bin/env bash
+# Delegate to the real tool so checksum verification is genuinely exercised.
+if [[ "${1:-}" == "-c" ]]; then
+    exec /usr/bin/sha256sum -c "$2"
+fi
+exec /usr/bin/sha256sum "$@"
+EOF
+chmod +x "$HUB_STUBS2/sha256sum"
+# The npm hook must exist: without it `npm ci` runs for real against a fixture
+# package with no lockfile, which correctly fails and aborts the deployment.
+cat > "$HUB_STUBS2/npm-stub" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p "$PWD/node_modules"
+touch "$PWD/node_modules/.installed"
+EOF
+cat > "$HUB_STUBS2/systemctl" <<'EOF'
+#!/usr/bin/env bash
+verb="${1:-}"
+case "$verb" in
+  daemon-reload|enable|stop|status) exit 0 ;;
+  is-active) [[ -f "$TEST_ROOT/state/hub-running" ]] && exit 0; exit 3 ;;
+  restart|start)
+      cat "$TEST_ROOT/opt/gre-hub/VERSION" > "$TEST_ROOT/state/hub-running"
+      touch "$TEST_ROOT/state/hub-restarted"
+      exit 0 ;;
+  *) exit 0 ;;
+esac
+EOF
+chmod +x "$HUB_STUBS2"/*
+
+# Old CLI (fixture) + old hub, both behind the latest release.
+cat > "$R/update-fixtures-old" <<EOF
+#!/usr/bin/env bash
+VERSION="2.12.0"
+EOF
+cp "$R/update-fixtures-old" "$R/usr/local/sbin/gre"
+chmod +x "$R/usr/local/sbin/gre"
+mkdir -p "$R/opt/gre-hub/data" "$R/opt/gre-hub/server" "$R/opt/gre-hub/node_modules"
+cp "$HUB_REL2/2.12.0/hub/VERSION" "$R/opt/gre-hub/VERSION"
+cp "$HUB_REL2/2.12.0/hub/build-info.json" "$R/opt/gre-hub/build-info.json"
+printf '{"name":"gre-hub","version":"2.12.0"}\n' > "$R/opt/gre-hub/package.json"
+printf '// old\n' > "$R/opt/gre-hub/server/xui.js"
+printf '// index\n' > "$R/opt/gre-hub/server/index.js"
+printf 'DBDATA' > "$R/opt/gre-hub/data/hub.db"
+printf '2.12.0' > "$R/state/hub-running"
+printf '2.13.0' > "$R/state/hub-latest"
+printf 'valid' > "$R/state/hub-mode"
+
+HUB_TEST_NPM_CMD="$HUB_STUBS2/npm-stub" HUB_TEST_CURL_CMD="$HUB_STUBS2/curl" PATH="$HUB_STUBS2:$STUBS:$PATH" TEST_ROOT="$R" \
+  bash "$SUT" update --yes > "$R/gre-update.out" 2>&1
+GRE_RC=$?
+assert "gre update succeeds" test "$GRE_RC" -eq 0
+assert "gre update installed the new CLI" grep -q '^VERSION="2.13.0"' "$R/usr/local/sbin/gre"
+assert "gre update moved the hub to the SAME release" grep -q '^2.13.0' "$R/opt/gre-hub/VERSION"
+assert "gre update preserved hub.db" grep -qx 'DBDATA' "$R/opt/gre-hub/data/hub.db"
+assert "gre update installed hub dependencies" test -f "$R/opt/gre-hub/node_modules/.installed"
+assert "the release summary is printed" grep -q 'gre-manager:' "$R/gre-update.out"
+assert "the release summary names the hub" grep -q 'gre-hub:' "$R/gre-update.out"
+assert "the release summary names the release" grep -q 'release:' "$R/gre-update.out"
+
+# The hub-only path must also work when the CLI is already current.
+mkdir -p "$R/opt/gre-hub/node_modules"
+printf '2.12.0' > "$R/opt/gre-hub/VERSION"
+printf '{"version":"2.12.0","commit":"c","shortCommit":"c","builtAt":"2026-01-01T00:00:00Z","tag":"v2.12.0"}' > "$R/opt/gre-hub/build-info.json"
+rm -f "$R/opt/gre-hub/node_modules/.installed"
+HUB_TEST_NPM_CMD="$HUB_STUBS2/npm-stub" HUB_TEST_CURL_CMD="$HUB_STUBS2/curl" PATH="$HUB_STUBS2:$STUBS:$PATH" TEST_ROOT="$R" \
+  bash "$SUT" hub update > "$R/hub-only.out" 2>&1
+HUB_RC=$?
+assert "gre hub update works without touching the CLI" test "$HUB_RC" -eq 0
+assert "gre hub update reached the latest hub" grep -q '^2.13.0' "$R/opt/gre-hub/VERSION"
+assert "the CLI was not modified by hub update" grep -q '^VERSION="2.13.0"' "$R/usr/local/sbin/gre"
 rm -rf "$R"
 
 # ======================================================================

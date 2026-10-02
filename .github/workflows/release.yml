@@ -12,17 +12,79 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Build release artifacts (pinned script + checksum)
+      - name: Verify version consistency (all five sources)
         run: |
           set -e
+          V_FILE="$(cat VERSION | tr -d '[:space:]')"
+          V_SCRIPT="$(grep -m1 -E '^VERSION=' gre-manager.sh | cut -d'"' -f2)"
+          V_PKG="$(node -p "require('./hub/package.json').version")"
+          V_LOCK="$(node -p "require('./hub/package-lock.json').version")"
+          V_HUB="$(cat hub/VERSION 2>/dev/null | tr -d '[:space:]' || echo '')"
+          TAG="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$V_FILE script=$V_SCRIPT package.json=$V_PKG package-lock=$V_LOCK hub/VERSION=$V_HUB tag=$TAG"
+          [ "$V_FILE" = "$V_SCRIPT" ] || { echo "::error::VERSION ($V_FILE) != gre-manager.sh ($V_SCRIPT)"; exit 1; }
+          [ "$V_FILE" = "$V_PKG" ] || { echo "::error::VERSION ($V_FILE) != hub/package.json ($V_PKG)"; exit 1; }
+          [ "$V_FILE" = "$V_LOCK" ] || { echo "::error::VERSION ($V_FILE) != hub/package-lock.json ($V_LOCK)"; exit 1; }
+          [ "$V_FILE" = "$V_HUB" ] || { echo "::error::VERSION ($V_FILE) != hub/VERSION ($V_HUB)"; exit 1; }
+          [ "$V_FILE" = "$TAG" ] || { echo "::error::VERSION ($V_FILE) != release tag ($TAG)"; exit 1; }
+          grep -q "^## \[$V_FILE\]" CHANGELOG.md || { echo "::error::CHANGELOG has no section for $V_FILE"; exit 1; }
+
+      - name: Build release artifacts (pinned script + checksum + hub build metadata)
+        run: |
+          set -e
+          VERSION="$(cat VERSION | tr -d '[:space:]')"
+          COMMIT="$(git rev-parse HEAD)"
+          SHORT="$(git rev-parse --short=7 HEAD)"
+          BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          TAG="${GITHUB_REF_NAME}"
+
+          # The hub must carry the canonical version so a deployed runtime can
+          # answer GET /api/meta without any git history being present.
+          cp VERSION hub/VERSION
+          cat > hub/build-info.json <<EOF
+          {
+            "version": "${VERSION}",
+            "commit": "${COMMIT}",
+            "shortCommit": "${SHORT}",
+            "builtAt": "${BUILT_AT}",
+            "tag": "${TAG}"
+          }
+          EOF
+
+          # Never ship test-only helpers or logs in the runtime package.
+          rm -rf hub/data hub/node_modules hub/scripts/.tmp
+          find hub -name '*.log' -delete 2>/dev/null || true
+
           cp gre-manager.sh gre
           chmod +x gre
           sha256sum gre > gre.sha256
           tar czf gre-hub.tar.gz hub/
           sha256sum gre-hub.tar.gz > gre-hub.tar.gz.sha256
+
           echo "--- artifacts ---"
           ls -la gre gre.sha256 gre-hub.tar.gz gre-hub.tar.gz.sha256
+
+      - name: Verify the hub tarball contents
+        run: |
+          set -e
+          VERSION="$(cat VERSION | tr -d '[:space:]')"
+          TMP="$(mktemp -d)"
+          tar xzf gre-hub.tar.gz -C "$TMP"
+          for f in hub/VERSION hub/build-info.json hub/server/xui.js hub/server/route-orchestrator.js hub/public/app.js hub/package.json hub/package-lock.json; do
+            [ -f "$TMP/$f" ] || { echo "::error::gre-hub.tar.gz is missing $f"; exit 1; }
+          done
+          [ "$(tr -d '[:space:]' < "$TMP/hub/VERSION")" = "$VERSION" ] || { echo "::error::tarball hub/VERSION mismatch"; exit 1; }
+          node -e '
+            const info = require(process.argv[1]);
+            const version = process.argv[2];
+            if (info.version !== version) { console.error("::error::build-info.json version mismatch"); process.exit(1); }
+            if (!info.commit || !info.builtAt) { console.error("::error::build-info.json incomplete"); process.exit(1); }
+            console.log("build-info.json ok:", JSON.stringify(info));
+          ' "$TMP/hub/build-info.json" "$VERSION"
+          rm -rf "$TMP"
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2

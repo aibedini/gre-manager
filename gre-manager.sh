@@ -62,7 +62,7 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are validated then sourced by design
 set -uo pipefail
 
-VERSION="2.11.0"
+VERSION="2.12.0"
 
 GITHUB_REPO="aibedini/gre-manager"
 
@@ -1671,16 +1671,30 @@ legacy_cleanup() {
     info "Verify with:  ip tunnel show   |   iptables -t nat -S   |   iptables -S INPUT"
 }
 
-sync_installed_hub() { # sync_installed_hub TARGET_VERSION
+sync_installed_hub() { # sync_installed_hub TARGET_VERSION — hub must match the CLI release
     local target_version="$1"
     [[ -d "$HUB_DIR" ]] || return 0
-    info "gre-hub is installed; syncing dashboard to v$target_version..."
-    if ! "$INSTALL_PATH" hub install --yes; then
+    [[ -f "$HUB_DIR/server/index.js" ]] || return 0
+    local installed=""
+    installed="$(hub_read_version "$HUB_DIR")"
+    if [[ "$installed" == "$target_version" ]]; then
+        # Same release: only re-sync when the tree looks incomplete (for example
+        # a previous npm ci failed), never a blind re-download.
+        if [[ -d "$HUB_DIR/node_modules" ]]; then
+            info "gre-hub is already at v$target_version."
+            return 0
+        fi
+        info "gre-hub v$target_version is incomplete; re-syncing..."
+    else
+        info "gre-hub is installed at ${installed:+v$installed }; syncing dashboard to v$target_version..."
+    fi
+    if ! HUB_FORCE_HUB_UPDATE=1 hub_update_to_release "v$target_version"; then
         err "gre-hub update failed."
-        info "Retry with: sudo gre hub install --yes"
+        info "Retry with: sudo gre hub update"
         return 1
     fi
-    ok "gre-hub updated and restarted."
+    ok "gre-hub updated to v$target_version."
+    return 0
 }
 
 self_update() {
@@ -1744,6 +1758,7 @@ self_update() {
         ok "Already up to date (v$VERSION)."
         rm -rf "$tmp"
         sync_installed_hub "$remote_ver" || return 1
+        print_release_summary "$remote_ver"
         return 0
     fi
     if ! version_is_newer "$remote_ver" "$VERSION"; then
@@ -1767,14 +1782,379 @@ self_update() {
         return 1
     }
 
+    print_release_summary "$remote_ver"
     info "Run 'gre' again to use the new version."
     exit 0
+}
+
+# One unambiguous block at the end of any update: what the CLI is, what the hub
+# is, and which release both came from. If these ever differ, one of the two
+# halves of the upgrade did not land.
+print_release_summary() { # print_release_summary TARGET_VERSION
+    local target="$1" hub_ver="" hub_state="not installed" running=""
+    if [[ -f "$HUB_DIR/server/index.js" ]]; then
+        hub_ver="$(hub_read_version "$HUB_DIR")"
+        hub_state="${hub_ver:+v$hub_ver}"
+        running="$(hub_meta_version 2>/dev/null || true)"
+        if [[ -n "$running" ]]; then
+            hub_state="${hub_state} (running v$running)"
+        fi
+    fi
+    echo
+    echo "  ${C_BOLD:-}gre-manager:${C_RESET:-} v$target"
+    echo "  ${C_BOLD:-}gre-hub:    ${C_RESET:-} ${hub_state}"
+    echo "  ${C_BOLD:-}release:    ${C_RESET:-} v$target"
+    echo
+    if [[ -n "$hub_ver" && "$hub_ver" != "$target" ]]; then
+        warn "gre-hub (v$hub_ver) does not match the CLI release (v$target); run 'gre hub update'."
+    fi
+    if [[ -n "$running" && -n "$hub_ver" && "$running" != "$hub_ver" ]]; then
+        warn "The running gre-hub process (v$running) does not match the installed files (v$hub_ver); restart it: sudo gre hub restart"
+    fi
+    return 0
 }
 
 # ------------------------------------------------------------- gre-hub (web dashboard)
 HUB_DIR="/opt/gre-hub"
 HUB_SERVICE_FILE="/etc/systemd/system/gre-hub.service"
 HUB_PORT_DEFAULT=3939
+
+hub_curl_get() { # hub_curl_get URL DEST — honors the test override, otherwise curl
+    local url="$1" dest="$2"
+    if [[ -n "${HUB_TEST_CURL_CMD:-}" ]]; then
+        # shellcheck disable=SC2086  # intentional word splitting for the override
+        $HUB_TEST_CURL_CMD "$url" > "$dest"
+        return $?
+    fi
+    curl -fsSL --max-time 90 "$url" -o "$dest" 2>/dev/null
+}
+
+hub_curl_text() { # hub_curl_text URL — prints the body, non-zero on failure
+    local url="$1"
+    if [[ -n "${HUB_TEST_CURL_CMD:-}" ]]; then
+        # shellcheck disable=SC2086
+        $HUB_TEST_CURL_CMD "$url"
+        return $?
+    fi
+    curl -fsSL --max-time 20 "$url" 2>/dev/null
+}
+
+# Resolve the GitHub release tag to install from.
+#   explicit tag  -> used as-is (used by `gre hub install <tag>`)
+#   latest|""     -> the newest stable release
+# A 404 of /releases/latest means the repo has no release: for `latest` we then
+# fall back to the tag matching this script's VERSION, never to main.
+resolve_release_tag() {
+    local want="${1:-latest}" tag=""
+    if [[ -n "$want" && "$want" != "latest" ]]; then
+        printf '%s\n' "$want"
+        return 0
+    fi
+    tag="$(hub_curl_text "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null \
+        | grep -m1 '"tag_name"' | cut -d'"' -f4)"
+    if [[ -n "$tag" ]]; then
+        printf '%s\n' "$tag"
+        return 0
+    fi
+    printf 'v%s\n' "$VERSION"
+}
+
+hub_read_version() { # hub_read_version DIR [COMMIT] — version of an installed/staged hub
+    local dir="$1" commit="${2:-}"
+    local v=""
+    if [[ -n "$commit" && -f "${dir}/build-info.json" ]]; then
+        v="$(grep -m1 '"version"' "${dir}/build-info.json" | cut -d'"' -f4)"
+    fi
+    if [[ -z "$v" && -f "${dir}/VERSION" ]]; then
+        v="$(tr -d '[:space:]' < "${dir}/VERSION")"
+    fi
+    if [[ -z "$v" && -f "${dir}/package.json" ]]; then
+        v="$(grep -m1 '"version"' "${dir}/package.json" | cut -d'"' -f4)"
+    fi
+    printf '%s\n' "$v"
+}
+
+hub_service_active() {
+    systemctl is-active gre-hub.service >/dev/null 2>&1
+}
+
+hub_service_restart() { # returns non-zero only when the unit refuses to start
+    systemctl daemon-reload 2>/dev/null || true
+    if [[ -f "$HUB_SERVICE_FILE" ]]; then
+        systemctl enable gre-hub.service >/dev/null 2>&1 || true
+    fi
+    if systemctl restart gre-hub.service 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# Make sure the unit exists. On a fresh install it is written; on an existing
+# install a missing/renamed unit file is restored, because losing the unit must
+# not silently break a hub that was already running.
+hub_ensure_service() {
+    if [[ -f "$HUB_SERVICE_FILE" ]]; then
+        return 0
+    fi
+    cat > "$HUB_SERVICE_FILE" <<EOF
+[Unit]
+Description=gre-hub web dashboard (gre-manager)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$HUB_DIR
+Environment=PORT=$HUB_PORT_DEFAULT HUB_HOST=127.0.0.1
+ExecStart=$(command -v node) server/index.js
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    mkdir -p "$(dirname "$HUB_SERVICE_FILE")"
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable gre-hub.service >/dev/null 2>&1 || true
+}
+
+hub_npm_ci() { # hub_npm_ci DIR
+    local dir="$1"
+    local -a cmd=(npm ci --omit=dev --no-audit --no-fund)
+    # Explicit opt-out for air-gapped hosts and for the test suite.
+    if [[ "${HUB_SKIP_NPM:-0}" == "1" ]]; then
+        info "HUB_SKIP_NPM=1: skipping dependency installation."
+        return 0
+    fi
+    if [[ -n "${HUB_TEST_NPM_CMD:-}" ]]; then
+        # shellcheck disable=SC2086
+        (cd "$dir" && $HUB_TEST_NPM_CMD)
+        return $?
+    fi
+    info "Installing dependencies (npm ci)..."
+    if (cd "$dir" && "${cmd[@]}"); then
+        return 0
+    fi
+    warn "npm ci failed; installing build tools and retrying (better-sqlite3 compiles natively)..."
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get install -y build-essential python3
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y gcc-c++ make python3
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y gcc-c++ make python3
+    fi
+    (cd "$dir" && "${cmd[@]}")
+}
+
+# Download a release tarball + its checksum and verify them. Prints nothing on
+# success; the verified archive is left at $2.
+hub_fetch_release() { # hub_fetch_release TAG DEST_TGZ
+    local tag="$1" dest="$2"
+    local base="https://github.com/${GITHUB_REPO}/releases/download/${tag}"
+    local attempt="" ok=0
+
+    command -v sha256sum >/dev/null 2>&1 || {
+        err "sha256sum is required so the hub package can be verified; refusing to install."
+        return 1
+    }
+
+    # Never reuse a stale archive from an earlier attempt.
+    rm -f "$dest" "${dest}.sha256"
+
+    for attempt in 1 2; do
+        if hub_curl_get "${base}/gre-hub.tar.gz" "$dest" \
+            && hub_curl_get "${base}/gre-hub.tar.gz.sha256" "${dest}.sha256" \
+            && [[ -s "$dest" && -s "${dest}.sha256" ]]; then
+            ok=1
+            break
+        fi
+        (( attempt == 1 )) && info "Hub package download failed for ${tag}; retrying..." && sleep 3
+    done
+    if (( ! ok )); then
+        err "Could not download the gre-hub package for release ${tag}."
+        rm -f "$dest" "${dest}.sha256"
+        return 1
+    fi
+
+    # A checksum that does not name the tarball is worse than no checksum: it
+    # would make `sha256sum -c` pass by verifying something else.
+    if ! grep -q 'gre-hub\.tar\.gz' "${dest}.sha256"; then
+        err "Release ${tag} has an unusable checksum file; refusing to install."
+        rm -f "$dest" "${dest}.sha256"
+        return 1
+    fi
+    if ! (cd "$(dirname "$dest")" && sha256sum -c "$(basename "${dest}").sha256" >/dev/null 2>&1); then
+        err "Checksum verification FAILED for release ${tag}; refusing to install."
+        rm -f "$dest" "${dest}.sha256"
+        return 1
+    fi
+    return 0
+}
+
+hub_extract() { # hub_extract TGZ DEST_DIR — validated extraction of the hub/ tree
+    local tgz="$1" dest="$2" listing=""
+    listing="$(tar tzf "$tgz" 2>/dev/null)" || { err "Could not read the hub archive."; return 1; }
+    # Path-traversal guard: a release archive must never contain absolute paths.
+    if grep -qE '(^|/)\.\.(/|$)|^/' <<< "$listing"; then
+        err "The hub archive contains an unsafe path; refusing to install."
+        return 1
+    fi
+    rm -rf "$dest"
+    mkdir -p "$dest"
+    if ! tar xzf "$tgz" -C "$dest" 2>/dev/null; then
+        err "Could not extract the hub archive."
+        return 1
+    fi
+    local src="$dest/hub"
+    if [[ ! -f "$src/package.json" ]]; then
+        src="$(dirname "$(find "$dest" -maxdepth 3 -path '*/hub/package.json' 2>/dev/null | head -1)")"
+    fi
+    if [[ -z "$src" || ! -f "$src/package.json" ]]; then
+        err "hub package not found in the archive."
+        return 1
+    fi
+    printf '%s\n' "$src"
+}
+
+# Stage -> install deps -> atomic swap -> restart -> verify -> roll back on
+# failure. $HUB_DIR/data is never touched by the swap.
+hub_deploy_tarball() { # hub_deploy_tarball TGZ TAG
+    local tgz="$1" tag="$2"
+    local tmp="" src="" stage="" backup="" newver="" running=""
+
+    tmp="$(mktemp -d)" || { err "mktemp failed"; return 1; }
+    # shellcheck disable=SC2064  # expand $tmp now, on purpose
+    trap "rm -rf '$tmp'" RETURN
+
+    src="$(hub_extract "$tgz" "$tmp/x")" || return 1
+    stage="$tmp/stage"
+    mkdir -p "$stage"
+    cp -a "$src/." "$stage/"
+    if [[ -f "$HUB_DIR/data" ]]; then
+        warn "Ignoring unexpected regular file at $HUB_DIR/data."
+    fi
+
+    newver="$(hub_read_version "$stage" yes)"
+    if [[ -z "$newver" ]]; then
+        warn "The hub package does not declare a version; continuing without a version check."
+    fi
+
+    hub_npm_ci "$stage" || { err "Dependency installation failed; $HUB_DIR was left untouched."; return 1; }
+
+    mkdir -p "$HUB_DIR"
+    backup="${HUB_DIR}.old.$$"
+    rm -rf "$backup"
+    mkdir -p "$backup"
+    if ! cp -a "$HUB_DIR/." "$backup/" 2>/dev/null; then
+        warn "Could not snapshot the current hub before upgrading."
+    fi
+    rm -rf "$backup/data"
+
+    # Swap only generated code: data/ (hub.db, master.key, ssh keys) stays put.
+    find "$HUB_DIR" -mindepth 1 -maxdepth 1 ! -name data -exec rm -rf {} + 2>/dev/null || true
+    cp -a "$stage/." "$HUB_DIR/"
+
+    hub_ensure_service || true
+    if ! hub_service_restart; then
+        err "gre-hub did not restart after the upgrade."
+        hub_restore_backup "$backup"
+        rm -rf "$backup"
+        return 1
+    fi
+
+    sleep 2
+    if [[ "${HUB_SKIP_HEALTHCHECK:-0}" != "1" ]]; then
+        running="$(hub_meta_version)"
+        if [[ -n "$newver" && -n "$running" && "$running" != "$newver" ]]; then
+            err "gre-hub restarted but reports v${running} while v${newver} was installed."
+            info "This usually means a stale process is still bound to the port."
+            hub_restore_backup "$backup"
+            rm -rf "$backup"
+            return 1
+        fi
+        if [[ -z "$running" ]] && ! hub_service_active; then
+            err "gre-hub is not running after the upgrade."
+            hub_restore_backup "$backup"
+            rm -rf "$backup"
+            return 1
+        fi
+    fi
+
+    rm -rf "$backup"
+    audit_log "hub-deploy tag=$tag version=${newver:-unknown}"
+    ok "gre-hub updated to ${newver:+v$newver }(${tag})."
+    return 0
+}
+
+# Restore a pre-upgrade snapshot. data/ is re-attached from the live directory
+# if the snapshot is missing it, so this can never lose hub.db/master.key.
+hub_restore_backup() { # hub_restore_backup BACKUP_DIR
+    local backup="$1"
+    [[ -d "$backup" ]] || return 0
+    local keep="$backup/data.keep.$$"
+    if [[ -d "$HUB_DIR/data" ]]; then
+        cp -a "$HUB_DIR/data" "$keep" 2>/dev/null || true
+    fi
+    find "$HUB_DIR" -mindepth 1 -maxdepth 1 ! -name data -exec rm -rf {} + 2>/dev/null || true
+    cp -a "$backup/." "$HUB_DIR/" 2>/dev/null || true
+    rm -rf "$HUB_DIR/data"
+    if [[ -d "$keep" ]]; then mv "$keep" "$HUB_DIR/data"; fi
+    warn "Restored the previous gre-hub build from $backup."
+    hub_service_restart >/dev/null 2>&1 || warn "The restored gre-hub did not restart."
+}
+
+hub_meta_version() { # hub_meta_version — version reported by the running hub, if any
+    local body="" port="${PORT:-$HUB_PORT_DEFAULT}"
+    body="$(hub_curl_text "http://127.0.0.1:${port}/api/meta" 2>/dev/null)" || return 1
+    [[ -n "$body" ]] || return 1
+    printf '%s' "$body" | tr ',' '\n' | grep -m1 '"version"' | cut -d'"' -f4
+}
+
+# The authoritative hub update path, shared by `gre update` and `gre hub update`.
+hub_update_to_release() { # hub_update_to_release [TAG|latest]
+    require_root
+    local want="${1:-latest}"
+    [[ -d "$HUB_DIR" ]] || { err "gre-hub is not installed at $HUB_DIR."; return 1; }
+    command -v curl >/dev/null 2>&1 || [[ -n "${HUB_TEST_CURL_CMD:-}" ]] || { err "curl is required."; return 1; }
+    command -v tar >/dev/null 2>&1 || { err "tar is required."; return 1; }
+    hub_ensure_node || return 1
+
+    local tag="" target="" installed="" tmp="" tgz=""
+    tag="$(resolve_release_tag "$want")"
+    if [[ -z "$tag" ]]; then
+        err "Could not determine which release to install."
+        return 1
+    fi
+    target="${tag#v}"
+    installed="$(hub_read_version "$HUB_DIR")"
+
+    if [[ -n "${HUB_FORCE_HUB_UPDATE:-}" || "$want" != "latest" ]]; then
+        info "Target release: ${tag}${installed:+ (installed: v$installed)}."
+    elif [[ "$installed" == "$target" ]]; then
+        # Same release: only re-sync when the on-disk tree looks incomplete.
+        if [[ -d "$HUB_DIR/node_modules" && -f "$HUB_DIR/server/index.js" ]]; then
+            ok "gre-hub is already at v${target}."
+            return 0
+        fi
+        info "gre-hub v${target} is installed but incomplete; re-syncing..."
+    else
+        info "Updating gre-hub ${installed:+from v$installed }to v${target}..."
+    fi
+
+    tmp="$(mktemp -d)" || { err "mktemp failed"; return 1; }
+    tgz="$tmp/gre-hub.tar.gz"
+    if ! hub_fetch_release "$tag" "$tgz"; then
+        rm -rf "$tmp"
+        err "gre-hub was not changed."
+        return 1
+    fi
+    if ! hub_deploy_tarball "$tgz" "$tag"; then
+        rm -rf "$tmp"
+        return 1
+    fi
+    rm -rf "$tmp"
+    return 0
+}
 
 hub_status_text() {
     if [[ ! -d "$HUB_DIR" ]]; then
@@ -1813,92 +2193,38 @@ hub_ensure_node() {
     ok "Node.js $(node -v) installed"
 }
 
-hub_download() { # hub_download DEST_TGZ — tag-pinned asset, then latest release, then main tarball
-    local dest="$1" t="" u="" attempt=""
-    local -a urls=("https://github.com/${GITHUB_REPO}/releases/download/v${VERSION}/gre-hub.tar.gz")
-    t="$(curl -fsSL --max-time 20 "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null \
-        | grep -m1 '"tag_name"' | cut -d'"' -f4)"
-    [[ -n "$t" && "$t" != "v$VERSION" ]] && \
-        urls+=("https://github.com/${GITHUB_REPO}/releases/download/${t}/gre-hub.tar.gz")
-    urls+=("https://github.com/${GITHUB_REPO}/archive/refs/heads/main.tar.gz")
-    for u in "${urls[@]}"; do
-        for attempt in 1 2; do
-            info "Downloading: $u"
-            if curl -fsSL --max-time 90 "$u" -o "$dest" 2>/dev/null && [[ -s "$dest" ]]; then
-                return 0
-            fi
-            sleep 2
-        done
-    done
-    return 1
-}
-
-hub_install() {
+hub_install() { # hub_install [--yes] [TAG|latest]
     require_root
-    local noninteractive="${1:-}"
+    local noninteractive=0 tag="latest"
+    local arg=""
+    for arg in "$@"; do
+        case "$arg" in
+            --yes|-y) noninteractive=1 ;;
+            "") ;;
+            *) tag="$arg" ;;
+        esac
+    done
     local was_installed=0
-    [[ -d "$HUB_DIR" ]] && was_installed=1
-    command -v curl >/dev/null 2>&1 || { err "curl is required."; return 1; }
+    [[ -f "$HUB_DIR/server/index.js" ]] && was_installed=1
+    command -v curl >/dev/null 2>&1 || [[ -n "${HUB_TEST_CURL_CMD:-}" ]] || { err "curl is required."; return 1; }
     command -v ssh-keygen >/dev/null 2>&1 || warn "ssh-keygen not found (usually in openssh-client) — hub SSH keys need it."
     hub_ensure_node || return 1
-
-    local tmp=""
-    tmp="$(mktemp -d)" || { err "mktemp failed"; return 1; }
-    if ! hub_download "$tmp/hub.tar.gz"; then
-        err "Could not download the gre-hub package."
-        rm -rf "$tmp"; return 1
-    fi
-    mkdir -p "$tmp/x"
-    tar xzf "$tmp/hub.tar.gz" -C "$tmp/x" || { err "Could not extract the package."; rm -rf "$tmp"; return 1; }
-    # release asset contains hub/; main tarball contains gre-manager-main/hub/
-    local src=""
-    [[ -f "$tmp/x/hub/package.json" ]] && src="$tmp/x/hub"
-    if [[ -z "$src" ]]; then
-        src="$(dirname "$(find "$tmp/x" -maxdepth 3 -path '*/hub/package.json' | head -1)")"
-    fi
-    [[ -n "$src" && -f "$src/package.json" ]] || { err "hub package not found in the archive."; rm -rf "$tmp"; return 1; }
     mkdir -p "$HUB_DIR"
-    cp -a "$src/." "$HUB_DIR/"
-    rm -rf "$tmp"
 
-    info "Installing dependencies (npm)..."
-    if ! (cd "$HUB_DIR" && npm install --omit=dev --no-audit --no-fund); then
-        warn "npm install failed; installing build tools and retrying..."
-        if command -v apt-get >/dev/null 2>&1; then
-            apt-get install -y build-essential python3
-        elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y gcc-c++ make python3
-        elif command -v yum >/dev/null 2>&1; then
-            yum install -y gcc-c++ make python3
-        fi
-        (cd "$HUB_DIR" && npm install --omit=dev --no-audit --no-fund) || { err "npm install failed."; return 1; }
-    fi
-
-    cat > "$HUB_SERVICE_FILE" <<EOF
-[Unit]
-Description=gre-hub web dashboard (gre-manager)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=$HUB_DIR
-Environment=PORT=$HUB_PORT_DEFAULT HUB_HOST=127.0.0.1
-ExecStart=$(command -v node) server/index.js
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable gre-hub.service >/dev/null 2>&1 || true
-    if (( was_installed )); then
-        systemctl restart gre-hub.service || { err "gre-hub files updated, but service restart failed."; return 1; }
+    # An explicit tag on an existing installation is an intentional change of
+    # release, so allow it even if it is not newer.
+    if (( was_installed )) && [[ "$tag" != "latest" ]]; then
+        HUB_FORCE_HUB_UPDATE=1 hub_update_to_release "$tag" || {
+            err "gre-hub installation failed."
+            return 1
+        }
     else
-        systemctl start gre-hub.service || { err "gre-hub installed, but service start failed."; return 1; }
+        hub_update_to_release "$tag" || {
+            err "gre-hub installation failed."
+            return 1
+        }
     fi
-    audit_log "hub-install dir=$HUB_DIR"
+    audit_log "hub-install dir=$HUB_DIR tag=$tag"
 
     echo
     ok "gre-hub is installed and running."
@@ -1906,8 +2232,8 @@ EOF
     info "From your PC:     ssh -L $HUB_PORT_DEFAULT:127.0.0.1:$HUB_PORT_DEFAULT root@<this-server-ip>"
     info "                  then open http://127.0.0.1:$HUB_PORT_DEFAULT"
     info "First visit: create the hub password, then enable 2FA in Settings."
-    info "Manage: gre hub [status|start|stop|restart|uninstall]"
-    [[ "$noninteractive" == "--yes" ]] && return 0
+    info "Manage: gre hub [status|update|start|stop|restart|uninstall]"
+    (( noninteractive )) && return 0
     echo
     if confirm "Set up web access with a domain + free HTTPS now?"; then
         hub_expose || true
@@ -1916,13 +2242,38 @@ EOF
     fi
 }
 
-hub_menu() { # gre hub [install|status|start|stop|restart|uninstall]
+hub_update_cmd() { # gre hub update [TAG] — always the newest stable release
+    require_root
+    local tag="${1:-latest}"
+    hub_ensure_node || return 1
+    if ! hub_update_to_release "$tag"; then
+        return 1
+    fi
+    local running=""
+    running="$(hub_meta_version 2>/dev/null || true)"
+    echo
+    ok "gre-hub is up to date${running:+ (running v$running)}."
+    print_release_summary "$VERSION"
+    info "Verify in the UI top bar or with:  curl -s http://127.0.0.1:$HUB_PORT_DEFAULT/api/meta"
+    return 0
+}
+
+hub_menu() { # gre hub [install|update|status|start|stop|restart|uninstall]
     require_root
     case "${1:-status}" in
-        install|reinstall) hub_install "${2:-}" ;;
+        install|reinstall) hub_install "${2:-}" "${3:-}" ;;
+        update|upgrade)    hub_update_cmd "${2:-latest}" ;;
         status)
             echo "gre-hub: $(hub_status_text)"
             if [[ -d "$HUB_DIR" ]]; then
+                local inst run
+                inst="$(hub_read_version "$HUB_DIR")"
+                run="$(hub_meta_version 2>/dev/null || true)"
+                [[ -n "$inst" ]] && echo "gre-hub files:     v$inst"
+                [[ -n "$run" ]] && echo "gre-hub running:    v$run"
+                if [[ -n "$inst" && -n "$run" && "$inst" != "$run" ]]; then
+                    warn "Installed files and the running process disagree; run 'gre hub update'."
+                fi
                 systemctl status gre-hub.service --no-pager 2>/dev/null | head -n 5 || true
             fi
             ;;
@@ -1941,7 +2292,7 @@ hub_menu() { # gre hub [install|status|start|stop|restart|uninstall]
             audit_log "hub-uninstall"
             ok "gre-hub removed."
             ;;
-        *) err "Usage: gre hub [install|status|start|stop|restart|domain [DOMAIN]|unexpose|uninstall]"; return 1 ;;
+        *) err "Usage: gre hub [install [TAG]|update [TAG]|status|start|stop|restart|domain [DOMAIN]|unexpose|uninstall]"; return 1 ;;
     esac
 }
 
@@ -3382,7 +3733,7 @@ EOF
     echo   "  ── Maintenance ─────────────────────────────────────────────"
     echo   "  9) Backup / restore (export / import)"
     echo   " 10) Clean up original vatanhost gre.sh (vatan-m2)"
-    echo   " 11) Update gre-manager to the latest version"
+    echo   " 11) Update gre-manager + gre-hub to the latest release"
     echo   " 12) Uninstall from this server"
     printf ' %s13) PURGE: remove EVERYTHING GRE (danger)%s\n' "$C_RED" "$C_RESET"
     echo   " 14) gre-hub dashboard (web UI: install / manage)"

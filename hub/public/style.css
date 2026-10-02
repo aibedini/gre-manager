@@ -86,6 +86,19 @@ kbd {
   letter-spacing: -0.02em;
 }
 .brand span { color: var(--text-muted); font-weight: 400; }
+/* Running-build stamp: the fastest way to spot a stale deployment. */
+.brand em {
+  display: block;
+  font-style: normal;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--text-faint);
+  letter-spacing: 0.01em;
+  line-height: 1.3;
+  white-space: nowrap;
+}
+.brand em.stale { color: var(--yellow-fg); }
 
 .nav { display: flex; gap: 4px; margin-left: 16px; }
 
@@ -555,6 +568,34 @@ table.data tr:last-child td { border-bottom: none; }
   line-height: 1.5;
 }
 .tl-summary.hidden { display: none; }
+.tl-summary.ok { color: var(--green-fg); }
+
+/* Attempt separator inside the timeline */
+.tl-attempt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0 6px;
+  color: var(--text-faint);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.tl-attempt::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+.plain-list { list-style: none; display: grid; gap: 5px; font-size: 12.5px; }
+.plain-list li { position: relative; padding-left: 14px; color: var(--text-muted); }
+.plain-list li::before { content: '—'; position: absolute; left: 0; color: var(--text-faint); }
+
+/* Failure card above the timeline: exact stage + reason + attempt */
+.tl-failure { display: grid; gap: 6px; }
+.tl-failure .row { display: grid; grid-template-columns: 96px 1fr; gap: 8px; }
+.tl-failure .label { color: var(--text-faint); text-transform: uppercase; font-size: 10.5px; letter-spacing: 0.06em; padding-top: 2px; }
 
 .tl-scroll {
   background: #0c0c0b;

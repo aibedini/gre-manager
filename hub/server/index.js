@@ -10,6 +10,7 @@ const { openDb } = require('./db');
 const cryptoUtil = require('./crypto');
 const ssh = require('./ssh');
 const { createRouter, consumeTicket, makeSshOpts } = require('./routes');
+const versionInfo = require('./version');
 
 const PORT = Number(process.env.PORT || 3939);
 const HOST = process.env.HUB_HOST || '127.0.0.1';
@@ -164,7 +165,12 @@ wss.on('connection', (ws, req, url) => {
 });
 
 server.listen(PORT, HOST, () => {
+  // Print the resolved build identity at startup: the first line of any log
+  // dump then says which release is actually serving traffic.
+  const meta = versionInfo.resolveMeta();
+  const short = meta.shortCommit || meta.commit || 'unknown';
   console.log(`gre-hub listening on http://${HOST}:${PORT}  (data: ${DATA_DIR})`);
+  console.log(`gre-hub build: v${meta.version || 'unknown'} · ${short} · version source: ${meta.versionSource}${meta.mixed ? ' · WARNING: version sources disagree' : ''}`);
 });
 
 // Graceful shutdown so `node scripts/smoke.js` and Ctrl+C exit cleanly.

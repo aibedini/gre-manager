@@ -5,7 +5,8 @@ const path = require('path');
 const fs = require('fs');
 // Install the node:sqlite fallback before better-sqlite3 is loaded, so the hub
 // still opens its database on machines where the native build is unavailable.
-require('../scripts/_sqlite');
+// It is optional: a trimmed runtime package simply uses the real driver.
+try { require('../scripts/_sqlite'); } catch { /* test hook not shipped */ }
 const Database = require('better-sqlite3');
 
 function openDb(dataDir) {
@@ -80,7 +81,16 @@ function openDb(dataDir) {
       auth_type   TEXT NOT NULL DEFAULT 'password' CHECK (auth_type IN ('password','token')),
       capability  TEXT CHECK (capability IN ('managed_hosts','external_proxy')),
       password_enc TEXT NOT NULL,
-      created_at  INTEGER NOT NULL
+      created_at  INTEGER NOT NULL,
+      -- v2.12.0 diagnostics. Capability detection stays API-driven; these
+      -- columns exist so the UI can show what was detected, when, and whether
+      -- the last probe failed.
+      panel_version        TEXT,
+      panel_version_source TEXT,
+      client_model         TEXT CHECK (client_model IN ('first_class','embedded')),
+      host_mode            TEXT CHECK (host_mode IN ('managed_hosts','external_proxy')),
+      last_probe_at        INTEGER,
+      last_probe_error     TEXT
     );
     CREATE TABLE IF NOT EXISTS gre_routes (
       id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,7 +111,19 @@ function openDb(dataDir) {
       status            TEXT NOT NULL CHECK (status IN ('RESERVED','ACTIVE','FAILED','STALE','NEEDS_REVIEW')),
       last_error        TEXT,
       created_at        INTEGER NOT NULL,
-      updated_at        INTEGER NOT NULL
+      updated_at        INTEGER NOT NULL,
+      -- v2.12.0 ownership metadata: enough to reconcile, retry, edit and
+      -- safely delete exactly the resources this route created.
+      peer_name             TEXT,
+      host_group_id         TEXT,
+      client_created_by_route INTEGER,
+      client_attached_by_route INTEGER,
+      rollback_state        TEXT CHECK (rollback_state IN ('NONE','PARTIAL','CLEAN','FAILED')),
+      attempt_no            INTEGER NOT NULL DEFAULT 1,
+      deleted_at            INTEGER,
+      current_stage         TEXT,
+      panel_version_snapshot TEXT,
+      host_mode             TEXT CHECK (host_mode IN ('managed_hosts','external_proxy'))
     );
     CREATE TABLE IF NOT EXISTS port_allocations (
       id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,7 +142,10 @@ function openDb(dataDir) {
       stage      TEXT NOT NULL,
       status     TEXT NOT NULL,
       detail     TEXT NOT NULL DEFAULT '',
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      -- v2.12.0: which provisioning attempt produced this row, so a retried
+      -- route keeps every previous attempt in the same persistent log.
+      attempt_no INTEGER NOT NULL DEFAULT 1
     );
     CREATE INDEX IF NOT EXISTS idx_action_log_created ON action_log(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_connectivity_iran ON connectivity_checks(iran_server_id);
@@ -149,8 +174,40 @@ function openDb(dataDir) {
   // v2.10.0 databases get the same guarantees as fresh ones.
   ensureColumn(db, 'gre_routes', 'client_mode', "client_mode TEXT CHECK (client_mode IN ('existing','new'))");
   ensureColumn(db, 'gre_routes', 'client_model', "client_model TEXT CHECK (client_model IN ('first_class','embedded'))");
+  // v2.12.0: panel diagnostics + route ownership metadata. Same ALTER TABLE
+  // path, so an existing v2.10.0/v2.11.0 hub.db migrates in place and keeps
+  // every route, allocation and event row.
+  ensureColumn(db, 'xui_panels', 'panel_version', 'panel_version TEXT');
+  ensureColumn(db, 'xui_panels', 'panel_version_source', 'panel_version_source TEXT');
+  ensureColumn(db, 'xui_panels', 'client_model', "client_model TEXT CHECK (client_model IN ('first_class','embedded'))");
+  ensureColumn(db, 'xui_panels', 'host_mode', "host_mode TEXT CHECK (host_mode IN ('managed_hosts','external_proxy'))");
+  ensureColumn(db, 'xui_panels', 'last_probe_at', 'last_probe_at INTEGER');
+  ensureColumn(db, 'xui_panels', 'last_probe_error', 'last_probe_error TEXT');
 
+  ensureColumn(db, 'gre_routes', 'peer_name', 'peer_name TEXT');
+  ensureColumn(db, 'gre_routes', 'host_group_id', 'host_group_id TEXT');
+  ensureColumn(db, 'gre_routes', 'client_created_by_route', 'client_created_by_route INTEGER');
+  ensureColumn(db, 'gre_routes', 'client_attached_by_route', 'client_attached_by_route INTEGER');
+  ensureColumn(db, 'gre_routes', 'rollback_state', "rollback_state TEXT CHECK (rollback_state IN ('NONE','PARTIAL','CLEAN','FAILED'))");
+  ensureColumn(db, 'gre_routes', 'attempt_no', 'attempt_no INTEGER NOT NULL DEFAULT 1');
+  ensureColumn(db, 'gre_routes', 'deleted_at', 'deleted_at INTEGER');
+  ensureColumn(db, 'gre_routes', 'current_stage', 'current_stage TEXT');
+  ensureColumn(db, 'gre_routes', 'panel_version_snapshot', 'panel_version_snapshot TEXT');
+  ensureColumn(db, 'gre_routes', 'host_mode', "host_mode TEXT CHECK (host_mode IN ('managed_hosts','external_proxy'))");
+  ensureColumn(db, 'route_events', 'attempt_no', 'attempt_no INTEGER NOT NULL DEFAULT 1');
+
+  db.pragma(`user_version = ${SCHEMA_VERSION}`);
   return db;
+}
+
+// Bumped whenever the schema changes, so GET /api/meta can tell an operator
+// which schema a running hub actually migrated to.
+const SCHEMA_VERSION = 2;
+
+function schemaVersion(db) {
+  const row = db.prepare('PRAGMA user_version').get();
+  const value = row ? Object.values(row)[0] : 0;
+  return Number(value) || 0;
 }
 
 function ensureColumn(db, table, column, ddl) {
@@ -168,4 +225,4 @@ function audit(db, { kind = 'auth', serverId = null, serverName = 'hub', action,
   ).run(kind, serverId, serverName, action, params ? JSON.stringify(params) : null, rc, String(output).slice(0, 20000), Date.now());
 }
 
-module.exports = { openDb, audit };
+module.exports = { openDb, audit, schemaVersion, SCHEMA_VERSION };

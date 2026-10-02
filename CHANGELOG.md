@@ -4,6 +4,116 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.0] - 2026-10-02
+
+### Fixed
+
+- `gre update` and hub installation can no longer leave the CLI and gre-hub on
+  different releases. Hub installation used to try `v${VERSION}/gre-hub.tar.gz`
+  **before** asking GitHub for the latest release, so an outdated installed CLI
+  could reinstall a hub package matching its own old version even when a newer
+  release existed — and the last fallback was the raw `main` tarball, which
+  bypassed checksum verification entirely. The updater now resolves the release
+  tag first, verifies `gre-hub.tar.gz.sha256` (and refuses a checksum file that
+  does not name the tarball), and never falls back to `main` or
+  `raw.githubusercontent.com`.
+- Hub deployment is now atomic and self-recovering: the package is staged and
+  its dependencies installed in a temporary directory, the previous build is
+  snapshotted, the service is restarted, the running version is verified through
+  `/api/meta`, and a hub that fails to start or reports the wrong version is
+  rolled back automatically. `/opt/gre-hub/data` (`hub.db`, `master.key`, SSH
+  keys) is never touched by the swap.
+- Reconcile no longer marks a cleanly rolled back `FAILED` route as
+  `NEEDS_REVIEW`. Its expected state is "everything this route owned is gone", so
+  absence is success: the response now reports `cleanup_complete: true` and an
+  empty `leftovers` list, and only genuine surviving resources escalate a route.
+  Reconcile also never judges or destroys a `STALE` route: it performs read-only
+  discovery and says so.
+- The installed Hub version can no longer disagree with the released one
+  silently: `VERSION`, `gre-manager.sh`, `hub/package.json`,
+  `hub/package-lock.json` and `hub/VERSION` are asserted equal in CI and in the
+  release job, and the release tag itself must match.
+
+### Added
+
+- `gre hub update` — always installs the newest stable release, independent of
+  the CLI's own version. `gre hub install [TAG]` still works and an explicit tag
+  remains the way to pin a release. `gre hub status` now prints both the
+  installed and the running hub version and warns when they disagree. Every
+  update ends with an unambiguous summary:
+  `gre-manager: vX.Y.Z` / `gre-hub: vX.Y.Z` / `release: vX.Y.Z`.
+- `GET /api/meta` (no session required) and a permanent build stamp in the UI
+  top bar (`gre-hub v2.12.0 · abcdef1`, with a tooltip listing every version
+  source and whether they agree) plus an Application panel in Settings showing
+  version, version source, build commit, build time, release tag, Node and DB
+  schema. The startup log line also names the running build, so a stale
+  deployment is visible in `journalctl` immediately.
+- The release workflow now ships `hub/VERSION` and `hub/build-info.json`
+  (version, full commit, short commit, UTC build time, tag) inside
+  `gre-hub.tar.gz`, verifies both are present and consistent, and strips test-only
+  files from the runtime package. `GET /api/meta` resolves the version in a
+  documented order: `build-info.json` → `hub/VERSION` → `../VERSION` →
+  `package.json`, and flags a mixed deployment when sources disagree.
+- Exact 3x-ui version detection as **diagnostic metadata only**
+  (`XuiClient.detectPanelVersion()`): `/panel/api/server/getPanelUpdateInfo`
+  first, then a conservative scan of the authenticated panel HTML. It never
+  reports the Xray-core version as the panel version and resolves to `null` when
+  ambiguous. Capability detection remains API-driven (`/clients/list`,
+  `/hosts/list`) and never consults a version number.
+- Panel diagnostics are persisted in `xui_panels` (`panel_version`,
+  `panel_version_source`, `client_model`, `host_mode`, `last_probe_at`,
+  `last_probe_error`) with `POST /api/xui-panels/:id/probe` for a manual refresh
+  and an automatic background refresh when metadata is older than 10 minutes.
+  The panel table shows `3x-ui vX.Y.Z`, the client model, the host model and when
+  it was last checked — and keeps showing the last known-good values (with the
+  error alongside) when a probe fails, instead of reverting to
+  "detected on next save".
+- The Create Route dialog shows the selected panel's 3x-ui version, client model
+  and host model before anything is created, with explicit helper copy for
+  existing versus new clients and for the legacy embedded model.
+- Every mutable or slow provisioning step now emits `RUNNING` before its
+  `PASS`/`FAIL` (`panel_probe`, `public_ip`, `connectivity`, `gre_pairing`,
+  `foreign_node_add`, `iran_peer_add`, `inbound_add`, `client_attach`,
+  `client_create`, `managed_host_add`, `link_fetch`, `runtime_validation`), the
+  route records its `current_stage`, and a failure reports the exact step:
+  `Failed at inbound_add: Duplicate email: navid`. The timeline's failure card
+  now shows **Failed at / Reason / Attempt** instead of one generic `failed`.
+- Component-level Reconcile with a proper result modal. An `ACTIVE` route is
+  checked component by component (registry, IRAN peer and forwarding, FOREIGN
+  listeners, GRE link state, inbound presence/port/protocol, client existence and
+  attachment, managed host or `externalProxy`) and rendered as a
+  Component / Expected / Actual / Result / Detail table.
+- `PATCH /api/gre-routes/:id` edits a route's **desired specification** without
+  provisioning anything. Servers, panel, port, method and client are refused
+  while a route is `ACTIVE` (with the locked fields named in the response); a
+  rename is always allowed.
+- `POST /api/gre-routes/:id/retry` re-runs provisioning for a route that is not
+  `ACTIVE`. It reconciles first and refuses to start when the previous attempt
+  left resources behind, increments `attempt_no`, and preserves every earlier
+  event — `route_events.attempt_no` plus attempt separators in the timeline keep
+  each run distinguishable.
+- `GET /api/gre-routes/:id/delete-preview` and `DELETE /api/gre-routes/:id`.
+  Delete removes only the resources the route owns, in a safe order (client
+  relationship → managed host → inbound → IRAN peer → FOREIGN node → port
+  allocation), then soft-deletes the row (`deleted_at`) while keeping the event
+  history. A pre-existing client is only ever detached — never deleted globally —
+  and a route-created client is preserved (detached instead) when another inbound
+  still uses it. The preview dialog states plainly what will be removed and that
+  the existing client **WILL NOT BE DELETED**. Any cleanup failure leaves the
+  route visible as `NEEDS_REVIEW` with the exact failures recorded.
+- Ownership metadata is persisted so those operations are possible after a
+  restart: `peer_name`, `host_group_id`, `client_created_by_route`,
+  `client_attached_by_route`, `rollback_state`, `attempt_no`, `deleted_at`,
+  `current_stage`, `panel_version_snapshot` and `host_mode`.
+
+### Changed
+
+- `gre_routes` and `xui_panels` gained the columns above and `route_events`
+  gained `attempt_no`; existing v2.10.0/v2.11.0 databases migrate in place with
+  `ALTER TABLE … CHECK (…)`, keeping every route, allocation and event row.
+- The smoke/CI pipeline now runs the hub suite, and CI asserts that all five
+  version sources agree.
+
 ## [2.11.0] - 2026-10-02
 
 ### Fixed
