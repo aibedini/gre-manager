@@ -9,6 +9,14 @@ const { WebSocketServer } = require('ws');
 const { openDb } = require('./db');
 const cryptoUtil = require('./crypto');
 const ssh = require('./ssh');
+const { RouteOrchestrator } = require('./route-orchestrator');
+const { applyRouteLivePreflight } = require('./route-live-preflight');
+
+// Apply the live-preflight compatibility layer before the router creates its
+// RouteOrchestrator instance. Slow 3x-ui/SSH checks then happen after the API
+// has returned route_id, so the browser can stream the exact running stage.
+applyRouteLivePreflight(RouteOrchestrator);
+
 const { createRouter, consumeTicket, makeSshOpts } = require('./routes');
 const versionInfo = require('./version');
 
@@ -24,7 +32,6 @@ const cryptKey = cryptoUtil.loadKey(DATA_DIR);
 // reserved but never finished. Flag them for review — never destroy remote
 // state whose real condition we cannot know — and let Reconcile inspect them.
 try {
-  const { RouteOrchestrator } = require('./route-orchestrator');
   const stranded = new RouteOrchestrator({ db, cryptKey, sshOptsFor: () => ({}) }).sweepAbandoned();
   if (stranded.length) console.warn(`gre-hub: flagged ${stranded.length} interrupted route(s) as STALE: ${stranded.join(', ')}`);
 } catch (err) {
