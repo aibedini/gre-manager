@@ -8,10 +8,11 @@ function ok(value, message) { assert.ok(value, message); assertions++; }
 function equal(actual, expected, message) { assert.strictEqual(actual, expected, message); assertions++; }
 
 class FakeOrchestrator {
-  constructor() {
+  constructor({ failXuiPortQuery = false } = {}) {
     this.eventsLog = [];
     this.stageLog = [];
     this.clientCalls = 0;
+    this.requestPaths = [];
     this.originalCalled = false;
     this._route = null;
     this._client = {
@@ -19,6 +20,24 @@ class FakeOrchestrator {
       resolveCapabilities: async () => ({ clientModel: 'first_class', hostMode: 'managed_hosts', mode: 'managed_hosts' }),
       detectPanelVersion: async () => ({ version: '3.7.0', source: 'test' }),
       getFirstClassClient: async (email) => ({ client: { email }, inboundIds: [10] }),
+      request: async (path) => {
+        this.requestPaths.push(path);
+        if (failXuiPortQuery && path === '/panel/api/inbounds/options') {
+          throw new Error('The operation was aborted due to timeout');
+        }
+        if (path === '/panel/api/inbounds/options') {
+          return {
+            ok: true,
+            status: 200,
+            data: { success: true, obj: [{ id: 10, remark: 'existing', protocol: 'shadowsocks', port: 3049 }] },
+          };
+        }
+        return { ok: false, status: 404, data: null };
+      },
+      listInbounds: async () => {
+        this.requestPaths.push('/panel/api/inbounds/list');
+        return [{ id: 10, port: 3049 }];
+      },
     };
     this.db = {
       transaction: (fn) => () => fn(),
@@ -68,7 +87,6 @@ class FakeOrchestrator {
   route() { return this._route; }
   ownership(routeId, patch) { Object.assign(this._route, patch); }
   reportPanelMetadata() {}
-  async collectUsage() { return {}; }
   inspectCandidate() { return { free: false, conflict_route: this._route.name, evidence: { iran: [], foreign: [], inbound: null } }; }
   async publicIp(server) { return server.host; }
   async remote() { return { rc: 0, stdout: 'reachable', stderr: '' }; }
@@ -81,10 +99,8 @@ class FakeOrchestrator {
 
 applyRouteLivePreflight(FakeOrchestrator);
 
-(async () => {
-  const orchestrator = new FakeOrchestrator();
-  const started = Date.now();
-  const prepared = await orchestrator.prepare({
+async function prepare(orchestrator) {
+  return orchestrator.prepare({
     name: 'irwebnavid-tr',
     iranServerId: 1,
     foreignServerId: 2,
@@ -93,6 +109,12 @@ applyRouteLivePreflight(FakeOrchestrator);
     client_mode: 'existing',
     client_email: 'navid',
   });
+}
+
+(async () => {
+  const orchestrator = new FakeOrchestrator();
+  const started = Date.now();
+  const prepared = await prepare(orchestrator);
 
   equal(prepared.route_id, 77, 'prepare must reserve and return a route id');
   equal(prepared.status, 'RESERVED', 'prepare must return RESERVED');
@@ -103,12 +125,15 @@ applyRouteLivePreflight(FakeOrchestrator);
   const result = await orchestrator.run(77, prepared);
   ok(orchestrator.originalCalled, 'original provisioning run must continue after preflight');
   equal(result.routeId, 77, 'original result should be returned');
-  ok(orchestrator._client.timeoutMs >= 45000, '3x-ui timeout should be raised for slow panels');
+  ok(orchestrator._client.timeoutMs >= 45000, '3x-ui timeout should be restored after bounded port query');
 
   for (const stage of [
     'panel_probe',
     'client_preflight',
     'port_check',
+    'port_check_iran',
+    'port_check_foreign',
+    'port_check_xui',
     'public_ip_preflight',
     'connectivity_iran_to_foreign',
     'connectivity_foreign_to_iran',
@@ -117,11 +142,31 @@ applyRouteLivePreflight(FakeOrchestrator);
     ok(orchestrator.stageLog.some((e) => e.name === stage && e.status === 'PASS'), `${stage} must emit PASS`);
   }
 
+  ok(orchestrator.requestPaths.includes('/panel/api/inbounds/options'), 'port check must use the lightweight 3x-ui inbound options endpoint');
+  ok(!orchestrator.requestPaths.includes('/panel/api/inbounds/list'), '3x-ui 3.7 port check must not fetch the heavyweight full inbound list');
+  const xuiPass = orchestrator.stageLog.find((e) => e.name === 'port_check_xui' && e.status === 'PASS');
+  ok(/\/panel\/api\/inbounds\/options/.test(xuiPass.detail), 'timeline must report which lightweight endpoint supplied the port inventory');
+
   ok(orchestrator.eventsLog.some((e) => e.stage === 'connectivity_preflight' && e.status === 'PASS'), 'bidirectional connectivity summary must be persisted');
 
   const abort = new Error('The operation was aborted due to timeout');
   const message = contextualError('3x-ui client preflight', abort, 45000);
   ok(message.includes('3x-ui client preflight timed out after 45s'), 'opaque AbortError must gain stage and timeout context');
+
+  const failing = new FakeOrchestrator({ failXuiPortQuery: true });
+  const failingPrepared = await prepare(failing);
+  let failure = null;
+  try {
+    await failing.run(77, failingPrepared);
+  } catch (err) {
+    failure = err;
+  }
+  ok(failure, 'a failed lightweight 3x-ui port query must stop provisioning');
+  ok(/3x-ui inbound-port query timed out after 12s/.test(failure.message), 'port failure must identify 3x-ui and the bounded 12s timeout');
+  ok(failing.stageLog.some((e) => e.name === 'port_check_xui' && e.status === 'FAIL' && /12s/.test(e.detail)), 'timeline must mark port_check_xui FAIL with the exact timeout');
+  ok(failing.stageLog.some((e) => e.name === 'port_check_iran' && e.status === 'PASS'), 'IRAN port inventory result remains visible when 3x-ui fails');
+  ok(failing.stageLog.some((e) => e.name === 'port_check_foreign' && e.status === 'PASS'), 'FOREIGN port inventory result remains visible when 3x-ui fails');
+  ok(!failing.originalCalled, 'no GRE mutation may start after a failed port inventory');
 
   console.log(`live-preflight-test: ${assertions} assertions passed`);
 })().catch((err) => {
