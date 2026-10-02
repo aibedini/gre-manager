@@ -32,6 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Regression tests on both layers: `scripts/version-test.js` checks the packaged
   file and that no `.gitignore` excludes it, and `tests/run.sh` builds a tarball
   the way the release job does and asserts its contents.
+- The CLI fixture version in `tests/run.sh` is now derived from the script
+  instead of hardcoded, so a version bump can no longer silently turn that
+  regression test into a no-op.
+
+Everything below (the updater rewrite, build identity, panel diagnostics, the
+provisioning timeline, reconcile and the route lifecycle controls) first shipped
+in v2.12.0 with no functional changes here.
 
 ## [2.12.0] - 2026-10-02
 
