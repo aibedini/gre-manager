@@ -13,6 +13,23 @@ const AVOID_PORTS = new Set([22, 25, 53, 80, 110, 143, 443, 465, 587, 993, 995, 
 const DEFAULT_START = 3000;
 const DEFAULT_END = 3999;
 const XUI_TIMEOUT_MS = Math.max(20000, Number(process.env.HUB_XUI_TIMEOUT_MS || 45000));
+const PORT_SSH_TIMEOUT_MS = Math.max(10000, Number(process.env.HUB_PORT_SSH_TIMEOUT_MS || 20000));
+const PORT_XUI_TIMEOUT_MS = Math.max(5000, Number(process.env.HUB_PORT_XUI_TIMEOUT_MS || 12000));
+
+// Port preflight needs only listeners/firewall/docker state plus inbound id/port.
+// Do not ask 3x-ui for the heavyweight full inbound list here: on a panel with a
+// large client population `/panel/api/inbounds/list` can spend tens of seconds
+// serializing traffic/client payloads. 3x-ui v3.7 exposes `/options` specifically
+// as the lightweight id/remark/protocol/port projection; `/list/slim` is the
+// next-best compatible fallback.
+function portProbeCommand() {
+  return [
+    "echo '---listeners---'", 'ss -H -lntup 2>/dev/null || true',
+    "echo '---nft---'", 'nft list ruleset 2>/dev/null || true',
+    "echo '---iptables---'", 'iptables-save 2>/dev/null || true',
+    "echo '---docker---'", "docker ps --format '{{.Ports}}' 2>/dev/null || true",
+  ].join('; ');
+}
 
 function timeoutLike(err) {
   const text = String(err && (err.message || err.name) || '').toLowerCase();
@@ -69,10 +86,96 @@ function remoteEvidence(result) {
   );
 }
 
-async function verifyPort(orchestrator, route, client) {
+function unwrapPanelPayload(data) {
+  if (data && typeof data === 'object' && !Array.isArray(data)) {
+    if (data.obj !== undefined) return data.obj;
+    if (data.data !== undefined) return data.data;
+  }
+  return data;
+}
+
+function panelFailureDetail(data, status) {
+  const body = data && data.data;
+  return body && (body.msg || body.error) || `HTTP ${status}`;
+}
+
+async function listInboundPortIndex(client) {
+  const previousTimeout = Number(client.timeoutMs) || XUI_TIMEOUT_MS;
+  client.timeoutMs = Math.min(previousTimeout, PORT_XUI_TIMEOUT_MS);
+  try {
+    for (const path of ['/panel/api/inbounds/options', '/panel/api/inbounds/list/slim']) {
+      const result = await client.request(path, { allowFailure: true });
+      if (result && result.ok) {
+        const rows = unwrapPanelPayload(result.data);
+        return { rows: Array.isArray(rows) ? rows : [], source: path };
+      }
+      if (result && (result.status === 404 || result.status === 405)) continue;
+      throw new Error(`3x-ui GET ${path} failed: ${panelFailureDetail(result, result && result.status)}`);
+    }
+
+    // Old 3x-ui fallback only. Modern 3.7+ panels should never reach this.
+    const rows = await client.listInbounds();
+    return { rows: Array.isArray(rows) ? rows : [], source: '/panel/api/inbounds/list (legacy fallback)' };
+  } finally {
+    client.timeoutMs = previousTimeout;
+  }
+}
+
+function markPortError(message) {
+  const err = new Error(message);
+  err.portCheckDetail = true;
+  return err;
+}
+
+async function hostPortInventory(orchestrator, routeId, stageName, server, label) {
+  const stage = orchestrator.stage(routeId, stageName, `${label} ${server.name} (${server.host}): listeners + nftables + iptables + Docker`);
+  try {
+    const result = await orchestrator.remote(server, portProbeCommand(), PORT_SSH_TIMEOUT_MS);
+    if (result.rc !== 0) {
+      throw new Error(result.stderr || result.stdout || `rc=${result.rc}`);
+    }
+    const output = String(result.stdout || '');
+    stage.pass(`${label} inventory read (${output.split(/\r?\n/).length} lines)`);
+    return output;
+  } catch (err) {
+    const message = contextualError(`${label} port inspection`, err, PORT_SSH_TIMEOUT_MS);
+    stage.fail(message);
+    throw markPortError(message);
+  }
+}
+
+async function xuiPortInventory(orchestrator, routeId, client) {
+  const stage = orchestrator.stage(routeId, 'port_check_xui', 'Reading lightweight 3x-ui inbound port inventory');
+  try {
+    const result = await listInboundPortIndex(client);
+    stage.pass(`${result.rows.length} inbound(s) read via ${result.source}`);
+    return result.rows;
+  } catch (err) {
+    const message = contextualError('3x-ui inbound-port query', err, PORT_XUI_TIMEOUT_MS);
+    stage.fail(message);
+    throw markPortError(message);
+  }
+}
+
+async function collectPortUsage(orchestrator, routeId, iran, foreign, client) {
+  const settled = await Promise.allSettled([
+    hostPortInventory(orchestrator, routeId, 'port_check_iran', iran, 'IRAN'),
+    hostPortInventory(orchestrator, routeId, 'port_check_foreign', foreign, 'FOREIGN'),
+    xuiPortInventory(orchestrator, routeId, client),
+  ]);
+  const failure = settled.find((item) => item.status === 'rejected');
+  if (failure) throw failure.reason;
+  return {
+    iranOutput: settled[0].value,
+    foreignOutput: settled[1].value,
+    inbounds: settled[2].value,
+  };
+}
+
+async function verifyPort(orchestrator, routeId, route, client) {
   const iran = orchestrator.server(route.iran_server_id);
   const foreign = orchestrator.server(route.foreign_server_id);
-  const usage = await orchestrator.collectUsage(iran, foreign, client);
+  const usage = await collectPortUsage(orchestrator, routeId, iran, foreign, client);
 
   const preferred = orchestrator.inspectCandidate(usage, iran.id, foreign.id, route.port);
   const otherRegistryConflict = orchestrator.registryConflict(iran.id, foreign.id, route.port, route.id);
@@ -234,14 +337,16 @@ function applyRouteLivePreflight(RouteOrchestrator) {
     route = this.route(routeId);
     const portStage = this.stage(routeId, 'port_check', `Checking port ${route.port} on IRAN, FOREIGN, firewall, Docker and 3x-ui`);
     try {
-      const checked = await verifyPort(this, route, client);
+      const checked = await verifyPort(this, routeId, route, client);
       if (checked.changed) {
         portStage.pass(`port ${checked.previous} was occupied; switched reservation to free TCP+UDP port ${checked.port}`);
       } else {
         portStage.pass(`TCP+UDP port ${checked.port} is free on IRAN, FOREIGN, firewall, Docker, 3x-ui and registry`);
       }
     } catch (err) {
-      const message = contextualError('port safety scan', err, Math.max(XUI_TIMEOUT_MS, 30000));
+      const message = err && err.portCheckDetail
+        ? err.message
+        : contextualError('port safety scan', err, Math.max(PORT_SSH_TIMEOUT_MS, PORT_XUI_TIMEOUT_MS));
       portStage.fail(message);
       throw new Error(message);
     }
@@ -267,7 +372,7 @@ function applyRouteLivePreflight(RouteOrchestrator) {
     this.event(routeId, 'connectivity_preflight', 'PASS', 'IRAN -> FOREIGN and FOREIGN -> IRAN public reachability passed');
 
     // Re-read the route because port_check may have safely moved the reserved
-    // port. The original v2.12.2 provisioning code then performs all mutations,
+    // port. The original provisioning code then performs all mutations,
     // rollback and ownership tracking unchanged.
     route = this.route(routeId);
     return originalRun.call(this, routeId, {
