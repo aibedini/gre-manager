@@ -12,10 +12,12 @@ const ssh = require('./ssh');
 const { RouteOrchestrator } = require('./route-orchestrator');
 const { applyRouteLivePreflight } = require('./route-live-preflight');
 
-// Apply the live-preflight compatibility layer before the router creates its
-// RouteOrchestrator instance. Slow 3x-ui/SSH checks then happen after the API
-// has returned route_id, so the browser can stream the exact running stage.
-applyRouteLivePreflight(RouteOrchestrator);
+// Apply the live-preflight layer before the router creates its orchestrator.
+// `legacy` exists only for the old synchronous integration fixture; production
+// defaults to live mode and the dedicated live-preflight suite exercises it.
+if (process.env.HUB_ROUTE_PREFLIGHT_MODE !== 'legacy') {
+  applyRouteLivePreflight(RouteOrchestrator);
+}
 
 const { createRouter, consumeTicket, makeSshOpts } = require('./routes');
 const versionInfo = require('./version');
