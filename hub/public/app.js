@@ -1353,7 +1353,8 @@ $('#btn-add-route').addEventListener('click', async () => {
       <div class="field"><label>IRAN server</label><select name="iran_server_id">${options(iranServers)}</select></div>
       <div class="field"><label>FOREIGN server</label><select name="foreign_server_id">${options(foreignServers)}</select></div>
       <div class="field"><label>3x-ui panel</label><select name="panel_id">${state.panels.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></div>
-      <div class="field"><label>Client name</label><input name="client_name" value="navid" required /></div>
+      <div class="field"><label>3x-ui client</label><select name="client_choice"><option value="__new__">Add new client...</option></select><div class="hint" id="client-load">Loading clients from 3x-ui...</div></div>
+      <div class="field" id="new-client-wrap"><label>New client name</label><input name="client_name" required maxlength="80" placeholder="navid" /></div>
       <div class="field"><label>Preferred port (optional)</label><input name="port" type="number" min="1024" max="65535" placeholder="auto: 3000–3999" /></div>
       <div id="port-result" class="hint">A safe TCP+UDP port will be selected before any changes are made.</div>
       <div class="form-error" id="route-error"></div>
@@ -1361,21 +1362,44 @@ $('#btn-add-route').addEventListener('click', async () => {
     </form>`);
   $('.modal-cancel').addEventListener('click', closeModal);
   const form = $('#route-form');
+  const syncClient = () => {
+    const isNew = form.client_choice.value === '__new__';
+    $('#new-client-wrap').classList.toggle('hidden', !isNew);
+    form.client_name.required = isNew;
+  };
+  const loadClients = async () => {
+    $('#client-load').textContent = 'Loading clients from 3x-ui...';
+    try {
+      const clients = await api(`/api/xui-panels/${form.panel_id.value}/clients`);
+      form.client_choice.innerHTML = clients.map((client) => `<option value="${esc(client.email)}">${esc(client.email)} - ${esc(client.inbound_remark || 'inbound')}</option>`).join('') + '<option value="__new__">Add new client...</option>';
+      $('#client-load').textContent = clients.length ? `${clients.length} client(s) found` : 'No client found; create a new one.';
+      syncClient();
+    } catch (err) { $('#client-load').textContent = err.message; }
+  };
   const body = () => ({
     name: form.name.value.trim(), iran_server_id: Number(form.iran_server_id.value),
     foreign_server_id: Number(form.foreign_server_id.value), panel_id: Number(form.panel_id.value),
-    client_name: form.client_name.value.trim(), port: form.port.value ? Number(form.port.value) : undefined,
+    client_name: form.client_choice.value === '__new__' ? form.client_name.value.trim() : form.client_choice.value,
+    port: form.port.value ? Number(form.port.value) : undefined,
     range_start: 3000, range_end: 3999,
   });
-  $('#btn-check-port').addEventListener('click', async () => {
+  const checkPort = async () => {
     const btn = $('#btn-check-port'); btn.disabled = true; btn.textContent = 'Checking…';
     try {
       const r = await api('/api/gre-routes/recommend-port', { method: 'POST', body: body() });
       form.port.value = r.port;
-      $('#port-result').innerHTML = `<span class="badge green">${r.port} FREE</span> TCP: FREE · UDP: FREE · 3x-ui: FREE · GRE registry: FREE`;
+      const occupied = r.occupied_ports && r.occupied_ports.length ? r.occupied_ports.join(', ') : 'none in scanned candidates';
+      $('#port-result').innerHTML = `<span class="badge green">Suggested: ${r.port} FREE</span> TCP: ${esc(r.tcp)} / UDP: ${esc(r.udp)} / 3x-ui: ${esc(r.xui)} / GRE: ${esc(r.gre)}<br><strong>Occupied:</strong> ${esc(occupied)}`;
     } catch (err) { $('#route-error').textContent = err.message; }
     finally { btn.disabled = false; btn.textContent = 'Check port'; }
-  });
+  };
+  $('#btn-check-port').addEventListener('click', checkPort);
+  form.client_choice.addEventListener('change', syncClient);
+  form.panel_id.addEventListener('change', async () => { await loadClients(); await checkPort(); });
+  form.iran_server_id.addEventListener('change', checkPort);
+  form.foreign_server_id.addEventListener('change', checkPort);
+  await loadClients();
+  await checkPort();
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const btn = $('#btn-create-route'); btn.disabled = true; btn.textContent = 'Creating…';
@@ -1383,11 +1407,18 @@ $('#btn-add-route').addEventListener('click', async () => {
     try {
       const result = await api('/api/gre-routes', { method: 'POST', body: body() });
       closeModal(); await loadRoutes();
-      openModal(`<h2>Route active</h2><p class="sub">${esc(result.name)} — ${esc(result.capability)}</p><div class="output-pane" style="max-height:none; user-select:all">${esc(result.link)}</div><div class="foot"><button class="btn modal-cancel">Done</button></div>`);
+      const events = (result.events || []).map((event) => `<div><span class="badge ${event.status === 'PASS' ? 'green' : 'red'}">${esc(event.status)}</span> <strong>${esc(event.stage)}</strong> - ${esc(event.detail)}</div>`).join('');
+      openModal(`<h2>Route active</h2><p class="sub">${esc(result.name)} - ${esc(result.capability)}</p>
+        <div style="text-align:center"><img src="${esc(result.qr_data_url)}" alt="Shadowsocks QR code" width="260" height="260"></div>
+        <h3>Shadowsocks link</h3><div class="output-pane" style="max-height:none; user-select:all">${esc(result.link)}</div>
+        <h3>Xray outbound JSON</h3><pre class="output-pane" style="max-height:none; user-select:all">${esc(JSON.stringify(result.outbound, null, 2))}</pre>
+        <h3>Automation log</h3><div class="output-pane" style="max-height:320px">${events}</div>
+        <div class="foot"><button class="btn modal-cancel">Done</button></div>`);
       $('.modal-cancel').addEventListener('click', closeModal);
     } catch (err) {
       const rollback = err.data && err.data.rollback && err.data.rollback.length ? ` Rollback: ${err.data.rollback.join(', ')}` : '';
-      $('#route-error').textContent = err.message + rollback;
+      const events = err.data && err.data.events ? err.data.events.map((event) => `${event.status} ${event.stage}: ${event.detail}`).join('\n') : '';
+      $('#route-error').textContent = err.message + rollback + (events ? `\n${events}` : '');
       btn.disabled = false; btn.textContent = 'Create route';
     }
   });

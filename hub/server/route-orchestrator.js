@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const QRCode = require('qrcode');
 const ssh = require('./ssh');
 const actions = require('./actions');
 const { XuiClient, parseShadowsocksLink, buildShadowsocksLink } = require('./xui');
@@ -48,6 +49,16 @@ function validatePort(value) {
   const port = Number(value);
   if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('port must be an integer 1024-65535');
   return port;
+}
+
+function parseSuggestion(output) {
+  let value;
+  try { value = JSON.parse(String(output || '').trim()); } catch { throw new Error('remote gre returned invalid suggestion JSON; update gre on both servers'); }
+  const item = Array.isArray(value) ? value[0] : (Array.isArray(value.suggestions) ? value.suggestions[0] : value);
+  if (!item || !item.name || !item.subnet_base || !Number.isInteger(Number(item.idx)) || !item.key) {
+    throw new Error('remote gre returned an incomplete pairing suggestion; update gre on both servers');
+  }
+  return { name: String(item.name), subnet_base: String(item.subnet_base), idx: Number(item.idx), key: String(item.key) };
 }
 
 function inboundPayload({ remark, port, method, inboundPassword, clientPassword, email, externalProxy }) {
@@ -182,11 +193,38 @@ class RouteOrchestrator {
     const candidates = [];
     if (preferredPort !== undefined && preferredPort !== null && preferredPort !== '') candidates.push(validatePort(preferredPort));
     for (let p = start; p <= end; p++) if (!AVOID_PORTS.has(p) && !candidates.includes(p)) candidates.push(p);
+    const occupied = [];
+    let recommendation = null;
     for (const port of candidates) {
       const result = this.inspectCandidate(usage, iran.id, foreign.id, port);
-      if (result.free) return result;
+      if (result.free && !recommendation) recommendation = result;
+      if (!result.free) occupied.push(port);
     }
+    if (recommendation) return { ...recommendation, occupied_ports: occupied, occupied_count: occupied.length };
     throw new Error(`no free TCP+UDP port found in ${start}-${end}`);
+  }
+
+  event(routeId, stage, status, detail = '') {
+    const safe = String(detail || '').replace(/ss:\/\/\S+/gi, '[redacted-link]').slice(0, 4000);
+    this.db.prepare('INSERT INTO route_events (route_id, stage, status, detail, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run(routeId, stage, status, safe, Date.now());
+  }
+
+  events(routeId) {
+    return this.db.prepare('SELECT id, stage, status, detail, created_at FROM route_events WHERE route_id=? ORDER BY id').all(routeId);
+  }
+
+  async pairing(iran, foreign) {
+    const suggested = await this.remote(iran, 'gre iran peer suggest --json', 30000);
+    if (suggested.rc !== 0) throw new Error(`could not allocate GRE pairing values: ${suggested.stderr || suggested.stdout || `rc=${suggested.rc}`}`);
+    const pair = parseSuggestion(suggested.stdout);
+    const check = await this.remote(foreign, `gre node suggest --json --base ${shellQuote(pair.subnet_base)}`, 30000);
+    if (check.rc !== 0) throw new Error(`could not validate GRE allocation on FOREIGN: ${check.stderr || check.stdout || `rc=${check.rc}`}`);
+    const foreignPair = parseSuggestion(check.stdout);
+    if (foreignPair.idx !== pair.idx || foreignPair.key !== pair.key) {
+      throw new Error('IRAN and FOREIGN allocation pools disagree; reconcile existing GRE nodes before retrying');
+    }
+    return pair;
   }
 
   reserve(input, port, method, email) {
@@ -218,28 +256,53 @@ class RouteOrchestrator {
     const client = this.client(panel);
     const method = input.method || 'chacha20-ietf-poly1305';
     if (!['chacha20-ietf-poly1305', 'aes-256-gcm', 'aes-128-gcm'].includes(method)) throw new Error('unsupported Shadowsocks method');
-    const email = input.clientName || `gre-${input.name}`;
+    const email = String(input.clientName || `gre-${input.name}`).trim();
+    if (!email || email.length > 80) throw new Error('client name must be 1-80 characters');
     const recommendation = await this.recommend({ ...input, preferredPort: input.port });
     const port = recommendation.port;
     const routeId = this.reserve(input, port, method, email);
+    this.event(routeId, 'port_reserved', 'PASS', `TCP+UDP port ${port} reserved`);
     const inboundPassword = securePassword();
     const clientPassword = securePassword();
-    let greCreated = false;
+    let foreignCreated = false;
+    let iranCreated = false;
+    let peer = null;
     let inboundId = null;
     let hostGroupId = null;
     try {
       const [iranIp, foreignIp] = await Promise.all([this.publicIp(iran), this.publicIp(foreign)]);
+      this.event(routeId, 'public_ip', 'PASS', `IRAN ${iranIp}; FOREIGN ${foreignIp}`);
+      const connectivity = await Promise.all([
+        this.remote(iran, `ping -c 1 -W 3 ${shellQuote(foreignIp)}`, 10000),
+        this.remote(foreign, `ping -c 1 -W 3 ${shellQuote(iranIp)}`, 10000),
+      ]);
+      if (connectivity.some((result) => result.rc !== 0)) throw new Error('IRAN and FOREIGN servers are not reachable in both directions');
+      this.event(routeId, 'connectivity', 'PASS', 'Bidirectional public-IP reachability passed');
       const capability = await client.detectCapabilities();
-      const peer = peerName(input.name);
+      this.event(routeId, 'xui_capability', 'PASS', capability.mode);
+      const allocation = await this.pairing(iran, foreign);
+      peer = allocation.name || peerName(input.name);
+      const nodeCommand = actions.buildAction('node_add', {
+        name: peer, ip: iranIp, idx: allocation.idx, key: allocation.key, subnet_base: allocation.subnet_base,
+      });
+      const nodeResult = await this.remote(foreign, nodeCommand, 300000);
+      if (nodeResult.rc !== 0) throw new Error(`FOREIGN GRE setup failed: ${nodeResult.stderr || nodeResult.stdout || `rc=${nodeResult.rc}`}`);
+      foreignCreated = true;
+      this.event(routeId, 'foreign_node_add', 'PASS', `${foreign.name}: ${peer} (${allocation.subnet_base}/${allocation.idx})`);
       const greCommand = actions.buildAction('peer_add', {
         name: peer,
         foreign_ip: foreignIp,
+        iran_ip: iranIp,
+        idx: allocation.idx,
+        key: allocation.key,
+        subnet_base: allocation.subnet_base,
         tcp_ports: String(port),
         udp_ports: String(port),
       });
       const greResult = await this.remote(iran, greCommand, 300000);
       if (greResult.rc !== 0) throw new Error(`GRE setup failed: ${greResult.stderr || greResult.stdout || `rc=${greResult.rc}`}`);
-      greCreated = true;
+      iranCreated = true;
+      this.event(routeId, 'iran_peer_add', 'PASS', `${iran.name}: ${peer}; TCP+UDP ${port}`);
 
       const payload = inboundPayload({
         remark: `GRE-${input.name}`,
@@ -251,12 +314,16 @@ class RouteOrchestrator {
         externalProxy: capability.mode === 'external_proxy' ? { host: iranIp, port } : null,
       });
       inboundId = await client.addInbound(payload);
+      this.event(routeId, 'inbound_add', 'PASS', `Shadowsocks inbound ${inboundId}`);
       if (capability.mode === 'managed_hosts') {
         const response = await client.addHost({
           inboundIds: [inboundId], remark: `GRE-${input.name}`, hosts: [iranIp], port, security: 'same', tags: [],
         });
         const host = response && (response.obj || response.data || response);
         hostGroupId = host && (host.groupId || host.id) || null;
+        this.event(routeId, 'managed_host_add', 'PASS', `${iranIp}:${port}`);
+      } else {
+        this.event(routeId, 'external_proxy', 'PASS', `${iranIp}:${port}`);
       }
 
       const links = await client.clientLinks(email);
@@ -273,6 +340,7 @@ class RouteOrchestrator {
       if (!link) {
         throw new Error('generated Shadowsocks link does not match the IRAN endpoint, selected port, method, or client password');
       }
+      this.event(routeId, 'link_validate', 'PASS', 'Endpoint, method and client credential validated');
       const greHealth = await this.remote(iran, `ip link show ${shellQuote(`gre-${peer}`)} 2>/dev/null | grep -q '<[^>]*UP'`, 15000);
       if (greHealth.rc !== 0) throw new Error('GRE tunnel was created but its link is not UP');
       const runtime = await this.collectUsage(iran, foreign, client);
@@ -287,15 +355,24 @@ class RouteOrchestrator {
       const tcpProbe = await this.remote(foreign,
         `timeout 8 bash -c ${shellQuote(`exec 3<>/dev/tcp/${iranIp}/${port}`)}`, 15000);
       if (tcpProbe.rc !== 0) throw new Error(`end-to-end TCP probe to ${iranIp}:${port} failed`);
+      this.event(routeId, 'runtime_validation', 'PASS', 'GRE UP; TCP+UDP listeners; inbound; end-to-end TCP');
       const now = Date.now();
       this.db.transaction(() => {
         this.db.prepare(`UPDATE gre_routes SET inbound_id=?, capability=?, client_password_enc=?, share_link_enc=?, status='ACTIVE', updated_at=? WHERE id=?`)
           .run(inboundId, capability.mode, encrypt(this.cryptKey, clientPassword), encrypt(this.cryptKey, link), now, routeId);
         this.db.prepare(`UPDATE port_allocations SET status='ACTIVE', updated_at=? WHERE route_id=?`).run(now, routeId);
       })();
+      this.event(routeId, 'active', 'PASS', 'Route marked ACTIVE');
+      const outbound = {
+        tag: `gre-${String(input.name).toLowerCase()}`,
+        protocol: 'shadowsocks',
+        settings: { servers: [{ address: iranIp, port, method, password: clientPassword }] },
+      };
+      const qr_data_url = await QRCode.toDataURL(link, { errorCorrectionLevel: 'M', margin: 2, width: 320 });
       return {
         id: routeId, name: input.name, status: 'ACTIVE', port, capability: capability.mode,
-        inbound_id: inboundId, iran_endpoint: iranIp, link,
+        inbound_id: inboundId, iran_endpoint: iranIp, link, outbound, qr_data_url,
+        events: this.events(routeId),
         checks: { gre: 'UP', tcp: 'PASS', udp: 'LISTENING', xui: 'PASS', link: 'PASS' },
       };
     } catch (err) {
@@ -306,11 +383,19 @@ class RouteOrchestrator {
       if (inboundId) {
         try { await client.deleteInbound(inboundId); rollback.push('inbound'); } catch (rollbackErr) { rollback.push(`inbound failed: ${rollbackErr.message}`); }
       }
-      if (greCreated) {
+      if (iranCreated) {
         try {
-          const result = await this.remote(iran, actions.buildAction('peer_remove', { name: peerName(input.name) }), 300000);
-          rollback.push(result.rc === 0 ? 'gre' : `gre failed: ${result.stderr || result.stdout}`);
-        } catch (rollbackErr) { rollback.push(`gre failed: ${rollbackErr.message}`); }
+          const result = await this.remote(iran, actions.buildAction('peer_remove', { name: peer }), 300000);
+          rollback.push(result.rc === 0 ? 'iran peer' : `iran peer failed: ${result.stderr || result.stdout}`);
+          this.event(routeId, 'rollback_iran_peer', result.rc === 0 ? 'PASS' : 'FAIL', result.rc === 0 ? 'removed' : 'remove failed');
+        } catch (rollbackErr) { rollback.push(`iran peer failed: ${rollbackErr.message}`); }
+      }
+      if (foreignCreated) {
+        try {
+          const result = await this.remote(foreign, actions.buildAction('node_remove', { name: peer }), 300000);
+          rollback.push(result.rc === 0 ? 'foreign node' : `foreign node failed: ${result.stderr || result.stdout}`);
+          this.event(routeId, 'rollback_foreign_node', result.rc === 0 ? 'PASS' : 'FAIL', result.rc === 0 ? 'removed' : 'remove failed');
+        } catch (rollbackErr) { rollback.push(`foreign node failed: ${rollbackErr.message}`); }
       }
       const now = Date.now();
       this.db.transaction(() => {
@@ -318,7 +403,10 @@ class RouteOrchestrator {
           .run(inboundId, err.message, now, routeId);
         this.db.prepare(`UPDATE port_allocations SET status='RELEASED', updated_at=? WHERE route_id=?`).run(now, routeId);
       })();
+      this.event(routeId, 'failed', 'FAIL', err.message);
       err.rollback = rollback;
+      err.routeId = routeId;
+      err.events = this.events(routeId);
       throw err;
     }
   }

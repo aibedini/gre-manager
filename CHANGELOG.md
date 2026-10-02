@@ -4,6 +4,22 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.0] - 2026-10-02
+
+### Added
+
+- Auto routes now load existing client names from 3x-ui and support creating a
+  new client name directly from the route workflow.
+- Port recommendation now runs automatically and reports every occupied port
+  found in the selected range across Linux, firewall, Docker, 3x-ui and the
+  persistent GRE allocation registry.
+- Route creation now provisions the matching FOREIGN node and IRAN peer with
+  one collision-checked GRE identity, and rolls both sides back on failure.
+- Persistent secret-safe route event logs are returned to the web UI for every
+  provisioning and rollback stage.
+- Successful routes now provide a Shadowsocks QR code, share link and complete
+  Xray outbound JSON.
+
 ## [2.9.2] - 2026-10-02
 
 ### Fixed

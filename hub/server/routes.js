@@ -560,6 +560,12 @@ function createRouter(db, cryptKey, dataDir) {
     }
   });
 
+  authed.get('/xui-panels/:id/clients', wrap(async (req, res) => {
+    const panel = db.prepare('SELECT * FROM xui_panels WHERE id = ?').get(req.params.id);
+    if (!panel) return res.status(404).json({ error: 'not found' });
+    res.json(await routeOrchestrator.client(panel).listClients());
+  }));
+
   authed.post('/gre-routes/recommend-port', wrap(async (req, res) => {
     const result = await routeOrchestrator.recommend({
       iranServerId: Number(req.body && req.body.iran_server_id),
@@ -574,6 +580,12 @@ function createRouter(db, cryptKey, dataDir) {
 
   authed.get('/gre-routes', (req, res) => {
     res.json(routeOrchestrator.listRoutes(req.query.reveal === '1'));
+  });
+
+  authed.get('/gre-routes/:id/events', (req, res) => {
+    const route = db.prepare('SELECT id FROM gre_routes WHERE id=?').get(req.params.id);
+    if (!route) return res.status(404).json({ error: 'not found' });
+    res.json(routeOrchestrator.events(route.id));
   });
 
   authed.post('/gre-routes', wrap(async (req, res) => {
@@ -596,7 +608,7 @@ function createRouter(db, cryptKey, dataDir) {
       res.status(201).json(result);
     } catch (err) {
       auditEvent(null, 'hub', 'gre_route_create', { name: body.name, rollback: err.rollback || [] }, 1, err.message);
-      res.status(409).json({ error: err.message, rollback: err.rollback || [] });
+      res.status(409).json({ error: err.message, route_id: err.routeId || null, rollback: err.rollback || [], events: err.events || [] });
     }
   }));
 

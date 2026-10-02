@@ -131,6 +131,28 @@ class XuiClient {
     return Array.isArray(data) ? data : (data && Array.isArray(data.obj) ? data.obj : []);
   }
 
+  async listClients() {
+    const inbounds = await this.listInbounds();
+    const seen = new Set();
+    const clients = [];
+    for (const inbound of inbounds) {
+      let settings = inbound && inbound.settings;
+      try { if (typeof settings === 'string') settings = JSON.parse(settings); } catch { settings = null; }
+      for (const client of (settings && Array.isArray(settings.clients) ? settings.clients : [])) {
+        const email = String(client && (client.email || client.name) || '').trim();
+        if (!email || seen.has(email)) continue;
+        seen.add(email);
+        clients.push({
+          email,
+          inbound_id: Number(inbound.id) || null,
+          inbound_remark: String(inbound.remark || ''),
+          protocol: String(inbound.protocol || ''),
+        });
+      }
+    }
+    return clients;
+  }
+
   async addInbound(payload) {
     const data = await this.request('/panel/api/inbounds/add', { method: 'POST', body: payload });
     const obj = data && (data.obj || data.data || data);

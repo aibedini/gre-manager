@@ -109,11 +109,20 @@ function openDb(dataDir) {
       created_at        INTEGER NOT NULL,
       updated_at        INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS route_events (
+      id         INTEGER PRIMARY KEY AUTOINCREMENT,
+      route_id   INTEGER NOT NULL REFERENCES gre_routes(id) ON DELETE CASCADE,
+      stage      TEXT NOT NULL,
+      status     TEXT NOT NULL,
+      detail     TEXT NOT NULL DEFAULT '',
+      created_at INTEGER NOT NULL
+    );
     CREATE INDEX IF NOT EXISTS idx_action_log_created ON action_log(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_connectivity_iran ON connectivity_checks(iran_server_id);
     CREATE INDEX IF NOT EXISTS idx_connectivity_foreign ON connectivity_checks(foreign_server_id);
     CREATE INDEX IF NOT EXISTS idx_routes_pair ON gre_routes(iran_server_id, foreign_server_id);
     CREATE INDEX IF NOT EXISTS idx_ports_status ON port_allocations(status);
+    CREATE INDEX IF NOT EXISTS idx_route_events_route ON route_events(route_id, id);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_ports_live_iran
       ON port_allocations(iran_server_id, port) WHERE status != 'RELEASED';
     CREATE UNIQUE INDEX IF NOT EXISTS idx_ports_live_foreign
