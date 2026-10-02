@@ -1,13 +1,19 @@
-# gre-manager v2.12.0 — deployment & real-panel verification runbook
+# gre-manager v2.12.1 — deployment & real-panel verification runbook
 
-This is the exact sequence for PHASE 0/1/2/19 of the v2.12.0 brief: prove what is
+This is the exact sequence for PHASE 0/1/2/19 of the v2.12.1 brief: prove what is
 running now, deploy the release, and reproduce the `navid` flow against a real
 3x-ui panel. Run it on the machine that hosts the gre-hub dashboard and keep the
 output of each step.
 
-Set these once:
+**Install v2.12.1, not v2.12.1.** The v2.12.1 `gre-hub.tar.gz` shipped without
+`hub/.npmrc`, so on a host whose npm refuses dependency install scripts by
+default the hub installed "successfully" and then could not start (no native
+`better-sqlite3` binding). v2.12.1 contains every v2.12.1 change plus that fix.
+
+Set these once (`REL` is used by the download commands below):
 
 ```bash
+REL=v2.12.1
 HUB_DIR=/opt/gre-hub
 HUB_URL=http://127.0.0.1:3939          # change if PORT was overridden
 PANEL=NetlenTRNew1                     # the saved 3x-ui panel to test with
@@ -37,8 +43,8 @@ sha256sum $HUB_DIR/public/app.js $HUB_DIR/server/xui.js \
           $HUB_DIR/server/db.js $HUB_DIR/server/index.js
 
 TMP=$(mktemp -d); cd "$TMP"
-curl -fsSLO https://github.com/aibedini/gre-manager/releases/download/v2.12.0/gre-hub.tar.gz
-curl -fsSLO https://github.com/aibedini/gre-manager/releases/download/v2.12.0/gre-hub.tar.gz.sha256
+curl -fsSLO https://github.com/aibedini/gre-manager/releases/download/$REL/gre-hub.tar.gz
+curl -fsSLO https://github.com/aibedini/gre-manager/releases/download/$REL/gre-hub.tar.gz.sha256
 sha256sum -c gre-hub.tar.gz.sha256
 tar xzf gre-hub.tar.gz
 cat hub/VERSION hub/build-info.json
@@ -46,7 +52,7 @@ cat hub/VERSION hub/build-info.json
 for f in public/app.js server/xui.js server/route-orchestrator.js server/routes.js server/db.js server/index.js; do
   d=$(sha256sum "$HUB_DIR/$f" 2>/dev/null | cut -c1-12)
   r=$(sha256sum "$TMP/hub/$f" 2>/dev/null | cut -c1-12)
-  printf '%-32s deployed=%s  v2.12.0=%s  %s\n' "$f" "${d:-missing}" "${r:-missing}" \
+  printf '%-32s deployed=%s  v2.12.1=%s  %s\n' "$f" "${d:-missing}" "${r:-missing}" \
     "$([ "$d" = "$r" ] && echo MATCH || echo DIFFERENT)"
 done
 ```
@@ -70,7 +76,7 @@ released code.
 
 ---
 
-## PHASE 1 — deploy v2.12.0 and prove it
+## PHASE 1 — deploy v2.12.1 and prove it
 
 Back up first. Never delete `hub.db`, `master.key` or the SSH keys:
 
@@ -95,9 +101,9 @@ and then use it:
 
 ```bash
 sudo curl -fsSL -o /usr/local/sbin/gre \
-  https://github.com/aibedini/gre-manager/releases/download/v2.12.0/gre
+  https://github.com/aibedini/gre-manager/releases/download/$REL/gre
 curl -fsSL -o /tmp/gre.sha256 \
-  https://github.com/aibedini/gre-manager/releases/download/v2.12.0/gre.sha256
+  https://github.com/aibedini/gre-manager/releases/download/$REL/gre.sha256
 # verify /usr/local/sbin/gre against it (the checksum line names `gre`)
 (cd /usr/local/sbin && sudo sha256sum -c /tmp/gre.sha256)
 sudo chmod +x /usr/local/sbin/gre
@@ -114,17 +120,17 @@ cat $HUB_DIR/VERSION; cat $HUB_DIR/build-info.json
 sudo gre hub status
 ```
 
-Expected journal line:
+Expected journal line (the hash is the release commit — take it from
+`hub/build-info.json` in the tarball you downloaded, or from the release page):
 
 ```
-gre-hub build: v2.12.0 · fd475ca · version source: build-info.json
+gre-hub build: v2.12.1 · <shortsha> · version source: build-info.json
 ```
 
-Expected `/api/meta`: `"version": "2.12.0"`, `"commit":
-"fd475ca294c833eac926b99e01e766f5e09561ad"`, `"schemaVersion": 2`,
-`"mixed": false`.
+Expected `/api/meta`: `"version": "2.12.1"`, the same `"commit"` as
+`hub/build-info.json`, `"schemaVersion": 2`, `"mixed": false`.
 
-The UI top bar must read `v2.12.0 · fd475ca` after a hard refresh, and
+The UI top bar must read `v2.12.1 · <shortsha>` after a hard refresh, and
 Settings → Application must show the same values. If the service does not come
 up, the updater has already rolled the previous build back — capture
 `journalctl -u gre-hub -n 200 --no-pager` before retrying.
@@ -209,7 +215,7 @@ Never delete a production route for testing.
 
 ## What to send back
 
-1. The Phase 0 comparison table (deployed vs. v2.12.0 hashes) and `/api/meta`.
+1. The Phase 0 comparison table (deployed vs. v2.12.1 hashes) and `/api/meta`.
 2. `systemctl is-active gre-hub` plus the first 30 journal lines.
 3. The Phase 2c timeline text, including any FAIL row.
 4. `GET /panel/api/clients/get/navid` before and after the test-route deletion.

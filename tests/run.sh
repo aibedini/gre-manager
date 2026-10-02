@@ -990,8 +990,12 @@ mkdir -p "$HUB_STUBS2"
 
 # The new CLI fixture is the real script with the bumped version, so the whole
 # upgrade path is exercised. Its true digest is what the stub publishes.
+# Derive the pinned version from the SUT instead of hardcoding it: a version
+# bump must not silently turn this fixture into a no-op.
 NEW_CLI="$R/update-fixtures-new"
-sed "s|^VERSION=\"2.12.0\"|VERSION=\"2.13.0\"|" "$SUT" > "$NEW_CLI"
+SUT_VERSION="$(grep -m1 -E '^VERSION=' "$SUT" | cut -d'"' -f2)"
+sed "s|^VERSION=\"${SUT_VERSION}\"|VERSION=\"2.13.0\"|" "$SUT" > "$NEW_CLI"
+grep -q '^VERSION="2.13.0"' "$NEW_CLI" || bad "could not bump the CLI fixture version"
 chmod +x "$NEW_CLI"
 mkdir -p "$R/update-fixtures"
 cp "$NEW_CLI" "$R/update-fixtures/newer"

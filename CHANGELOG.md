@@ -4,7 +4,41 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.1] - 2026-10-02
+
+### Fixed
+
+- **A fresh v2.12.0 hub installation could not start.** `better-sqlite3` is a
+  native module, and recent npm versions (11+) refuse to run dependency install
+  scripts unless the package explicitly allows them — silently. `npm ci`
+  reported success, installed no compiled binding, and the hub then exited at
+  startup with `Could not locate the bindings file`, so its database could never
+  be opened. The v2.12.0 `gre-hub.tar.gz` shipped no install policy at all.
+  The package now ships `hub/.npmrc` with `allow-scripts=true`, which is the
+  documented npm setting for this.
+- The installer no longer passes `--allow-scripts` on the npm command line: npm
+  11 rejects it for project-scoped installs with `EALLOWSCRIPTS`, which would
+  have converted a silent failure into a hard one.
+
+### Changed
+
+- `hub_npm_ci` warns when the installed package has no `.npmrc` (so an older
+  package cannot fail silently), installs a build toolchain and retries, and as
+  a last resort installs with `--ignore-scripts` and then rebuilds the native
+  modules explicitly instead of leaving the hub unable to open its database.
+- The release job now asserts that `gre-hub.tar.gz` contains `hub/.npmrc` with
+  `allow-scripts=true`, plus `hub/server/version.js`, `routes.js`, `db.js` and
+  the public assets, so an uninstallable package can never be published again.
+- Regression tests on both layers: `scripts/version-test.js` checks the packaged
+  file and that no `.gitignore` excludes it, and `tests/run.sh` builds a tarball
+  the way the release job does and asserts its contents.
+
 ## [2.12.0] - 2026-10-02
+
+> **Do not install this release's `gre-hub.tar.gz`.** It ships without
+> `hub/.npmrc`, so on a host whose npm refuses dependency install scripts by
+> default the hub installs "successfully" and then cannot start. Use v2.12.1,
+> which contains every change below plus the fix.
 
 ### Fixed
 
