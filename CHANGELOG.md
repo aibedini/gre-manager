@@ -4,6 +4,69 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.0] - 2026-10-02
+
+### Fixed
+
+- Auto routes no longer re-creates a 3x-ui client the panel already owns. The
+  route form now sends an explicit `client_mode` (`existing` / `new`) instead of
+  collapsing both cases into one `client_name` string, and an existing
+  first-class client is **attached** to the new inbound instead of being embedded
+  in `settings.clients`, which is what produced `Duplicate email: navid` on
+  3x-ui v3.1.0 and newer.
+- 3x-ui client-model detection is a capability probe, never a version guess:
+  `GET /panel/api/clients/list` decides `first_class` (HTTP 200) versus
+  `embedded` (404/405). 3x-ui v3.0.2 still uses the legacy inbound-centric
+  model, so a `major >= 3` test would be wrong; 401/403, 5xx and timeouts are
+  surfaced as auth/panel failures instead of silently classifying the panel as
+  legacy. Host mode (`managed_hosts` / `external_proxy`) remains an independent
+  axis and is stored and logged separately as `client=…; hosts=…`.
+- The share link for a reused client is taken from the panel-issued `ss://` link
+  and validated against the expected endpoint, port and cipher, so the real
+  existing credential is preserved. A credential is only ever rebuilt locally
+  for a client that this route itself created; otherwise provisioning fails
+  clearly instead of returning a link that cannot authenticate.
+- Rollback is ownership-scoped: a pre-existing client is detached from the newly
+  created inbound only, a route-created client is deleted explicitly, and an
+  existing client is never deleted globally. One failing rollback stage no
+  longer prevents the remaining cleanup stages from running.
+
+### Added
+
+- `POST /api/gre-routes` is now an async job: it validates the request, runs the
+  read-only client preflight, reserves the port and the route row, then answers
+  **202** with `{ route_id, status: "RESERVED" }` while provisioning continues in
+  the hub. Client-selection mistakes and capacity problems are therefore
+  rejected before any IRAN/FOREIGN mutation.
+- Live provisioning timeline in the web UI: the create dialog turns into a
+  step-by-step log streamed from `GET /api/gre-routes/:id/events?after_id=…`, with
+  per-stage rows (`port_reserved`, `client_model_detected`, `client_preflight`,
+  `inbound_add`, `client_attach`/`client_create`, `link_validate`,
+  `runtime_validation`, `active`, …), PASS/INFO/FAIL/rollback styling, a failure
+  summary above the log and no duplicate rows.
+- `GET /api/gre-routes/:id` returns the safe status of a single route, and the
+  events endpoint supports `after_id` for incremental reads plus `wait=1` for a
+  long poll. Every route row now has a **Timeline** action that reopens the
+  complete persistent log, including after a browser refresh or a hub restart.
+- Interrupted provisioning is now surfaced instead of ignored: on startup a route
+  that is still `RESERVED` past the provisioning window is marked `STALE` with an
+  explanatory event. Remote state is never destroyed automatically.
+- Optional test-transport hooks (`HUB_TEST_FETCH_MODULE`, `HUB_TEST_SSH_MODULE`)
+  so the real HTTP surface, router and orchestrator can be exercised offline, and
+  a `node:sqlite` fallback so the hub's own test suite also runs where the native
+  `better-sqlite3` build is unavailable.
+
+### Changed
+
+- `gre_routes` gained `client_mode` and `client_model` columns. Existing v2.10.0
+  databases are migrated in place with `ALTER TABLE … CHECK (…)`, keeping all
+  routes, allocations and event history; legacy rows keep NULL and behave as
+  before.
+- `inboundPayload()` no longer invents a client: it accepts an explicit `clients`
+  array, so the data-model decision lives in one place in the orchestrator
+  instead of leaking into the generic inbound builder.
+- CI now syntax-checks the hub scripts and runs the full hub test suite.
+
 ## [2.10.0] - 2026-10-02
 
 ### Added

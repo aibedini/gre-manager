@@ -23,9 +23,11 @@ const state = {
   autoRefreshTimer: null,
   autoRefreshRunning: false,
   lastRefreshAt: null,
+  routesPoll: null,   // live provisioning timeline poller
+  routesPollGeneration: 0, // invalidates an in-flight poll after the modal closes
 };
 
-async function api(path, { method = 'GET', body } = {}) {
+async function api(path, { method = 'GET', body, ok = null } = {}) {
   const headers = {};
   if (body) headers['Content-Type'] = 'application/json';
   if (method !== 'GET' && state.csrf) headers['x-csrf-token'] = state.csrf;
@@ -40,7 +42,8 @@ async function api(path, { method = 'GET', body } = {}) {
     showAuth(false);
     throw new Error('not authenticated');
   }
-  if (!res.ok) {
+  const accepted = ok && ok.includes(res.status);
+  if (!res.ok && !accepted) {
     const err = new Error((data && data.error) || `request failed (${res.status})`);
     err.status = res.status;
     err.data = data;
@@ -1271,13 +1274,19 @@ async function loadRoutes() {
             <td><strong>${esc(r.name)}</strong><div class="muted">${esc(r.method)}</div></td>
             <td>${esc(r.iran_host)}:${esc(r.port)}<div class="muted">TCP + UDP</div></td>
             <td>${esc(r.foreign_name)}</td>
-            <td>${esc(r.panel_name)}</td>
+            <td>${esc(r.panel_name)}<div class="muted">${esc(clientModelLabel(r.client_model))}</div></td>
             <td>${esc(r.capability || 'pending')}</td>
-            <td><span class="badge ${r.status === 'ACTIVE' ? 'green' : r.status === 'FAILED' ? 'red' : 'gray'}">${esc(r.status)}</span>${r.last_error ? `<div class="muted">${esc(r.last_error)}</div>` : ''}</td>
+            <td><span class="badge ${routeStatusClass(r.status)}">${esc(r.status)}</span>${r.last_error ? `<div class="muted">${esc(r.last_error)}</div>` : ''}</td>
             <td>${timeAgo(r.created_at)}</td>
-            <td><button class="btn btn-ghost btn-sm btn-reconcile" data-id="${r.id}">Reconcile</button></td>
+            <td class="row-actions">
+              <button class="btn btn-ghost btn-sm btn-timeline" data-id="${r.id}" data-name="${esc(r.name)}">Timeline</button>
+              <button class="btn btn-ghost btn-sm btn-reconcile" data-id="${r.id}">Reconcile</button>
+            </td>
           </tr>`).join('')}</tbody>
       </table>`;
+    $$('.btn-timeline', wrap).forEach((btn) => btn.addEventListener('click', () => {
+      openRouteTimeline({ id: Number(btn.dataset.id), name: btn.dataset.name });
+    }));
     $$('.btn-reconcile', wrap).forEach((btn) => btn.addEventListener('click', async () => {
       btn.disabled = true; btn.textContent = 'Checking…';
       try {
@@ -1322,14 +1331,21 @@ $('#btn-add-panel').addEventListener('click', () => {
     e.preventDefault();
     const form = e.target;
     try {
-      await api('/api/xui-panels', { method: 'POST', body: {
+      const saved = await api('/api/xui-panels', { method: 'POST', body: {
         name: form.name.value.trim(), base_url: form.base_url.value.trim(),
         auth_type: form.auth_type.value, username: form.username.value.trim(),
         password: form.password.value, token: form.token.value,
       } });
       closeModal();
       await loadRoutes();
-      toast('3x-ui panel saved');
+      // The detected client model is the thing users actually need to know
+      // about their panel; surface it without making them read API versions.
+      let model = null;
+      try {
+        const probe = await api(`/api/xui-panels/${saved.id}/clients`);
+        model = probe && probe.client_model;
+      } catch { /* detection is best effort here */ }
+      toast(`3x-ui panel saved${model ? ` — ${clientModelLabel(model)}` : ''}`);
     } catch (err) { $('#panel-error').textContent = err.message; }
   });
 });
@@ -1347,14 +1363,20 @@ $('#btn-add-route').addEventListener('click', async () => {
   const options = (rows) => rows.map((x) => `<option value="${x.id}">${esc(x.name)} — ${esc(x.host)}</option>`).join('');
   openModal(`
     <h2>Create automatic route</h2>
-    <p class="sub">The selected port is checked against listeners, nftables, iptables, Docker, 3x-ui and the permanent registry before it is reserved.</p>
+    <p class="sub">The selected port is checked against listeners, nftables, iptables, Docker, 3x-ui and the permanent registry before it is reserved. Nothing is changed on either server until the client selection has been validated.</p>
     <form id="route-form">
       <div class="field"><label>Route name</label><input name="name" required maxlength="40" placeholder="IR05-DE02" /></div>
       <div class="field"><label>IRAN server</label><select name="iran_server_id">${options(iranServers)}</select></div>
       <div class="field"><label>FOREIGN server</label><select name="foreign_server_id">${options(foreignServers)}</select></div>
       <div class="field"><label>3x-ui panel</label><select name="panel_id">${state.panels.map((p) => `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></div>
-      <div class="field"><label>3x-ui client</label><select name="client_choice"><option value="__new__">Add new client...</option></select><div class="hint" id="client-load">Loading clients from 3x-ui...</div></div>
-      <div class="field" id="new-client-wrap"><label>New client name</label><input name="client_name" required maxlength="80" placeholder="navid" /></div>
+      <div class="field">
+        <label>3x-ui client</label>
+        <select name="client_choice"><option value="__new__">Add new client...</option></select>
+        <div class="hint" id="client-model">Detecting 3x-ui client model…</div>
+        <div class="hint" id="client-choice-hint"></div>
+        <div class="hint" id="client-load">Loading clients from 3x-ui...</div>
+      </div>
+      <div class="field" id="new-client-wrap"><label>New client name</label><input name="client_name" required maxlength="80" placeholder="navid" /><div class="hint">Creates a new 3x-ui client for this route.</div></div>
       <div class="field"><label>Preferred port (optional)</label><input name="port" type="number" min="1024" max="65535" placeholder="auto: 3000–3999" /></div>
       <div id="port-result" class="hint">A safe TCP+UDP port will be selected before any changes are made.</div>
       <div class="form-error" id="route-error"></div>
@@ -1362,27 +1384,57 @@ $('#btn-add-route').addEventListener('click', async () => {
     </form>`);
   $('.modal-cancel').addEventListener('click', closeModal);
   const form = $('#route-form');
+  let clientModel = null;
+  const clientHint = () => {
+    const isNew = form.client_choice.value === '__new__';
+    if (isNew) return 'Creates a new 3x-ui client for this route.';
+    return clientModel === 'embedded'
+      ? 'Client credentials are stored inside each inbound; the real credential of the selected client is reused.'
+      : 'Will be attached to the new inbound; the client will not be recreated.';
+  };
   const syncClient = () => {
     const isNew = form.client_choice.value === '__new__';
     $('#new-client-wrap').classList.toggle('hidden', !isNew);
     form.client_name.required = isNew;
+    const hint = $('#new-client-wrap .hint');
+    if (hint) hint.textContent = clientHint();
+    // Helper copy for the currently selected intent, shown next to the select.
+    const fieldHint = $('#client-choice-hint');
+    if (fieldHint) fieldHint.textContent = isNew ? '' : clientHint();
+    const model = $('#client-model');
+    if (clientModel === 'first_class') model.textContent = '3x-ui client model: First-class / multi-inbound';
+    else if (clientModel === 'embedded') model.textContent = '3x-ui client model: Legacy embedded';
+    else model.textContent = 'Detecting 3x-ui client model…';
   };
   const loadClients = async () => {
     $('#client-load').textContent = 'Loading clients from 3x-ui...';
     try {
-      const clients = await api(`/api/xui-panels/${form.panel_id.value}/clients`);
-      form.client_choice.innerHTML = clients.map((client) => `<option value="${esc(client.email)}">${esc(client.email)} - ${esc(client.inbound_remark || 'inbound')}</option>`).join('') + '<option value="__new__">Add new client...</option>';
+      const payload = await api(`/api/xui-panels/${form.panel_id.value}/clients`);
+      const clients = Array.isArray(payload) ? payload : (payload.clients || []);
+      clientModel = Array.isArray(payload) ? (clients[0] && clients[0].model) || null : payload.client_model || null;
+      form.client_choice.innerHTML = clients.map((client) => {
+        const where = client.inbound_remark || (Array.isArray(client.inbound_ids) && client.inbound_ids.length
+          ? `inbound ${client.inbound_ids.join(', ')}`
+          : 'not attached to any inbound');
+        return `<option value="${esc(client.email)}">${esc(client.email)} - ${esc(where)}</option>`;
+      }).join('') + '<option value="__new__">Add new client...</option>';
       $('#client-load').textContent = clients.length ? `${clients.length} client(s) found` : 'No client found; create a new one.';
       syncClient();
     } catch (err) { $('#client-load').textContent = err.message; }
   };
-  const body = () => ({
-    name: form.name.value.trim(), iran_server_id: Number(form.iran_server_id.value),
-    foreign_server_id: Number(form.foreign_server_id.value), panel_id: Number(form.panel_id.value),
-    client_name: form.client_choice.value === '__new__' ? form.client_name.value.trim() : form.client_choice.value,
-    port: form.port.value ? Number(form.port.value) : undefined,
-    range_start: 3000, range_end: 3999,
-  });
+  const body = () => {
+    const isNew = form.client_choice.value === '__new__';
+    return {
+      name: form.name.value.trim(),
+      iran_server_id: Number(form.iran_server_id.value),
+      foreign_server_id: Number(form.foreign_server_id.value),
+      panel_id: Number(form.panel_id.value),
+      client_mode: isNew ? 'new' : 'existing',
+      client_email: isNew ? form.client_name.value.trim() : form.client_choice.value,
+      port: form.port.value ? Number(form.port.value) : undefined,
+      range_start: 3000, range_end: 3999,
+    };
+  };
   const checkPort = async () => {
     const btn = $('#btn-check-port'); btn.disabled = true; btn.textContent = 'Checking…';
     try {
@@ -1395,7 +1447,7 @@ $('#btn-add-route').addEventListener('click', async () => {
   };
   $('#btn-check-port').addEventListener('click', checkPort);
   form.client_choice.addEventListener('change', syncClient);
-  form.panel_id.addEventListener('change', async () => { await loadClients(); await checkPort(); });
+  form.panel_id.addEventListener('change', async () => { clientModel = null; await loadClients(); await checkPort(); });
   form.iran_server_id.addEventListener('change', checkPort);
   form.foreign_server_id.addEventListener('change', checkPort);
   await loadClients();
@@ -1404,25 +1456,246 @@ $('#btn-add-route').addEventListener('click', async () => {
     e.preventDefault();
     const btn = $('#btn-create-route'); btn.disabled = true; btn.textContent = 'Creating…';
     $('#route-error').textContent = '';
+    const payload = body();
     try {
-      const result = await api('/api/gre-routes', { method: 'POST', body: body() });
-      closeModal(); await loadRoutes();
-      const events = (result.events || []).map((event) => `<div><span class="badge ${event.status === 'PASS' ? 'green' : 'red'}">${esc(event.status)}</span> <strong>${esc(event.stage)}</strong> - ${esc(event.detail)}</div>`).join('');
-      openModal(`<h2>Route active</h2><p class="sub">${esc(result.name)} - ${esc(result.capability)}</p>
-        <div style="text-align:center"><img src="${esc(result.qr_data_url)}" alt="Shadowsocks QR code" width="260" height="260"></div>
-        <h3>Shadowsocks link</h3><div class="output-pane" style="max-height:none; user-select:all">${esc(result.link)}</div>
-        <h3>Xray outbound JSON</h3><pre class="output-pane" style="max-height:none; user-select:all">${esc(JSON.stringify(result.outbound, null, 2))}</pre>
-        <h3>Automation log</h3><div class="output-pane" style="max-height:320px">${events}</div>
-        <div class="foot"><button class="btn modal-cancel">Done</button></div>`);
-      $('.modal-cancel').addEventListener('click', closeModal);
+      // 202 + route_id comes back as soon as validation, client preflight,
+      // port reservation and the route row are done. The rest runs in the
+      // hub and is streamed through route_events.
+      const created = await api('/api/gre-routes', { method: 'POST', body: payload, ok: [202] });
+      loadRoutes();
+      startProvisioningTimeline(created);
     } catch (err) {
-      const rollback = err.data && err.data.rollback && err.data.rollback.length ? ` Rollback: ${err.data.rollback.join(', ')}` : '';
-      const events = err.data && err.data.events ? err.data.events.map((event) => `${event.status} ${event.stage}: ${event.detail}`).join('\n') : '';
-      $('#route-error').textContent = err.message + rollback + (events ? `\n${events}` : '');
+      $('#route-error').textContent = err.message;
       btn.disabled = false; btn.textContent = 'Create route';
     }
   });
 });
+
+// ---------- live provisioning timeline ------------------------------------
+
+const TERMINAL_STATUSES = ['ACTIVE', 'FAILED', 'STALE', 'NEEDS_REVIEW'];
+const POLL_INTERVAL_MS = 900;
+
+function routeStatusClass(status) {
+  if (status === 'ACTIVE') return 'green';
+  if (status === 'FAILED') return 'red';
+  if (status === 'RESERVED') return 'blue';
+  if (status === 'STALE' || status === 'NEEDS_REVIEW') return 'yellow';
+  return 'gray';
+}
+
+function clientModelLabel(model) {
+  if (model === 'first_class') return 'client model: first-class';
+  if (model === 'embedded') return 'client model: legacy embedded';
+  return 'client model: unknown';
+}
+
+function eventKind(event) {
+  if (event.status === 'FAIL') return { cls: 'red', icon: '✗', color: 'var(--red-fg)' };
+  if (event.status === 'INFO' || event.status === 'RUNNING') return { cls: 'blue', icon: '›', color: 'var(--blue-fg)' };
+  if (event.status === 'WARN') return { cls: 'yellow', icon: '!', color: 'var(--yellow-fg)' };
+  if (/^rollback_/.test(String(event.stage || ''))) return { cls: 'yellow', icon: '↩', color: 'var(--yellow-fg)' };
+  return { cls: 'green', icon: '✓', color: 'var(--green-fg)' };
+}
+
+function eventRowHtml(event) {
+  const kind = eventKind(event);
+  const when = new Date(Number(event.created_at) || Date.now()).toLocaleTimeString();
+  return `<div class="tl-row ${kind.cls}" data-event-id="${Number(event.id)}">
+    <span class="tl-time">${esc(when)}</span>
+    <span class="tl-icon" style="color:${kind.color}">${kind.icon}</span>
+    <span class="tl-stage"><strong>${esc(event.stage)}</strong><span class="tl-detail">${esc(event.detail || '')}</span></span>
+  </div>`;
+}
+
+function timelineShellHtml(header) {
+  return `<h2 id="tl-title">Creating route</h2>
+    <div class="tl-head">${header}</div>
+    <div class="tl-summary hidden" id="tl-summary"></div>
+    <div class="tl-scroll" id="tl-scroll"><div class="tl-empty">Waiting for the first provisioning step…</div></div>
+    <div class="tl-result hidden" id="tl-result"></div>
+    <div class="foot">
+      <button class="btn btn-ghost" id="tl-refresh">Refresh log</button>
+      <button class="btn modal-cancel">Close</button>
+    </div>`;
+}
+
+function headerFor(route) {
+  return `
+    <span class="tl-chip"><strong>${esc(route.name || '(route)')}</strong></span>
+    <span class="tl-chip">port ${esc(route.port ?? '—')}</span>
+    <span class="tl-chip">${esc(route.client_mode === 'existing' ? `existing client ${route.client_email || ''}` : `new client ${route.client_email || ''}`)}</span>
+    <span class="tl-chip">${esc(clientModelLabel(route.client_model))}</span>
+    <span class="badge gray" id="tl-status">${esc(route.status || 'RESERVED')}</span>`;
+}
+
+function renderTimelineEvents(routeId, events) {
+  const scroll = $('#tl-scroll');
+  if (!scroll) return 0;
+  const empty = $('.tl-empty', scroll);
+  if (empty) empty.remove();
+  let lastId = 0;
+  for (const event of events) {
+    const id = Number(event.id) || 0;
+    if (id && $(`.tl-row[data-event-id="${id}"]`, scroll)) { lastId = Math.max(lastId, id); continue; }
+    scroll.insertAdjacentHTML('beforeend', eventRowHtml(event));
+    lastId = Math.max(lastId, id);
+  }
+  return lastId;
+}
+
+function timelineNearBottom() {
+  const scroll = $('#tl-scroll');
+  if (!scroll) return true;
+  return scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 60;
+}
+
+function stopProvisioningTimeline() {
+  // Bumping the generation also neutralises a poll request that is already in
+  // flight, so closing the modal cannot leave a polling loop behind.
+  state.routesPollGeneration += 1;
+  if (state.routesPoll) {
+    clearTimeout(state.routesPoll.timer);
+    state.routesPoll = null;
+  }
+}
+
+function renderFailureSummary(route) {
+  const box = $('#tl-summary');
+  if (!box) return;
+  const text = route.last_error || 'Provisioning failed. See the timeline below for the exact step.';
+  box.className = 'tl-summary';
+  box.innerHTML = `<span class="badge red">FAILED</span> <span>${esc(text)}</span>`;
+}
+
+async function openRouteTimeline(route) {
+  stopProvisioningTimeline();
+  const detail = await api(`/api/gre-routes/${route.id}`).catch(() => route);
+  const merged = { ...route, ...detail };
+  openModal(timelineShellHtml(headerFor(merged)));
+  $('.modal-cancel').addEventListener('click', () => { stopProvisioningTimeline(); closeModal(); });
+  $('#tl-refresh').addEventListener('click', () => refreshTimeline(merged.id));
+  await refreshTimeline(merged.id, merged);
+}
+
+async function refreshTimeline(routeId, known = null) {
+  try {
+    const [events, route] = await Promise.all([
+      api(`/api/gre-routes/${routeId}/events`),
+      known ? Promise.resolve(known) : api(`/api/gre-routes/${routeId}`),
+    ]);
+    renderTimelineEvents(routeId, events);
+    const badge = $('#tl-status');
+    if (badge && route && route.status) {
+      badge.textContent = route.status;
+      badge.className = `badge ${routeStatusClass(route.status)}`;
+    }
+    if (route && route.status === 'FAILED') renderFailureSummary(route);
+    return route;
+  } catch (err) {
+    toast(err.message, true);
+    return null;
+  }
+}
+
+function startProvisioningTimeline(created) {
+  stopProvisioningTimeline();
+  const initial = {
+    id: created.route_id,
+    name: created.name,
+    port: created.port,
+    status: created.status || 'RESERVED',
+    client_email: created.client_email,
+    client_mode: created.client_mode,
+    client_model: created.client_model,
+    last_error: null,
+  };
+  openModal(timelineShellHtml(headerFor(initial)));
+  $('.modal-cancel').addEventListener('click', () => { stopProvisioningTimeline(); closeModal(); });
+  $('#tl-refresh').addEventListener('click', () => refreshTimeline(created.route_id));
+
+  let lastEventId = 0;
+  let finished = false;
+  const generation = state.routesPollGeneration;
+  const stillCurrent = () => !finished && state.routesPollGeneration === generation;
+  const finish = (route, result) => {
+    finished = true;
+    stopProvisioningTimeline();
+    const badge = $('#tl-status');
+    if (badge) { badge.textContent = route.status; badge.className = `badge ${routeStatusClass(route.status)}`; }
+    const box = $('#tl-result');
+    if (!box) return;
+    if (route.status === 'ACTIVE' && result && result.link) {
+      box.className = 'tl-result';
+      const outbound = result.outbound
+        ? `<h3>Xray outbound JSON</h3><pre class="output-pane" style="max-height:none; user-select:all">${esc(JSON.stringify(result.outbound, null, 2))}</pre>`
+        : '';
+      const qr = result.qr_data_url
+        ? `<div style="text-align:center; margin-top:14px"><img src="${esc(result.qr_data_url)}" alt="Shadowsocks QR code" width="240" height="240"></div>`
+        : '';
+      box.innerHTML = `
+        <h3>Shadowsocks link</h3>
+        <div class="output-pane" style="max-height:none; user-select:all">${esc(result.link)}</div>
+        ${outbound}${qr}`;
+    } else if (route.status === 'ACTIVE') {
+      box.className = 'tl-result';
+      box.innerHTML = '<div class="muted">Route is ACTIVE. Use <strong>Timeline</strong> on the route row, or <strong>Reveal</strong> later, to retrieve the share link.</div>';
+    } else if (route.status !== 'ACTIVE') {
+      renderFailureSummary(route);
+    }
+    loadRoutes();
+  };
+
+  const tick = async () => {
+    if (!stillCurrent()) return;
+    // wait=1 makes the hub hold this request until the provisioning run that
+    // this browser started has settled, so we never render a half-written row.
+    const route = await (async () => {
+      try {
+        return await api(`/api/gre-routes/${created.route_id}?wait=1`);
+      } catch { return null; }
+    })();
+    let events = [];
+    try {
+      events = await api(`/api/gre-routes/${created.route_id}/events?after_id=${lastEventId}`);
+    } catch { /* keep polling */ }
+    // The modal may have been closed while those two requests were in flight.
+    if (!stillCurrent()) return;
+    if (events.length) {
+      const stick = timelineNearBottom();
+      const newest = renderTimelineEvents(created.route_id, events);
+      if (newest > lastEventId) lastEventId = newest;
+      if (stick) {
+        const scroll = $('#tl-scroll');
+        if (scroll) scroll.scrollTop = scroll.scrollHeight;
+      }
+    }
+    if (route) {
+      const badge = $('#tl-status');
+      if (badge && route.status) { badge.textContent = route.status; badge.className = `badge ${routeStatusClass(route.status)}`; }
+      if (route.status === 'FAILED') renderFailureSummary(route);
+    }
+    if (route && TERMINAL_STATUSES.includes(route.status)) {
+      let result = null;
+      if (route.status === 'ACTIVE') {
+        // The share link and credential live AES-encrypted in the hub; the
+        // completed result (link, QR, outbound) is fetched for this one route
+        // through the explicit result path.
+        try {
+          result = await api(`/api/gre-routes/${created.route_id}?result=1`);
+          if (!stillCurrent()) return;
+        } catch { result = null; }
+      }
+      finish(route, result);
+      return;
+    }
+    if (!stillCurrent()) return;
+    state.routesPoll = { timer: setTimeout(tick, POLL_INTERVAL_MS) };
+  };
+
+  // The reserve/preflight events already exist, so pull them immediately.
+  tick();
+}
 
 // ---------- action log page ----------------------------------------------
 

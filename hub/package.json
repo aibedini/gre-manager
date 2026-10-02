@@ -6,12 +6,21 @@
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
+    "test": "node scripts/connectivity-test.js && node scripts/route-test.js && node scripts/compatibility-test.js && node scripts/migration-test.js && node scripts/routes-events-test.js && node scripts/smoke.js",
     "smoke": "node scripts/connectivity-test.js && node scripts/route-test.js && node scripts/smoke.js",
     "test:routes": "node scripts/route-test.js",
+    "test:compat": "node scripts/compatibility-test.js",
+    "test:migration": "node scripts/migration-test.js",
+    "test:events": "node scripts/routes-events-test.js",
     "test:connectivity": "node scripts/connectivity-test.js"
   },
   "engines": {
     "node": ">=18"
+  },
+  "allowScripts": {
+    "better-sqlite3": true,
+    "ssh2": true,
+    "cpu-features": true
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.10.0",

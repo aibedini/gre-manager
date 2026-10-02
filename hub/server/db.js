@@ -3,6 +3,9 @@
 
 const path = require('path');
 const fs = require('fs');
+// Install the node:sqlite fallback before better-sqlite3 is loaded, so the hub
+// still opens its database on machines where the native build is unavailable.
+require('../scripts/_sqlite');
 const Database = require('better-sqlite3');
 
 function openDb(dataDir) {
@@ -89,6 +92,8 @@ function openDb(dataDir) {
       protocol          TEXT NOT NULL DEFAULT 'tcp,udp',
       method            TEXT NOT NULL,
       client_email      TEXT NOT NULL,
+      client_mode       TEXT CHECK (client_mode IN ('existing','new')),
+      client_model      TEXT CHECK (client_model IN ('first_class','embedded')),
       client_password_enc TEXT,
       inbound_id        INTEGER,
       capability        TEXT CHECK (capability IN ('managed_hosts','external_proxy')),
@@ -138,6 +143,12 @@ function openDb(dataDir) {
   ensureColumn(db, 'action_log', 'kind', "kind TEXT NOT NULL DEFAULT 'action'");
   ensureColumn(db, 'xui_panels', 'auth_type', "auth_type TEXT NOT NULL DEFAULT 'password'");
   ensureColumn(db, 'xui_panels', 'capability', 'capability TEXT');
+  // v2.11.0: distinguish "reuse an existing 3x-ui client" from "create a new
+  // one", and remember which of the two client data models the panel had.
+  // ALTER TABLE ADD COLUMN accepts a CHECK constraint in SQLite, so existing
+  // v2.10.0 databases get the same guarantees as fresh ones.
+  ensureColumn(db, 'gre_routes', 'client_mode', "client_mode TEXT CHECK (client_mode IN ('existing','new'))");
+  ensureColumn(db, 'gre_routes', 'client_model', "client_model TEXT CHECK (client_model IN ('first_class','embedded'))");
 
   return db;
 }

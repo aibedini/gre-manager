@@ -29,6 +29,16 @@ jobs:
           bash gre-manager.sh --help
           bash gre-manager.sh node 2>&1 | grep -qi usage || true
 
+      - name: Node syntax check (hub)
+        run: |
+          for f in hub/server/*.js hub/scripts/*.js hub/public/app.js; do node --check "$f"; done
+
+      - name: Hub tests (3x-ui compatibility, migration, routes, timeline)
+        working-directory: hub
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+
       - name: Version consistency (VERSION file == script == CHANGELOG)
         run: |
           set -e

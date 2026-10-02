@@ -63,7 +63,7 @@ function makeSshOpts(db, cryptKey) {
   });
 }
 
-function createRouter(db, cryptKey, dataDir) {
+function createRouter(db, cryptKey, dataDir, transport = {}) {
   const router = express.Router();
 
   // Express 4 does not catch async rejections; wrap async handlers.
@@ -103,7 +103,31 @@ function createRouter(db, cryptKey, dataDir) {
 
   // ssh options: host-key TOFU pinning + optional fallback password.
   const sshOptsFor = makeSshOpts(db, cryptKey);
-  const routeOrchestrator = new RouteOrchestrator({ db, cryptKey, sshOptsFor });
+  const routeOrchestrator = new RouteOrchestrator({
+    db,
+    cryptKey,
+    sshOptsFor,
+    // Test hooks: the end-to-end suite injects a scripted SSH transport and a
+    // fake 3x-ui panel so the real HTTP surface can be exercised offline.
+    ...(transport.fetchImpl ? { fetchImpl: transport.fetchImpl } : {}),
+    ...(transport.sshExec ? { sshExec: transport.sshExec } : {}),
+    ...(transport.runTimeoutMs ? { runTimeoutMs: transport.runTimeoutMs } : {}),
+  });
+
+  // Exposed for tests and for the startup sweep in index.js.
+  router.orchestrator = routeOrchestrator;
+
+  // QR payloads for provisioning runs started by this process. The share LINK
+  // itself stays AES-encrypted in SQLite and only comes back through the
+  // explicit reveal path; this map is in-memory only and dropped on restart.
+  const routeResults = new Map();
+  const rememberResult = (routeId, value) => {
+    routeResults.set(Number(routeId), value);
+    for (const key of routeResults.keys()) {
+      if (routeResults.size <= 50) break;
+      routeResults.delete(key);
+    }
+  };
 
   const getSnapshot = (id) => {
     const row = db.prepare('SELECT json, taken_at FROM snapshots WHERE server_id = ?').get(id);
@@ -563,7 +587,14 @@ function createRouter(db, cryptKey, dataDir) {
   authed.get('/xui-panels/:id/clients', wrap(async (req, res) => {
     const panel = db.prepare('SELECT * FROM xui_panels WHERE id = ?').get(req.params.id);
     if (!panel) return res.status(404).json({ error: 'not found' });
-    res.json(await routeOrchestrator.client(panel).listClients());
+    const client = routeOrchestrator.client(panel);
+    const capabilities = await client.resolveCapabilities();
+    const clients = await client.listClients();
+    res.json({
+      clients,
+      client_model: capabilities.clientModel,
+      host_mode: capabilities.hostMode,
+    });
   }));
 
   authed.post('/gre-routes/recommend-port', wrap(async (req, res) => {
@@ -582,34 +613,103 @@ function createRouter(db, cryptKey, dataDir) {
     res.json(routeOrchestrator.listRoutes(req.query.reveal === '1'));
   });
 
-  authed.get('/gre-routes/:id/events', (req, res) => {
-    const route = db.prepare('SELECT id FROM gre_routes WHERE id=?').get(req.params.id);
+  authed.get('/gre-routes/:id', wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    // While a provisioning run started by this process is still going, wait for
+    // it to settle so a client that just observed `active` gets the completed
+    // result (share link + QR) instead of a half-written row.
+    const running = routeOrchestrator.running && routeOrchestrator.running.get(id);
+    if (running && req.query.wait === '1') await running;
+    const route = routeOrchestrator.safeRoute(id);
     if (!route) return res.status(404).json({ error: 'not found' });
-    res.json(routeOrchestrator.events(route.id));
-  });
+    // `link` is present here only for a run this hub process just completed,
+    // and only for an ACTIVE route; nothing is decrypted otherwise.
+    if (req.query.result === '1' && routeResults.has(id)) {
+      const cached = routeResults.get(id);
+      return res.json({
+        ...route,
+        link: route.status === 'ACTIVE' ? cached.link : null,
+        qr_data_url: route.status === 'ACTIVE' ? cached.qr_data_url : null,
+        outbound: route.status === 'ACTIVE' ? cached.outbound : null,
+        iran_endpoint: cached.iran_endpoint,
+        inbound_id: cached.inbound_id != null ? cached.inbound_id : route.inbound_id,
+      });
+    }
+    res.json(route);
+  }));
 
+  // Incremental, always-cheap event read. `after_id` returns only newer rows;
+  // omitting it keeps the original full-history behavior. `wait=1` long-polls
+  // until something new exists (or the wait window expires) so the timeline
+  // does not need to hammer the API while a route provisions.
+  authed.get('/gre-routes/:id/events', wrap(async (req, res) => {
+    const route = db.prepare('SELECT id, status FROM gre_routes WHERE id=?').get(req.params.id);
+    if (!route) return res.status(404).json({ error: 'not found' });
+    const afterId = req.query.after_id;
+    if (req.query.wait === '1' && afterId !== undefined) {
+      return res.json(await routeOrchestrator.waitForEvent(route.id, afterId));
+    }
+    res.json(routeOrchestrator.events(route.id, afterId));
+  }));
+
+  // Async job-style create: validate + reserve + return 202 immediately, then
+  // provision in the background while the UI streams route_events.
   authed.post('/gre-routes', wrap(async (req, res) => {
     const body = req.body || {};
+    const input = {
+      name: body.name,
+      iranServerId: Number(body.iran_server_id),
+      foreignServerId: Number(body.foreign_server_id),
+      panelId: Number(body.panel_id),
+      port: body.port,
+      start: body.range_start,
+      end: body.range_end,
+      method: body.method,
+      client_mode: body.client_mode,
+      client_email: body.client_email,
+      // Backward compatibility for an older frontend.
+      client_name: body.client_name,
+      clientName: body.client_name,
+    };
+    let prepared;
     try {
-      const result = await routeOrchestrator.create({
-        name: body.name,
-        iranServerId: Number(body.iran_server_id),
-        foreignServerId: Number(body.foreign_server_id),
-        panelId: Number(body.panel_id),
-        port: body.port,
-        start: body.range_start,
-        end: body.range_end,
-        method: body.method,
-        clientName: body.client_name,
-      });
-      auditEvent(null, 'hub', 'gre_route_create', {
-        name: result.name, port: result.port, capability: result.capability,
-      }, 0, `route ${result.id} active`);
-      res.status(201).json(result);
+      prepared = await routeOrchestrator.prepare(input);
     } catch (err) {
-      auditEvent(null, 'hub', 'gre_route_create', { name: body.name, rollback: err.rollback || [] }, 1, err.message);
-      res.status(409).json({ error: err.message, route_id: err.routeId || null, rollback: err.rollback || [], events: err.events || [] });
+      auditEvent(null, 'hub', 'gre_route_create', { name: body.name }, 1, err.message);
+      return res.status(409).json({ error: err.message, route_id: err.routeId || null });
     }
+    auditEvent(null, 'hub', 'gre_route_create', {
+      name: prepared.name, port: prepared.port, client_model: prepared.client_model, client_mode: prepared.client_mode,
+    }, 0, `route ${prepared.route_id} reserved; provisioning started`);
+    // Never leave an unhandled rejection behind: startProvisioning catches
+    // everything and always resolves. The outcome is cached so the UI can pick
+    // up the share link and QR code once the timeline reports a terminal
+    // status, without polling the whole route list for decrypted secrets.
+    routeOrchestrator.startProvisioning(prepared.route_id, prepared)
+      .then((outcome) => {
+        const route = routeOrchestrator.safeRoute(prepared.route_id);
+        rememberResult(prepared.route_id, {
+          ok: outcome.ok,
+          status: route ? route.status : (outcome.ok ? 'ACTIVE' : 'FAILED'),
+          error: outcome.ok ? null : outcome.error.message,
+          link: outcome.ok ? outcome.result.link : null,
+          qr_data_url: outcome.ok ? outcome.result.qr_data_url : null,
+          outbound: outcome.ok ? outcome.result.outbound : null,
+          iran_endpoint: outcome.ok ? outcome.result.iran_endpoint : null,
+          inbound_id: outcome.ok ? outcome.result.inbound_id : null,
+        });
+      });
+    res.status(202).json({
+      route_id: prepared.route_id,
+      status: 'RESERVED',
+      name: prepared.name,
+      port: prepared.port,
+      method: prepared.method,
+      client_email: prepared.client_email,
+      client_mode: prepared.client_mode,
+      client_model: prepared.client_model,
+      host_mode: prepared.host_mode,
+    });
   }));
 
   authed.post('/gre-routes/:id/reconcile', wrap(async (req, res) => {

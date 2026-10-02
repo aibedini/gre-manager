@@ -87,6 +87,75 @@ UDP listeners, nftables, iptables, Docker-published ports, 3x-ui inbounds and
 the Hub's persistent port registry. The chosen port is reserved before GRE is
 created.
 
+#### Client selection and the two 3x-ui client models
+
+The route form distinguishes **existing** from **new** explicitly: it sends
+`client_mode: "existing" | "new"` plus `client_email`, never one ambiguous
+`client_name`. (An older client sending only `client_name` is still accepted and
+means "new".)
+
+3x-ui has had two different client data models, and the boundary is **v3.1.0**,
+not v3.0.x:
+
+| Panel | Model | Client identity | Endpoints |
+| --- | --- | --- | --- |
+| 2.8.x, 3.0.x | `embedded` | one entry inside each inbound's `settings.clients` | `POST /panel/api/inbounds/addClient` |
+| 3.1.0+ | `first_class` | one global client row, attachable to many inbounds | `GET/POST /panel/api/clients/{list,get,links,add,:email/attach,:email/detach,del}` |
+
+The Hub therefore **probes** instead of guessing: `GET /panel/api/clients/list`
+returning HTTP 200 means `first_class`, 404/405 means `embedded`. `401/403`, 5xx
+and timeouts are reported as authentication/panel failures and never silently
+downgrade the panel to the legacy model. Host mode (`managed_hosts` versus
+`external_proxy`) is an independent axis and is reported separately, e.g.
+`client=first_class; hosts=managed_hosts`.
+
+Consequences per intent:
+
+- **Existing client on a first-class panel** — read-only preflight
+  (`GET /clients/get/:email`), create the inbound with `clients: []`, then
+  `POST /clients/:email/attach` with `{ inboundIds: [id] }`. The client is
+  **attached, never re-created**, which is what fixes `Duplicate email: navid`.
+  The shareable credential comes from the panel-issued `ss://` link and is
+  validated against the expected host, port and cipher; rollback only detaches
+  the attachment and never deletes the client globally.
+- **New client on a first-class panel** — preflight proves the email is free,
+  create the inbound, then `POST /clients/add` with
+  `{ client: {...}, inboundIds: [id] }`. Rollback deletes only the client this
+  route created.
+- **Existing client on an embedded panel** — the source client's real protocol
+  credential is read from `settings.clients` server-side and cloned into the new
+  inbound. It is never regenerated, never exposed to the browser, and if a
+  reusable credential cannot be established the route fails
+  (`credential cannot be reused`) rather than handing back a fake configuration.
+
+#### Live provisioning timeline
+
+Route creation is asynchronous. `POST /api/gre-routes` validates the request,
+runs the read-only client preflight, recommends and reserves the port and the
+route row (`status='RESERVED'`), then answers **202** with
+`{ route_id, status: "RESERVED" }`. Provisioning continues in the Hub process
+while the UI streams `GET /api/gre-routes/:id/events?after_id=…`:
+
+```
+12:44:02  ✓ port_reserved        TCP+UDP port 3061 reserved
+12:44:02  ✓ client_model_detected client=first_class; hosts=managed_hosts
+12:44:03  ✓ client_preflight     client 'navid' exists on the panel
+12:44:06  ✓ foreign_node_add     …
+12:44:07  ✓ iran_peer_add        …
+12:44:08  ✓ inbound_add          Shadowsocks inbound 123
+12:44:08  ✓ client_attach        Attached existing client navid to inbound 123
+12:44:11  ✓ link_validate        Endpoint, method and credential validated
+12:44:11  ✓ active               Route marked ACTIVE
+```
+
+Failures show a compact summary above the same timeline, rollback rows
+(`rollback_client_detach`, `rollback_inbound`, `rollback_iran_peer`,
+`rollback_foreign_node`, …) stay visible, and every route row has a **Timeline**
+action that reopens the complete persisted log later. Events never contain
+passwords, API tokens or full `ss://` links. A route left `RESERVED` by a Hub
+restart is marked `STALE` with an explanatory event instead of being destroyed,
+because its real remote state is unknown.
+
 The panel adapter detects capabilities instead of comparing version strings:
 
 - Managed Hosts available: create the Shadowsocks inbound, then create a Host
@@ -99,13 +168,13 @@ save an admin-scope API token from **Settings → Security → API Token**; Hub
 sends it as `Authorization: Bearer`. Legacy 2.x panels use username/password
 and a session cookie. Cookie authentication also bootstraps and replays CSRF
 tokens when the panel exposes the 3.x `/csrf-token` flow. Relevant endpoint
-variants are handled across 2.9.x, 3.0–3.3, and Managed Hosts releases 3.4+.
+variants are handled across 2.8.x, 3.0.x, 3.1–3.3 and Managed Hosts releases
+(3.4+, re-homed under `internal/` in later trees).
 
-The Hub asks 3x-ui for the final client link and verifies its address, port,
-method and **client password** before marking the route `ACTIVE`. A failed
-stage removes the partial inbound/Host, removes the GRE peer and releases the
-reservation. Reconcile never reuses an apparently idle `ACTIVE` port; missing
-runtime state changes the route to `NEEDS_REVIEW`.
+A failed stage removes the client relationship it owns, removes the partial
+inbound/Host, removes the GRE peer and releases the reservation. Reconcile never
+reuses an apparently idle `ACTIVE` port; missing runtime state changes the route
+to `NEEDS_REVIEW`.
 
 ## Security model
 
@@ -153,8 +222,30 @@ runtime state changes the route to `NEEDS_REVIEW`.
 ## Development
 
 ```bash
-node scripts/smoke.js   # boots on a random port, 49 assertions
+npm test                      # full suite (see below)
+node scripts/smoke.js         # boots on a random port, API/auth/CSRF assertions
+node scripts/route-test.js    # orchestrator units + async lifecycle
+node scripts/compatibility-test.js  # 2.8.x / 3.0.x / 3.1+ client-model matrix
+node scripts/migration-test.js      # v2.10.0 hub.db migrates in place
+node scripts/routes-events-test.js  # 202 + live/persistent timeline over HTTP
 ```
+
+The compatibility suite runs against a behavioural fake of a 3x-ui panel
+(`scripts/_xui-mock.js`) with source-derived endpoint fixtures per release tag.
+It asserts, among other things, that `POST /panel/api/inbounds/addClient` exists
+in 2.8.11 and 3.0.2 but not in 3.1.0+, that a first-class client with
+`inboundIds: []` still shows up in the client list, and the exact regression:
+reusing client `navid` creates an inbound with no embedded client, calls
+`/attach`, and never triggers `Duplicate email`.
+
+`scripts/_sqlite.js` lets the suite run on a machine where the native
+`better-sqlite3` build is unavailable by falling back to Node's built-in
+`node:sqlite`; production and CI use the real driver.
+
+Optional test-only transport hooks (`HUB_TEST_FETCH_MODULE`,
+`HUB_TEST_SSH_MODULE`, `HUB_TEST_SCENARIO`) let the real server be exercised
+against a scripted SSH transport and fake panels. They are never set in
+production, and unset behaviour is unchanged.
 
 No build step: `public/` is plain HTML/JS/CSS; xterm.js is served from
 `node_modules`. Stack: Express, better-sqlite3, ssh2, ws.

@@ -19,6 +19,17 @@ const SECURE = process.env.HUB_SECURE === '1';
 const db = openDb(DATA_DIR);
 const cryptKey = cryptoUtil.loadKey(DATA_DIR);
 
+// Provisioning is asynchronous, so a hub restart can strand routes that were
+// reserved but never finished. Flag them for review — never destroy remote
+// state whose real condition we cannot know — and let Reconcile inspect them.
+try {
+  const { RouteOrchestrator } = require('./route-orchestrator');
+  const stranded = new RouteOrchestrator({ db, cryptKey, sshOptsFor: () => ({}) }).sweepAbandoned();
+  if (stranded.length) console.warn(`gre-hub: flagged ${stranded.length} interrupted route(s) as STALE: ${stranded.join(', ')}`);
+} catch (err) {
+  console.warn(`gre-hub: abandoned-route sweep skipped: ${err.message}`);
+}
+
 const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '100kb' }));
@@ -37,7 +48,24 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use('/api', createRouter(db, cryptKey, DATA_DIR));
+// Optional transport overrides. Only the hub's own test suite sets these: they
+// let the real HTTP surface, router and orchestrator run against a scripted
+// SSH transport and a fake 3x-ui panel, with no production behaviour change.
+function loadTransportOverride(envName) {
+  const target = process.env[envName];
+  if (!target) return null;
+  // eslint-disable-next-line global-require, import/no-dynamic-require
+  const loaded = require(path.resolve(target));
+  return typeof loaded === 'function' ? loaded : (loaded && loaded.default) || null;
+}
+
+const transport = {};
+const testFetch = loadTransportOverride('HUB_TEST_FETCH_MODULE');
+const testSsh = loadTransportOverride('HUB_TEST_SSH_MODULE');
+if (testFetch) transport.fetchImpl = testFetch;
+if (testSsh) transport.sshExec = testSsh;
+
+app.use('/api', createRouter(db, cryptKey, DATA_DIR, transport));
 
 // Unknown API routes → JSON 404 (never the HTML handler).
 app.use('/api', (req, res) => res.status(404).json({ error: 'not found' }));
