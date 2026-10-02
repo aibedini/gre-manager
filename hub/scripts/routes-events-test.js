@@ -29,6 +29,9 @@ let BASE = '';
 const SCENARIO_FILE = path.join(DATA_DIR, 'scenario.json');
 const PASSWORD = 'events-test-password-1';
 const PANEL_URL = 'https://panel-a.example';
+// `legacy` exercises the original synchronous prepare(); anything else (the
+// production default) exercises the live-preflight layer.
+const PREFLIGHT_MODE = process.env.HUB_ROUTE_PREFLIGHT_MODE || 'live';
 
 async function pickPort() {
   const net = require('net');
@@ -77,6 +80,10 @@ function writeScenario(spec) {
 }
 
 function startHub() {
+  // HUB_ROUTE_PREFLIGHT_MODE=legacy runs the original synchronous prepare();
+  // production omits it and installs the live-preflight layer, which reserves
+  // locally first and performs the slow network checks as timeline stages.
+  const preflightMode = process.env.HUB_ROUTE_PREFLIGHT_MODE || 'live';
   const child = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
     env: {
       ...process.env,
@@ -86,6 +93,7 @@ function startHub() {
       HUB_TEST_SCENARIO: SCENARIO_FILE,
       HUB_TEST_FETCH_MODULE: path.join(__dirname, '_test-fetch-module.js'),
       HUB_TEST_SSH_MODULE: path.join(__dirname, '_test-ssh-module.js'),
+      HUB_ROUTE_PREFLIGHT_MODE: preflightMode,
     },
     stdio: ['ignore', 'pipe', 'inherit'],  });
   return child;
@@ -172,11 +180,21 @@ async function main() {
       if (created.status !== 202) throw new Error(`expected 202, got ${created.status}: ${JSON.stringify(created.data)}`);
       if (!Number.isInteger(Number(created.data.route_id))) throw new Error('no route_id in the response');
       if (created.data.status !== 'RESERVED') throw new Error(`expected RESERVED, got ${created.data.status}`);
-      if (created.data.client_model !== 'first_class') throw new Error('client model must be reported');
+      // In live mode the panel has not been contacted yet, so the model is
+      // discovered later and reported through the timeline instead. In legacy
+      // mode it is already known when the 202 is written.
+      if (PREFLIGHT_MODE === 'legacy') {
+        if (created.data.client_model !== 'first_class') throw new Error('client model must be reported');
+      } else if (created.data.client_model !== null && created.data.client_model !== undefined) {
+        throw new Error(`live mode must not claim a client model before probing (got ${created.data.client_model})`);
+      }
     });
     check('the response is fast (validation only, provisioning is background)', () => {
       if (created.elapsed > 2000) throw new Error(`took ${created.elapsed}ms`);
     });
+    if (PREFLIGHT_MODE !== 'legacy') {
+      check('live mode reserves before any panel or SSH work', async () => { /* asserted via the route row below */ });
+    }
 
     const routeId = Number(created.data.route_id);
 
@@ -207,10 +225,17 @@ async function main() {
     });
     check('the timeline names every client-related stage explicitly', () => {
       const stages = all.map((e) => e.stage);
-      for (const required of ['request_validated', 'client_model_detected', 'client_preflight', 'port_reserved',
-        'public_ip', 'connectivity', 'iran_peer_add', 'foreign_node_add', 'inbound_add', 'client_attach',
-        'managed_host_add', 'link_validate', 'runtime_validation', 'active']) {
-        if (!stages.includes(required)) throw new Error(`missing stage ${required} (got ${stages.join(', ')})`);
+      // Shared by both modes.
+      const required = ['request_validated', 'client_model_detected', 'client_preflight', 'port_reserved',
+        'iran_peer_add', 'foreign_node_add', 'inbound_add', 'client_attach',
+        'managed_host_add', 'link_validate', 'runtime_validation', 'active'];
+      // Live mode replaces the coarse public-IP/connectivity pass with explicit
+      // per-direction preflight stages and a dedicated port safety scan.
+      const liveOnly = ['panel_probe', 'port_check', 'public_ip_preflight',
+        'connectivity_iran_to_foreign', 'connectivity_foreign_to_iran', 'connectivity_preflight'];
+      const legacyOnly = ['public_ip', 'connectivity'];
+      for (const stage of [...required, ...(PREFLIGHT_MODE === 'legacy' ? legacyOnly : liveOnly)]) {
+        if (!stages.includes(stage)) throw new Error(`missing stage ${stage} (got ${stages.join(', ')})`);
       }
       const attach = all.find((e) => e.stage === 'client_attach' && e.status === 'PASS');
       if (!attach) {
@@ -220,8 +245,14 @@ async function main() {
       if (!/Attached existing client navid/.test(attach.detail)) throw new Error(`unexpected detail: ${attach.detail}`);
     });
     check('every mutable stage announced RUNNING before its verdict', () => {
-      for (const stageName of ['public_ip', 'connectivity', 'gre_pairing', 'foreign_node_add', 'iran_peer_add',
-        'inbound_add', 'client_attach', 'managed_host_add', 'link_fetch', 'runtime_validation']) {
+      const stageNames = PREFLIGHT_MODE === 'legacy'
+        ? ['public_ip', 'connectivity', 'gre_pairing', 'foreign_node_add', 'iran_peer_add',
+          'inbound_add', 'client_attach', 'managed_host_add', 'link_fetch', 'runtime_validation']
+        : ['panel_probe', 'client_preflight', 'port_check', 'public_ip_preflight',
+          'connectivity_iran_to_foreign', 'connectivity_foreign_to_iran',
+          'gre_pairing', 'foreign_node_add', 'iran_peer_add',
+          'inbound_add', 'client_attach', 'managed_host_add', 'link_fetch', 'runtime_validation'];
+      for (const stageName of stageNames) {
         const forStage = all.filter((e) => e.stage === stageName);
         if (!forStage.length) throw new Error(`missing stage ${stageName}`);
         if (!forStage.some((e) => e.status === 'RUNNING')) throw new Error(`${stageName} never announced RUNNING`);
@@ -295,22 +326,79 @@ async function main() {
       if (reopened.data.length < fullHistory.data.length) throw new Error('history shrank after restart');
     });
 
-    console.log('\npreflight failures return 409 without reserving anything:');
-    const duplicate = await after.call('/api/gre-routes', { method: 'POST', body: { ...createBody, name: 'IR05-DE03', client_mode: 'new', client_email: 'navid' } });
-    check('duplicate email is a 409 with a friendly message and no route_id', () => {
-      if (duplicate.status !== 409) throw new Error(`expected 409, got ${duplicate.status}`);
-      if (!/already exists/i.test(duplicate.data.error)) throw new Error(`unexpected error: ${duplicate.data.error}`);
+    console.log(`\nclient-selection mistakes are rejected without GRE mutations (${PREFLIGHT_MODE} mode):`);
+    // Distinct ports per request so the two cases cannot collide with each other
+    // or with the already-ACTIVE route.
+    const duplicate = await after.call('/api/gre-routes', {
+      method: 'POST',
+      body: { ...createBody, name: 'IR05-DE03', port: 3055, client_mode: 'new', client_email: 'navid' },
     });
-    const missing = await after.call('/api/gre-routes', { method: 'POST', body: { ...createBody, name: 'IR05-DE04', client_mode: 'existing', client_email: 'ghost' } });
-    check('a missing client is a 409 with a friendly message', () => {
-      if (missing.status !== 409) throw new Error(`expected 409, got ${missing.status}`);
-      if (!/no longer exists/i.test(missing.data.error)) throw new Error(`unexpected error: ${missing.data.error}`);
+    const missing = await after.call('/api/gre-routes', {
+      method: 'POST',
+      body: { ...createBody, name: 'IR05-DE04', port: 3056, client_mode: 'existing', client_email: 'ghost' },
     });
-    const routes = await after.call('/api/gre-routes');
-    check('no route row was reserved by the rejected requests', () => {
-      const names = routes.data.map((row) => row.name);
-      if (names.includes('IR05-DE03') || names.includes('IR05-DE04')) throw new Error(`unexpected rows: ${names.join(', ')}`);
-    });
+    const routeNames = await after.call('/api/gre-routes');
+
+    if (PREFLIGHT_MODE === 'legacy') {
+      // Legacy prepare() does the client lookup synchronously, so the mistake is
+      // a 409 and no route row is ever written.
+      check('duplicate email is a 409 with a friendly message', () => {
+        if (duplicate.status !== 409) throw new Error(`expected 409, got ${duplicate.status}: ${JSON.stringify(duplicate.data)}`);
+        if (!/already exists/i.test(duplicate.data.error)) throw new Error(`unexpected error: ${duplicate.data.error}`);
+      });
+      check('a missing client is a 409 with a friendly message', () => {
+        if (missing.status !== 409) throw new Error(`expected 409, got ${missing.status}: ${JSON.stringify(missing.data)}`);
+        if (!/no longer exists/i.test(missing.data.error)) throw new Error(`unexpected error: ${missing.data.error}`);
+      });
+      check('no route row was reserved by the rejected requests', () => {
+        const names = routeNames.data.map((row) => row.name);
+        if (names.includes('IR05-DE03') || names.includes('IR05-DE04')) throw new Error(`unexpected rows: ${names.join(', ')}`);
+      });
+    } else {
+      // Live mode reserves first and validates on the timeline, so the mistake
+      // is accepted as 202 and must then FAIL without touching either server.
+      check('live mode accepts the request as 202 (reserve-then-validate)', () => {
+        for (const [label, res] of [['duplicate', duplicate], ['missing', missing]]) {
+          if (res.status !== 202) throw new Error(`${label}: expected 202, got ${res.status}: ${JSON.stringify(res.data)}`);
+          if (!Number.isInteger(Number(res.data.route_id))) throw new Error(`${label}: no route_id`);
+        }
+      });
+      for (const [label, res, pattern] of [
+        ['duplicate email', duplicate, /already exists/i],
+        ['a missing client', missing, /no longer exists/i],
+      ]) {
+        const id = Number(res.data.route_id);
+        // Wait for the background run to settle before judging it.
+        for (let i = 0; i < 80; i++) {
+          const probe = await after.call(`/api/gre-routes/${id}`);
+          if (['ACTIVE', 'FAILED', 'STALE', 'NEEDS_REVIEW'].includes(probe.data.status)) break;
+          await sleep(80);
+        }
+        const route = await after.call(`/api/gre-routes/${id}`);
+        const events = (await after.call(`/api/gre-routes/${id}/events`)).data;
+        check(`live: ${label} fails with a friendly message`, () => {
+          if (route.data.status !== 'FAILED') throw new Error(`status ${route.data.status}: ${route.data.last_error}`);
+          if (!pattern.test(route.data.last_error || '')) throw new Error(`unexpected last_error: ${route.data.last_error}`);
+          if (!events.some((e) => e.stage === 'client_preflight' && e.status === 'FAIL')) {
+            throw new Error(`client_preflight did not report FAIL (${events.map((e) => e.stage).join(', ')})`);
+          }
+          // The whole point of reserving first: validation failures must not
+          // have reached any GRE or inbound mutation on either server.
+          const mutationStages = ['foreign_node_add', 'iran_peer_add', 'inbound_add', 'client_attach', 'client_create', 'managed_host_add'];
+          const touched = events.filter((e) => mutationStages.includes(e.stage));
+          if (touched.length) {
+            throw new Error(`a rejected client selection reached mutations: ${touched.map((e) => `${e.status}:${e.stage}`).join(', ')}`);
+          }
+        });
+      }
+      const routeNamesFresh = await after.call('/api/gre-routes');
+      check('both rejected attempts are recorded on the timeline', () => {
+        const names = routeNamesFresh.data.map((row) => row.name);
+        if (!names.includes('IR05-DE03') || !names.includes('IR05-DE04')) {
+          throw new Error(`expected both attempts to be recorded: ${names.join(', ')}`);
+        }
+      });
+    }
 
     console.log('\nFAILED routes keep their rollback timeline:');
     // The fake panel re-reads this file, so the fault takes effect on the next

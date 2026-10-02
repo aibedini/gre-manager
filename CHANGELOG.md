@@ -4,6 +4,61 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.13.0] - 2026-10-03
+
+Adds the live Auto Route preflight timeline contributed upstream in
+`4cd1ba7`, on top of everything in v2.12.2.
+
+### Added
+
+- **Route creation now answers before any network work happens.** The old
+  synchronous preflight probed 3x-ui and both servers *before* the request
+  returned, so the Create Route dialog could only show a static `Creating…`
+  until everything finished. `prepare()` now validates, reserves the port
+  locally and returns the route id immediately; every slow step then runs as a
+  persisted timeline stage that the modal streams live:
+  - `panel_probe` — 3x-ui capability probe, with the panel version, now on a 45s
+    timeout (`HUB_XUI_TIMEOUT_MS`) because slow panels previously surfaced as an
+    opaque browser `AbortError`
+  - `client_preflight` — the selected client is validated against the panel
+  - `port_check` — full remote safety scan of the reserved port
+    (listeners/nftables/iptables/Docker/3x-ui/registry); if it turns out to be
+    occupied the reservation is moved to a free port instead of failing
+  - `public_ip_preflight` — resolves both public IPv4 addresses
+  - `connectivity_iran_to_foreign` / `connectivity_foreign_to_iran` — explicit
+    **per-direction** reachability checks, replacing the single combined check
+    that could not say which side was blocked
+  - `connectivity_preflight` — persisted summary of both directions
+- Failures now name the stage and the timeout, e.g.
+  `3x-ui client preflight timed out after 45s: The operation was aborted`, and
+  each preflight stage emits `RUNNING` before its `PASS`/`FAIL`.
+- The in-flight 3x-ui client is reused for a short window so the background
+  provisioning run inherits the capability result and timeout from the probe.
+
+### Changed
+
+- Client-selection validation now happens **after** the route row is reserved
+  rather than before the request returns. A bad selection therefore no longer
+  comes back as an immediate `409`; it is accepted as `202` and then fails at
+  `client_preflight` on the timeline. The guarantee that matters is unchanged and
+  is now covered by a test: the failure happens **before** any inbound, GRE node
+  or GRE peer is created, so no remote mutation is made for a mistake in the
+  client picker. The Create Route dialog surfaces it as `Failed at
+  client_preflight`.
+- Legacy mode is still available with `HUB_ROUTE_PREFLIGHT_MODE=legacy` for the
+  synchronous integration fixture; production defaults to live preflight.
+
+### Tests
+
+- The upstream `live-preflight-test.js` (22 assertions) covers the new stages
+  against a stub class.
+- The HTTP events suite now runs in **both** modes: live (production default)
+  with 26 assertions and legacy with 24, including the assertion that a rejected
+  client selection reaches no `foreign_node_add`, `iran_peer_add`,
+  `inbound_add`, `client_attach`, `client_create` or `managed_host_add` stage.
+  The upstream commit had removed this suite from `npm test` entirely; both modes
+  are wired back in.
+
 ## [2.12.2] - 2026-10-02
 
 ### Fixed

@@ -186,8 +186,12 @@ async function main() {
     try {
       let buf = '';
       child.stdout.on('data', (d) => { buf += d; });
+      // Wait for BOTH lines. stdio is a pipe, so Node delivers stdout in
+      // arbitrary chunks: seeing `gre-hub listening` does not guarantee the
+      // earlier `gre-hub build:` line has already arrived in the same buffer,
+      // which made the build-line assertion flaky under load.
       const deadline = Date.now() + 15000;
-      while (Date.now() < deadline && !buf.includes('gre-hub listening')) {
+      while (Date.now() < deadline && !(buf.includes('gre-hub listening') && buf.includes('gre-hub build:'))) {
         if (child.exitCode !== null) throw new Error(`hub exited early (${child.exitCode})\n${buf}`);
         // eslint-disable-next-line no-await-in-loop
         await sleep(100);
