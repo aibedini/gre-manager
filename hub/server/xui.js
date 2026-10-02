@@ -118,18 +118,9 @@ class XuiClient {
   }
 
   async detectCapabilities() {
-    let docs = null;
-    for (const path of ['/docs/openapi.json', '/panel/api/docs/openapi.json', '/openapi.json']) {
-      docs = await this.request(path, { allow404: true }).catch(() => null);
-      if (docs && docs.paths) break;
-    }
-    if (docs && Object.keys(docs.paths).some((path) => path.startsWith('/panel/api/hosts'))) {
-      return { mode: 'managed_hosts' };
-    }
-    const hosts = await this.request('/panel/api/hosts/list', { allow404: true }).catch((err) => {
-      if (err.status === 401 || err.status === 403) throw err;
-      return null;
-    });
+    // This single read-only probe is the authoritative capability boundary:
+    // 3.4+ exposes it; older releases return 404/405.
+    const hosts = await this.request('/panel/api/hosts/list', { allow404: true });
     return hosts === null
       ? { mode: 'external_proxy' }
       : { mode: 'managed_hosts' };

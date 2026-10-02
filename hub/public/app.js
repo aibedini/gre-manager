@@ -1223,15 +1223,47 @@ $('#btn-term-reconnect').addEventListener('click', () => {
 
 // ---------- automatic GRE + 3x-ui routes ---------------------------------
 
+function panelsHtml() {
+  return `
+    <div class="section">
+      <h3>Saved 3x-ui panels</h3>
+      ${state.panels.length ? `
+        <table class="data">
+          <thead><tr><th>Name</th><th>URL</th><th>Authentication</th><th>Capability</th><th></th></tr></thead>
+          <tbody>${state.panels.map((panel) => `
+            <tr>
+              <td><strong>${esc(panel.name)}</strong></td>
+              <td>${esc(panel.base_url)}</td>
+              <td><span class="badge blue">${panel.auth_type === 'token' ? 'API token' : 'Username + password'}</span></td>
+              <td>${esc(panel.capability || 'detected on next save')}</td>
+              <td><button class="btn btn-danger btn-sm btn-delete-panel" data-id="${panel.id}">Delete</button></td>
+            </tr>`).join('')}</tbody>
+        </table>` : '<div class="empty">No 3x-ui panel saved yet.</div>'}
+    </div>`;
+}
+
+function bindPanelActions(wrap) {
+  $$('.btn-delete-panel', wrap).forEach((btn) => btn.addEventListener('click', async () => {
+    if (!confirm('Delete this saved panel? Routes using it prevent deletion.')) return;
+    btn.disabled = true;
+    try {
+      await api(`/api/xui-panels/${btn.dataset.id}`, { method: 'DELETE' });
+      toast('Panel deleted');
+      await loadRoutes();
+    } catch (err) { toast(err.message, true); btn.disabled = false; }
+  }));
+}
+
 async function loadRoutes() {
   const wrap = $('#routes-body');
   try {
     [state.routes, state.panels] = await Promise.all([api('/api/gre-routes'), api('/api/xui-panels')]);
     if (!state.routes.length) {
-      wrap.innerHTML = `<div class="empty">No automatic routes yet. ${state.panels.length ? 'Create the first route.' : 'Add a 3x-ui panel first.'}</div>`;
+      wrap.innerHTML = panelsHtml() + `<div class="empty">No automatic routes yet. ${state.panels.length ? 'Create the first route.' : 'Add a 3x-ui panel first.'}</div>`;
+      bindPanelActions(wrap);
       return;
     }
-    wrap.innerHTML = `
+    wrap.innerHTML = panelsHtml() + `
       <table class="data">
         <thead><tr><th>Route</th><th>IRAN endpoint</th><th>FOREIGN</th><th>Panel</th><th>Mode</th><th>Status</th><th>Created</th><th></th></tr></thead>
         <tbody>${state.routes.map((r) => `
@@ -1254,6 +1286,7 @@ async function loadRoutes() {
         await loadRoutes();
       } catch (err) { toast(err.message, true); btn.disabled = false; btn.textContent = 'Reconcile'; }
     }));
+    bindPanelActions(wrap);
   } catch (err) { wrap.innerHTML = `<div class="empty">${esc(err.message)}</div>`; }
 }
 

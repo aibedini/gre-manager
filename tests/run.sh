@@ -629,6 +629,14 @@ UPDATE_STUBS="$R/update-stubs"
 mkdir -p "$UPDATE_STUBS" "$R/update-fixtures"
 CURRENT_VERSION="$(grep -m1 -E '^VERSION=' "$SUT" | cut -d'"' -f2)"
 NEWER_VERSION="$(awk -F. '{ printf "%d.%d.%d", $1, $2, $3 + 1 }' <<< "$CURRENT_VERSION")"
+cat > "$R/update-fixtures/current" <<EOF
+#!/usr/bin/env bash
+VERSION="$CURRENT_VERSION"
+if [[ "\${1:-}" == "hub" && "\${2:-}" == "install" && "\${3:-}" == "--yes" ]]; then
+    touch "\$TEST_ROOT/state/hub-updated"
+    exit 0
+fi
+EOF
 cat > "$R/update-fixtures/older" <<'EOF'
 #!/usr/bin/env bash
 VERSION="2.7.1"
@@ -674,6 +682,15 @@ cat > "$UPDATE_STUBS/sha256sum" <<'EOF'
 [[ "${1:-}" == "-c" ]]
 EOF
 chmod +x "$UPDATE_STUBS/curl" "$UPDATE_STUBS/sha256sum"
+
+cp "$R/update-fixtures/current" "$R/usr/local/sbin/gre"
+chmod +x "$R/usr/local/sbin/gre"
+mkdir -p "$R/opt/gre-hub"
+printf 'current\n' > "$R/state/update-mode"
+PATH="$UPDATE_STUBS:$PATH" gre update --yes
+assert "same-version update still syncs installed hub" test "$GRE_RC" -eq 0
+assert "same-version hub sync invoked" test -f "$R/state/hub-updated"
+rm -f "$R/state/hub-updated"
 
 printf 'sentinel\n' > "$R/usr/local/sbin/gre"
 printf 'older\n' > "$R/state/update-mode"

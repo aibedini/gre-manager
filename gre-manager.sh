@@ -62,7 +62,7 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are validated then sourced by design
 set -uo pipefail
 
-VERSION="2.9.1"
+VERSION="2.9.2"
 
 GITHUB_REPO="aibedini/gre-manager"
 
@@ -1671,6 +1671,18 @@ legacy_cleanup() {
     info "Verify with:  ip tunnel show   |   iptables -t nat -S   |   iptables -S INPUT"
 }
 
+sync_installed_hub() { # sync_installed_hub TARGET_VERSION
+    local target_version="$1"
+    [[ -d "$HUB_DIR" ]] || return 0
+    info "gre-hub is installed; syncing dashboard to v$target_version..."
+    if ! "$INSTALL_PATH" hub install --yes; then
+        err "gre-hub update failed."
+        info "Retry with: sudo gre hub install --yes"
+        return 1
+    fi
+    ok "gre-hub updated and restarted."
+}
+
 self_update() {
     require_root
     command -v curl >/dev/null 2>&1 || { err "curl is required for update."; return 1; }
@@ -1731,6 +1743,7 @@ self_update() {
     if [[ "$remote_ver" == "$VERSION" ]]; then
         ok "Already up to date (v$VERSION)."
         rm -rf "$tmp"
+        sync_installed_hub "$remote_ver" || return 1
         return 0
     fi
     if ! version_is_newer "$remote_ver" "$VERSION"; then
@@ -1749,15 +1762,10 @@ self_update() {
     audit_log "self-update from=$VERSION to=$remote_ver checksum=$verified"
     ok "Updated: v$VERSION -> v$remote_ver (checksum verified: $verified)"
 
-    if [[ -d "$HUB_DIR" ]]; then
-        info "gre-hub is installed; updating dashboard to v$remote_ver..."
-        if ! "$INSTALL_PATH" hub install --yes; then
-            err "CLI updated to v$remote_ver, but gre-hub update failed."
-            info "Retry with: sudo gre hub install --yes"
-            return 1
-        fi
-        ok "gre-hub updated and restarted."
-    fi
+    sync_installed_hub "$remote_ver" || {
+        err "CLI updated to v$remote_ver, but gre-hub update did not complete."
+        return 1
+    }
 
     info "Run 'gre' again to use the new version."
     exit 0

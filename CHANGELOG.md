@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.2] - 2026-10-02
+
+### Fixed
+
+- `gre update` now syncs and restarts an installed gre-hub even when the CLI is
+  already on the latest version, fixing partially updated installations.
+- Auto routes now lists saved 3x-ui panels with URL, authentication mode,
+  detected capability and safe deletion controls.
+- Panel verification uses one authoritative Managed Hosts probe and parallel
+  read-only checks, removing slow sequential OpenAPI timeouts.
+
 ## [2.9.1] - 2026-10-02
 
 ### Fixed

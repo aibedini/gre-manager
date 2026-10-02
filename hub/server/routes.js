@@ -503,7 +503,7 @@ function createRouter(db, cryptKey, dataDir) {
 
   // --- Automatic GRE + 3x-ui routes --------------------------------------
   authed.get('/xui-panels', (req, res) => {
-    const rows = db.prepare('SELECT id, name, base_url, username, auth_type, created_at FROM xui_panels ORDER BY name').all();
+    const rows = db.prepare('SELECT id, name, base_url, username, auth_type, capability, created_at FROM xui_panels ORDER BY name').all();
     res.json(rows);
   });
 
@@ -529,16 +529,17 @@ function createRouter(db, cryptKey, dataDir) {
     });
     let capabilities;
     try {
-      await probe.listInbounds();
-      capabilities = await probe.detectCapabilities();
+      await probe.authenticate();
+      [, capabilities] = await Promise.all([probe.listInbounds(), probe.detectCapabilities()]);
     } catch (err) {
       return res.status(400).json({ error: `panel connection failed: ${err.message}` });
     }
     try {
       const result = db.prepare(`
-        INSERT INTO xui_panels (name, base_url, username, auth_type, password_enc, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).run(String(name).slice(0, 80), normalized, username.slice(0, 120), authType, encrypt(cryptKey, credential), Date.now());
+        INSERT INTO xui_panels (name, base_url, username, auth_type, capability, password_enc, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(String(name).slice(0, 80), normalized, username.slice(0, 120), authType,
+        capabilities.mode, encrypt(cryptKey, credential), Date.now());
       auditEvent(null, 'hub', 'xui_panel_add', { name, base_url: normalized, auth_type: authType }, 0, '3x-ui panel saved');
       res.status(201).json({
         id: Number(result.lastInsertRowid), name, base_url: normalized, username,
