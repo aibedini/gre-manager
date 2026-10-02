@@ -74,6 +74,7 @@ function openDb(dataDir) {
       name        TEXT NOT NULL UNIQUE,
       base_url    TEXT NOT NULL,
       username    TEXT NOT NULL,
+      auth_type   TEXT NOT NULL DEFAULT 'password' CHECK (auth_type IN ('password','token')),
       password_enc TEXT NOT NULL,
       created_at  INTEGER NOT NULL
     );
@@ -125,6 +126,7 @@ function openDb(dataDir) {
   ensureColumn(db, 'sessions', 'csrf', "csrf TEXT NOT NULL DEFAULT ''");
   ensureColumn(db, 'sessions', 'last_seen', 'last_seen INTEGER NOT NULL DEFAULT 0');
   ensureColumn(db, 'action_log', 'kind', "kind TEXT NOT NULL DEFAULT 'action'");
+  ensureColumn(db, 'xui_panels', 'auth_type', "auth_type TEXT NOT NULL DEFAULT 'password'");
 
   return db;
 }

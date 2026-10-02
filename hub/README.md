@@ -12,6 +12,9 @@ npm install
 npm start          # listens on http://127.0.0.1:3939
 ```
 
+Once installed through `gre hub install`, future `sudo gre update` runs update
+both the CLI and gre-hub, preserve `data/`, and restart the dashboard service.
+
 Open http://127.0.0.1:3939 — on first run you create the hub password (min 12
 chars), then add your servers with host, SSH port, username and password.
 
@@ -90,6 +93,13 @@ The panel adapter detects capabilities instead of comparing version strings:
   mapping to `IRAN_PUBLIC_IP:PORT`.
 - Managed Hosts unavailable: put the legacy `externalProxy` mapping in the
   inbound's `streamSettings`.
+
+Authentication is negotiated separately from capabilities. For 3.x panels,
+save an admin-scope API token from **Settings → Security → API Token**; Hub
+sends it as `Authorization: Bearer`. Legacy 2.x panels use username/password
+and a session cookie. Cookie authentication also bootstraps and replays CSRF
+tokens when the panel exposes the 3.x `/csrf-token` flow. Relevant endpoint
+variants are handled across 2.9.x, 3.0–3.3, and Managed Hosts releases 3.4+.
 
 The Hub asks 3x-ui for the final client link and verifies its address, port,
 method and **client password** before marking the route `ACTIVE`. A failed

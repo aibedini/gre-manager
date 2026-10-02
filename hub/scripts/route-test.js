@@ -7,7 +7,7 @@ const path = require('path');
 const { openDb } = require('../server/db');
 const cryptoUtil = require('../server/crypto');
 const { RouteOrchestrator, inboundPayload, portEvidence, peerName } = require('../server/route-orchestrator');
-const { parseShadowsocksLink } = require('../server/xui');
+const { XuiClient, parseShadowsocksLink, buildShadowsocksLink } = require('../server/xui');
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gre-route-test-'));
 const db = openDb(dataDir);
@@ -21,6 +21,28 @@ async function main() {
   assert.equal(portEvidence('tcp LISTEN 0 10 0.0.0.0:3049\n', 3049).length, 1);
   assert.equal(portEvidence('tcp LISTEN 0 10 0.0.0.0:3050\n', 3049).length, 0);
   assert(peerName('Very-Long-Route-Name').length <= 11);
+  assert.equal(parseShadowsocksLink(buildShadowsocksLink({
+    method: 'chacha20-ietf-poly1305', password: 'secret', host: '37.202.247.77', port: 3049, remark: 'test',
+  })).password, 'secret');
+
+  const cookieCalls = [];
+  const cookieClient = new XuiClient({
+    baseUrl: 'https://cookie-panel.example', username: 'admin', password: 'password',
+    fetchImpl: async (url, opts = {}) => {
+      cookieCalls.push({ url, opts });
+      if (url.endsWith('/csrf-token')) return json({ success: true, obj: 'csrf-123' }, 200, { 'set-cookie': 'prelogin=one; Path=/' });
+      if (url.endsWith('/login')) {
+        assert.equal(opts.headers['x-csrf-token'], 'csrf-123');
+        assert.match(opts.headers.cookie, /prelogin=one/);
+        return json({ success: true }, 200, { 'set-cookie': '3x-ui=session; Path=/' });
+      }
+      assert.equal(opts.headers['x-csrf-token'], 'csrf-123');
+      assert.match(opts.headers.cookie, /3x-ui=session/);
+      return json({ success: true, obj: { id: 1 } });
+    },
+  });
+  await cookieClient.request('/panel/api/inbounds/add', { method: 'POST', body: {} });
+  assert.equal(cookieCalls.length, 3);
 
   const legacy = inboundPayload({
     remark: 'GRE-test', port: 3049, method: 'chacha20-ietf-poly1305',
@@ -40,15 +62,15 @@ async function main() {
     (name,host,ssh_port,username,auth_type,secret_enc,created_at) VALUES (?,?,?,?,?,?,?)`)
     .run('foreign', '46.8.228.7', 22, 'root', 'password', cryptoUtil.encrypt(key, 'pw2'), Date.now()).lastInsertRowid);
   const panelId = Number(db.prepare(`INSERT INTO xui_panels
-    (name,base_url,username,password_enc,created_at) VALUES (?,?,?,?,?)`)
-    .run('panel', 'https://panel.example', 'admin', cryptoUtil.encrypt(key, 'panel-pass'), Date.now()).lastInsertRowid);
+    (name,base_url,username,auth_type,password_enc,created_at) VALUES (?,?,?,?,?,?)`)
+    .run('panel', 'https://panel.example', '', 'token', cryptoUtil.encrypt(key, 'panel-token'), Date.now()).lastInsertRowid);
 
   let clientPassword = '';
   let inboundCreated = false;
   const calls = [];
   const fetchImpl = async (url, opts = {}) => {
     calls.push({ url, method: opts.method || 'GET' });
-    if (url.endsWith('/login')) return json({ success: true }, 200, { 'set-cookie': 'session=test; Path=/; HttpOnly' });
+    assert.equal(opts.headers.authorization, 'Bearer panel-token');
     if (url.endsWith('/panel/api/inbounds/list')) return json({ success: true, obj: inboundCreated ? [{ id: 123, port: 3049 }] : [] });
     if (url.endsWith('/docs/openapi.json')) return json({ paths: { '/panel/api/hosts/add': { post: {} } } });
     if (url.endsWith('/panel/api/inbounds/add')) {
@@ -64,7 +86,7 @@ async function main() {
       const body = JSON.parse(opts.body);
       assert.deepEqual(body.inboundIds, [123]);
       assert.equal(body.hosts[0], '37.202.247.77');
-      return json({ success: true, obj: { id: 9 } });
+      return json({ success: true, obj: { groupId: 'host-group-9' } });
     }
     if (url.includes('/panel/api/clients/links/')) {
       const auth = Buffer.from(`chacha20-ietf-poly1305:${clientPassword}`).toString('base64');

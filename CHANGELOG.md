@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.1] - 2026-10-02
+
+### Fixed
+
+- 3x-ui adapter now supports admin Bearer tokens, 3.x CSRF-protected session
+  login, legacy 2.x cookie login, Managed Hosts endpoint variants and manual
+  Shadowsocks-link fallback where the client-links endpoint is unavailable.
+- Panel credentials are verified against the remote API before being saved.
+- `gre update` now updates and restarts an installed gre-hub from the matching
+  release while preserving its database and encryption keys.
+
 ## [2.9.0] - 2026-10-01
 
 ### Added

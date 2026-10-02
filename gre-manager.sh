@@ -62,7 +62,7 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are validated then sourced by design
 set -uo pipefail
 
-VERSION="2.9.0"
+VERSION="2.9.1"
 
 GITHUB_REPO="aibedini/gre-manager"
 
@@ -1748,6 +1748,17 @@ self_update() {
     rm -rf "$tmp"
     audit_log "self-update from=$VERSION to=$remote_ver checksum=$verified"
     ok "Updated: v$VERSION -> v$remote_ver (checksum verified: $verified)"
+
+    if [[ -d "$HUB_DIR" ]]; then
+        info "gre-hub is installed; updating dashboard to v$remote_ver..."
+        if ! "$INSTALL_PATH" hub install --yes; then
+            err "CLI updated to v$remote_ver, but gre-hub update failed."
+            info "Retry with: sudo gre hub install --yes"
+            return 1
+        fi
+        ok "gre-hub updated and restarted."
+    fi
+
     info "Run 'gre' again to use the new version."
     exit 0
 }
@@ -1816,6 +1827,9 @@ hub_download() { # hub_download DEST_TGZ — tag-pinned asset, then latest relea
 
 hub_install() {
     require_root
+    local noninteractive="${1:-}"
+    local was_installed=0
+    [[ -d "$HUB_DIR" ]] && was_installed=1
     command -v curl >/dev/null 2>&1 || { err "curl is required."; return 1; }
     command -v ssh-keygen >/dev/null 2>&1 || warn "ssh-keygen not found (usually in openssh-client) — hub SSH keys need it."
     hub_ensure_node || return 1
@@ -1870,7 +1884,12 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now gre-hub.service >/dev/null 2>&1 || true
+    systemctl enable gre-hub.service >/dev/null 2>&1 || true
+    if (( was_installed )); then
+        systemctl restart gre-hub.service || { err "gre-hub files updated, but service restart failed."; return 1; }
+    else
+        systemctl start gre-hub.service || { err "gre-hub installed, but service start failed."; return 1; }
+    fi
     audit_log "hub-install dir=$HUB_DIR"
 
     echo
@@ -1880,6 +1899,7 @@ EOF
     info "                  then open http://127.0.0.1:$HUB_PORT_DEFAULT"
     info "First visit: create the hub password, then enable 2FA in Settings."
     info "Manage: gre hub [status|start|stop|restart|uninstall]"
+    [[ "$noninteractive" == "--yes" ]] && return 0
     echo
     if confirm "Set up web access with a domain + free HTTPS now?"; then
         hub_expose || true
@@ -1891,7 +1911,7 @@ EOF
 hub_menu() { # gre hub [install|status|start|stop|restart|uninstall]
     require_root
     case "${1:-status}" in
-        install|reinstall) hub_install ;;
+        install|reinstall) hub_install "${2:-}" ;;
         status)
             echo "gre-hub: $(hub_status_text)"
             if [[ -d "$HUB_DIR" ]]; then
@@ -3577,7 +3597,7 @@ EOF
     import)            cli_import "${@:2}" ;;
     update)            self_update ;;
     purge)             purge_all "${@:2}" ;;
-    hub)               hub_menu "${2:-status}" ;;
+    hub)               hub_menu "${@:2}" ;;
     --version|-v)      echo "gre-manager v$VERSION" ;;
     --help|-h)         usage ;;
     "")                main_menu ;;

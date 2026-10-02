@@ -409,9 +409,11 @@ sudo gre update
 ```
 
 Downloads only the latest **pinned release**, verifies its SHA-256 checksum, and refuses to
-install a lower version. If release assets are temporarily unavailable, the update stops without
-changing the installed file; it never falls back to an unverified development build from `main`.
-Your configuration, watchdog settings, nodes and peers are preserved across updates.
+install a lower version. If gre-hub is installed, the matching web release is installed
+automatically and its service is restarted; the database, encryption key, SSH keys and settings
+are preserved. If release assets are temporarily unavailable, the update stops without falling
+back to an unverified development build from `main`. GRE configuration, watchdog settings,
+nodes and peers are also preserved.
 
 ## Upgrading from v1.x
 

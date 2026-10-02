@@ -13,7 +13,7 @@ const provision = require('./provision');
 const connectivity = require('./connectivity');
 const { encrypt, decrypt } = require('./crypto');
 const { audit } = require('./db');
-const { normalizeBaseUrl } = require('./xui');
+const { XuiClient, normalizeBaseUrl } = require('./xui');
 const { RouteOrchestrator } = require('./route-orchestrator');
 
 const SECURE = process.env.HUB_SECURE === '1';
@@ -503,28 +503,51 @@ function createRouter(db, cryptKey, dataDir) {
 
   // --- Automatic GRE + 3x-ui routes --------------------------------------
   authed.get('/xui-panels', (req, res) => {
-    const rows = db.prepare('SELECT id, name, base_url, username, created_at FROM xui_panels ORDER BY name').all();
+    const rows = db.prepare('SELECT id, name, base_url, username, auth_type, created_at FROM xui_panels ORDER BY name').all();
     res.json(rows);
   });
 
-  authed.post('/xui-panels', (req, res) => {
-    const { name, base_url: baseUrl, username, password } = req.body || {};
-    if (!name || !username || typeof password !== 'string' || !password) {
-      return res.status(400).json({ error: 'name, base_url, username and password are required' });
+  authed.post('/xui-panels', wrap(async (req, res) => {
+    const { name, base_url: baseUrl } = req.body || {};
+    const authType = req.body && req.body.auth_type === 'token' ? 'token' : 'password';
+    const username = String(req.body && req.body.username || '').trim();
+    const rawCredential = authType === 'token' ? req.body && req.body.token : req.body && req.body.password;
+    const credential = authType === 'token' ? String(rawCredential || '').trim() : rawCredential;
+    if (!name || typeof credential !== 'string' || !credential || (authType === 'password' && !username)) {
+      return res.status(400).json({ error: authType === 'token'
+        ? 'name, base_url and API token are required'
+        : 'name, base_url, username and password are required' });
     }
     let normalized;
     try { normalized = normalizeBaseUrl(baseUrl); } catch (err) { return res.status(400).json({ error: err.message }); }
+    const probe = new XuiClient({
+      baseUrl: normalized,
+      authType,
+      username,
+      password: authType === 'password' ? credential : '',
+      token: authType === 'token' ? credential : '',
+    });
+    let capabilities;
+    try {
+      await probe.listInbounds();
+      capabilities = await probe.detectCapabilities();
+    } catch (err) {
+      return res.status(400).json({ error: `panel connection failed: ${err.message}` });
+    }
     try {
       const result = db.prepare(`
-        INSERT INTO xui_panels (name, base_url, username, password_enc, created_at)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(String(name).slice(0, 80), normalized, String(username).slice(0, 120), encrypt(cryptKey, password), Date.now());
-      auditEvent(null, 'hub', 'xui_panel_add', { name, base_url: normalized }, 0, '3x-ui panel saved');
-      res.status(201).json({ id: Number(result.lastInsertRowid), name, base_url: normalized, username });
+        INSERT INTO xui_panels (name, base_url, username, auth_type, password_enc, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(String(name).slice(0, 80), normalized, username.slice(0, 120), authType, encrypt(cryptKey, credential), Date.now());
+      auditEvent(null, 'hub', 'xui_panel_add', { name, base_url: normalized, auth_type: authType }, 0, '3x-ui panel saved');
+      res.status(201).json({
+        id: Number(result.lastInsertRowid), name, base_url: normalized, username,
+        auth_type: authType, capability: capabilities.mode,
+      });
     } catch (err) {
       res.status(err.code === 'SQLITE_CONSTRAINT_UNIQUE' ? 409 : 400).json({ error: err.message });
     }
-  });
+  }));
 
   authed.delete('/xui-panels/:id', (req, res) => {
     try {

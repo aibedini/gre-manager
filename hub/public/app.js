@@ -1260,23 +1260,39 @@ async function loadRoutes() {
 $('#btn-add-panel').addEventListener('click', () => {
   openModal(`
     <h2>Add 3x-ui panel</h2>
-    <p class="sub">Credentials are encrypted at rest and used only for panel automation.</p>
+    <p class="sub">3.x automation should use an admin API token. Legacy 2.x panels use username and password. Credentials are encrypted at rest.</p>
     <form id="panel-form">
       <div class="field"><label>Name</label><input name="name" required maxlength="80" /></div>
       <div class="field"><label>Panel URL</label><input name="base_url" type="url" required placeholder="https://panel.example.com:2053/path" /></div>
-      <div class="field"><label>Username</label><input name="username" required autocomplete="username" /></div>
-      <div class="field"><label>Password</label><input name="password" type="password" required autocomplete="current-password" /></div>
+      <div class="field"><label>Authentication</label><select name="auth_type"><option value="token">API token — 3.x (recommended)</option><option value="password">Username + password — legacy 2.x</option></select></div>
+      <div class="field" id="panel-token-wrap"><label>Admin API token</label><input name="token" type="password" required autocomplete="off" /><div class="hint">3x-ui: Settings → Security → API Token. Use an admin-scope token.</div></div>
+      <div id="panel-password-wrap" class="hidden">
+        <div class="field"><label>Username</label><input name="username" autocomplete="username" /></div>
+        <div class="field"><label>Password</label><input name="password" type="password" autocomplete="current-password" /></div>
+      </div>
       <div class="form-error" id="panel-error"></div>
       <div class="foot"><button type="button" class="btn btn-ghost modal-cancel">Cancel</button><button class="btn">Save panel</button></div>
     </form>`);
   $('.modal-cancel').addEventListener('click', closeModal);
+  const panelForm = $('#panel-form');
+  const syncPanelAuth = () => {
+    const tokenMode = panelForm.auth_type.value === 'token';
+    $('#panel-token-wrap').classList.toggle('hidden', !tokenMode);
+    $('#panel-password-wrap').classList.toggle('hidden', tokenMode);
+    panelForm.token.required = tokenMode;
+    panelForm.username.required = !tokenMode;
+    panelForm.password.required = !tokenMode;
+  };
+  panelForm.auth_type.addEventListener('change', syncPanelAuth);
+  syncPanelAuth();
   $('#panel-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const form = e.target;
     try {
       await api('/api/xui-panels', { method: 'POST', body: {
         name: form.name.value.trim(), base_url: form.base_url.value.trim(),
-        username: form.username.value.trim(), password: form.password.value,
+        auth_type: form.auth_type.value, username: form.username.value.trim(),
+        password: form.password.value, token: form.token.value,
       } });
       closeModal();
       await loadRoutes();

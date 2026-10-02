@@ -7,53 +7,107 @@ function normalizeBaseUrl(value) {
   if (!['http:', 'https:'].includes(url.protocol)) throw new Error('panel URL must use http or https');
   url.search = '';
   url.hash = '';
+  // Users often paste the visible /panel or /panel/inbounds URL. API and
+  // login routes are rooted one level above it, after any custom web base.
+  url.pathname = url.pathname.replace(/\/panel(?:\/.*)?\/?$/, '') || '/';
   return url.toString().replace(/\/$/, '');
 }
 
-function cookieFrom(headers) {
-  if (typeof headers.getSetCookie === 'function') return headers.getSetCookie().map((v) => v.split(';')[0]).join('; ');
+function setCookieValues(headers) {
+  if (typeof headers.getSetCookie === 'function') return headers.getSetCookie();
   const raw = headers.get('set-cookie') || '';
-  return raw.split(/,(?=[^;,]+=)/).map((v) => v.split(';')[0]).join('; ');
+  return raw ? raw.split(/,(?=[^;,]+=)/) : [];
+}
+
+function responseData(text) {
+  try { return text ? JSON.parse(text) : null; } catch { return text; }
 }
 
 class XuiClient {
-  constructor({ baseUrl, username, password, fetchImpl = global.fetch }) {
+  constructor({ baseUrl, authType = 'password', username = '', password = '', token = '', fetchImpl = global.fetch }) {
     this.baseUrl = normalizeBaseUrl(baseUrl);
+    this.authType = authType;
     this.username = username;
     this.password = password;
+    this.token = token;
     this.fetch = fetchImpl;
-    this.cookie = '';
+    this.cookies = new Map();
+    this.csrf = '';
+    this.authenticated = false;
   }
 
-  async login() {
-    const body = new URLSearchParams({ username: this.username, password: this.password });
-    const res = await this.fetch(`${this.baseUrl}/login`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body,
-      redirect: 'manual',
-    });
-    this.cookie = cookieFrom(res.headers);
-    if ((!res.ok && ![301, 302, 303].includes(res.status)) || !this.cookie) {
-      throw new Error(`3x-ui login failed (HTTP ${res.status})`);
+  absorbCookies(headers) {
+    for (const value of setCookieValues(headers)) {
+      const pair = value.split(';', 1)[0];
+      const at = pair.indexOf('=');
+      if (at > 0) this.cookies.set(pair.slice(0, at).trim(), pair.slice(at + 1).trim());
     }
   }
 
-  async request(path, { method = 'GET', body, allow404 = false } = {}) {
-    if (!this.cookie) await this.login();
+  cookieHeader() {
+    return [...this.cookies].map(([name, value]) => `${name}=${value}`).join('; ');
+  }
+
+  async raw(path, { method = 'GET', body, headers = {} } = {}) {
     const res = await this.fetch(`${this.baseUrl}${path}`, {
       method,
       headers: {
-        cookie: this.cookie,
         accept: 'application/json',
+        'x-requested-with': 'XMLHttpRequest',
+        ...(this.cookieHeader() ? { cookie: this.cookieHeader() } : {}),
+        ...headers,
+      },
+      body,
+      redirect: 'manual',
+      signal: AbortSignal.timeout(20000),
+    });
+    this.absorbCookies(res.headers);
+    const text = await res.text();
+    return { res, text, data: responseData(text) };
+  }
+
+  async authenticate() {
+    if (this.authenticated) return;
+    if (this.authType === 'token') {
+      if (!this.token) throw new Error('3x-ui API token is missing');
+      this.authenticated = true;
+      return;
+    }
+
+    // 3.x protects login and cookie-authenticated mutations with CSRF.
+    // 2.x has no endpoint here; a 404 simply selects the legacy flow.
+    const csrf = await this.raw('/csrf-token').catch(() => null);
+    if (csrf && csrf.res.ok && csrf.data && csrf.data.success !== false) {
+      this.csrf = String(csrf.data.obj || csrf.data.token || '');
+    }
+    const login = await this.raw('/login', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(this.csrf ? { 'x-csrf-token': this.csrf } : {}),
+      },
+      body: JSON.stringify({ username: this.username, password: this.password }),
+    });
+    if (!login.res.ok || (login.data && login.data.success === false) || !this.cookieHeader()) {
+      const detail = login.data && (login.data.msg || login.data.error) || `HTTP ${login.res.status}`;
+      throw new Error(`3x-ui login failed: ${detail}`);
+    }
+    this.authenticated = true;
+  }
+
+  async request(path, { method = 'GET', body, allow404 = false } = {}) {
+    await this.authenticate();
+    const unsafe = !['GET', 'HEAD', 'OPTIONS'].includes(method.toUpperCase());
+    const { res, text, data } = await this.raw(path, {
+      method,
+      headers: {
+        ...(this.authType === 'token' ? { authorization: `Bearer ${this.token}` } : {}),
+        ...(unsafe && this.authType !== 'token' && this.csrf ? { 'x-csrf-token': this.csrf } : {}),
         ...(body === undefined ? {} : { 'content-type': 'application/json' }),
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
-    if (allow404 && res.status === 404) return null;
-    const text = await res.text();
-    let data = null;
-    try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+    if (allow404 && (res.status === 404 || res.status === 405)) return null;
     if (!res.ok || (data && data.success === false)) {
       const detail = data && (data.msg || data.error) || String(text).slice(0, 300);
       const err = new Error(`3x-ui ${method} ${path} failed (HTTP ${res.status}): ${detail}`);
@@ -64,20 +118,21 @@ class XuiClient {
   }
 
   async detectCapabilities() {
-    const docs = await this.request('/docs/openapi.json', { allow404: true }).catch(() => null) ||
-      await this.request('/panel/api/docs/openapi.json', { allow404: true }).catch(() => null);
-    if (docs && docs.paths && Object.keys(docs.paths).some((p) => p.startsWith('/panel/api/hosts'))) {
-      return { mode: 'managed_hosts', evidence: 'openapi' };
+    let docs = null;
+    for (const path of ['/docs/openapi.json', '/panel/api/docs/openapi.json', '/openapi.json']) {
+      docs = await this.request(path, { allow404: true }).catch(() => null);
+      if (docs && docs.paths) break;
     }
-    for (const path of ['/panel/api/hosts', '/panel/api/hosts/list']) {
-      try {
-        const response = await this.request(path, { allow404: true });
-        if (response !== null) return { mode: 'managed_hosts', evidence: path };
-      } catch (err) {
-        if (err.status !== 404 && err.status !== 405) throw err;
-      }
+    if (docs && Object.keys(docs.paths).some((path) => path.startsWith('/panel/api/hosts'))) {
+      return { mode: 'managed_hosts' };
     }
-    return { mode: 'external_proxy', evidence: 'managed hosts API unavailable' };
+    const hosts = await this.request('/panel/api/hosts/list', { allow404: true }).catch((err) => {
+      if (err.status === 401 || err.status === 403) throw err;
+      return null;
+    });
+    return hosts === null
+      ? { mode: 'external_proxy' }
+      : { mode: 'managed_hosts' };
   }
 
   async listInbounds() {
@@ -94,21 +149,22 @@ class XuiClient {
   }
 
   deleteInbound(id) {
-    return this.request(`/panel/api/inbounds/del/${Number(id)}`, { method: 'DELETE' })
-      .catch(() => this.request(`/panel/api/inbounds/del/${Number(id)}`, { method: 'POST' }));
+    return this.request(`/panel/api/inbounds/del/${Number(id)}`, { method: 'POST' })
+      .catch(() => this.request(`/panel/api/inbounds/del/${Number(id)}`, { method: 'DELETE' }));
   }
 
   addHost(payload) {
     return this.request('/panel/api/hosts/add', { method: 'POST', body: payload });
   }
 
-  deleteHost(id) {
-    if (!id) return Promise.resolve();
-    return this.request(`/panel/api/hosts/delete/${Number(id)}`, { method: 'DELETE' }).catch(() => undefined);
+  deleteHost(groupId) {
+    if (!groupId) return Promise.resolve();
+    return this.request(`/panel/api/hosts/del/${encodeURIComponent(groupId)}`, { method: 'POST' });
   }
 
   async clientLinks(email) {
-    const data = await this.request(`/panel/api/clients/links/${encodeURIComponent(email)}`);
+    const data = await this.request(`/panel/api/clients/links/${encodeURIComponent(email)}`, { allow404: true });
+    if (data === null) return [];
     const obj = data && (data.obj || data.data || data);
     if (Array.isArray(obj)) return obj;
     if (obj && Array.isArray(obj.links)) return obj.links;
@@ -123,12 +179,18 @@ function parseShadowsocksLink(link) {
   if (at < 0) throw new Error('unsupported Shadowsocks link format');
   let userInfo = withoutFragment.slice(0, at);
   const endpoint = withoutFragment.slice(at + 1).split('?')[0];
-  try { userInfo = Buffer.from(userInfo.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'); } catch { /* plain SIP002 */ }
-  if (!userInfo.includes(':')) userInfo = decodeURIComponent(userInfo);
+  const decoded = Buffer.from(userInfo.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+  if (decoded.includes(':')) userInfo = decoded;
+  else userInfo = decodeURIComponent(userInfo);
   const split = userInfo.indexOf(':');
   const endpointMatch = endpoint.match(/^\[?([^\]]+)\]?:(\d+)$/);
   if (split < 1 || !endpointMatch) throw new Error('invalid Shadowsocks link');
   return { method: userInfo.slice(0, split), password: userInfo.slice(split + 1), host: endpointMatch[1], port: Number(endpointMatch[2]) };
 }
 
-module.exports = { XuiClient, normalizeBaseUrl, parseShadowsocksLink };
+function buildShadowsocksLink({ method, password, host, port, remark }) {
+  const userInfo = Buffer.from(`${method}:${password}`).toString('base64');
+  return `ss://${userInfo}@${host}:${port}#${encodeURIComponent(remark || '')}`;
+}
+
+module.exports = { XuiClient, normalizeBaseUrl, parseShadowsocksLink, buildShadowsocksLink };

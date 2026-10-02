@@ -70,6 +70,8 @@ build_sut() {
       -e 's|^WATCHDOG_SERVICE_FILE="/etc/systemd/system/multi-gre-watchdog.service"|WATCHDOG_SERVICE_FILE="${TEST_ROOT}/etc/systemd/system/multi-gre-watchdog.service"|' \
       -e 's|^WATCHDOG_TIMER_FILE="/etc/systemd/system/multi-gre-watchdog.timer"|WATCHDOG_TIMER_FILE="${TEST_ROOT}/etc/systemd/system/multi-gre-watchdog.timer"|' \
       -e 's|^INSTALL_PATH="/usr/local/sbin/gre"|INSTALL_PATH="${TEST_ROOT}/usr/local/sbin/gre"|' \
+        -e 's|^HUB_DIR="/opt/gre-hub"|HUB_DIR="${TEST_ROOT}/opt/gre-hub"|' \
+        -e 's|^HUB_SERVICE_FILE="/etc/systemd/system/gre-hub.service"|HUB_SERVICE_FILE="${TEST_ROOT}/etc/systemd/system/gre-hub.service"|' \
       -e 's|^AUDIT_LOG="/var/log/gre-manager.log"|AUDIT_LOG="${TEST_ROOT}/var/log/gre-manager.log"|' \
       -e 's|if \[\[ ${EUID:-$(id -u)} -ne 0 \]\]; then|if false; then|' \
       -e 's|tar -czf "$path" -C / etc/multi-gre|tar -czf "$path" -C "${TEST_ROOT:-/}" etc/multi-gre|' \
@@ -634,6 +636,10 @@ EOF
 cat > "$R/update-fixtures/newer" <<EOF
 #!/usr/bin/env bash
 VERSION="$NEWER_VERSION"
+if [[ "\${1:-}" == "hub" && "\${2:-}" == "install" && "\${3:-}" == "--yes" ]]; then
+    touch "\$TEST_ROOT/state/hub-updated"
+    exit 0
+fi
 EOF
 cat > "$R/update-fixtures/failure" <<'EOF'
 #!/usr/bin/env bash
@@ -683,9 +689,11 @@ assert "asset failure leaves installed file unchanged" grep -qx "sentinel" "$R/u
 assert_not "updater never falls back to raw main" grep -q "raw.githubusercontent.com" "$R/state/update-urls"
 
 printf 'newer\n' > "$R/state/update-mode"
+mkdir -p "$R/opt/gre-hub"
 PATH="$UPDATE_STUBS:$PATH" gre update --yes
 assert "newer release update succeeds" test "$GRE_RC" -eq 0
 assert "newer release replaces installed file" grep -q "^VERSION=\"$NEWER_VERSION\"" "$R/usr/local/sbin/gre"
+assert "installed hub updates with matching release" test -f "$R/state/hub-updated"
 rm -rf "$R"
 
 # ======================================================================

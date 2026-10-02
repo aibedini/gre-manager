@@ -3,7 +3,7 @@
 const crypto = require('crypto');
 const ssh = require('./ssh');
 const actions = require('./actions');
-const { XuiClient, parseShadowsocksLink } = require('./xui');
+const { XuiClient, parseShadowsocksLink, buildShadowsocksLink } = require('./xui');
 const { encrypt, decrypt } = require('./crypto');
 
 const DEFAULT_RANGE = [3000, 3999];
@@ -100,10 +100,13 @@ class RouteOrchestrator {
   }
 
   client(panel) {
+    const credential = decrypt(this.cryptKey, panel.password_enc);
     return new XuiClient({
       baseUrl: panel.base_url,
+      authType: panel.auth_type || 'password',
       username: panel.username,
-      password: decrypt(this.cryptKey, panel.password_enc),
+      password: panel.auth_type === 'token' ? '' : credential,
+      token: panel.auth_type === 'token' ? credential : '',
       fetchImpl: this.fetchImpl,
     });
   }
@@ -223,7 +226,7 @@ class RouteOrchestrator {
     const clientPassword = securePassword();
     let greCreated = false;
     let inboundId = null;
-    let hostId = null;
+    let hostGroupId = null;
     try {
       const [iranIp, foreignIp] = await Promise.all([this.publicIp(iran), this.publicIp(foreign)]);
       const capability = await client.detectCapabilities();
@@ -252,14 +255,22 @@ class RouteOrchestrator {
         const response = await client.addHost({
           inboundIds: [inboundId], remark: `GRE-${input.name}`, hosts: [iranIp], port, security: 'same', tags: [],
         });
-        hostId = Number(response && response.obj && response.obj.id) || null;
+        const host = response && (response.obj || response.data || response);
+        hostGroupId = host && (host.groupId || host.id) || null;
       }
 
       const links = await client.clientLinks(email);
-      const link = links.find((item) => typeof item === 'string' && item.startsWith('ss://'));
-      if (!link) throw new Error('3x-ui returned no Shadowsocks client link');
-      const parsed = parseShadowsocksLink(link);
-      if (parsed.host !== iranIp || parsed.port !== port || parsed.method !== method || parsed.password !== clientPassword) {
+      const shadowsocksLinks = links.filter((item) => typeof item === 'string' && item.startsWith('ss://'));
+      const link = shadowsocksLinks.length
+        ? shadowsocksLinks.find((item) => {
+          try {
+            const candidate = parseShadowsocksLink(item);
+            return candidate.host === iranIp && candidate.port === port &&
+              candidate.method === method && candidate.password === clientPassword;
+          } catch { return false; }
+        })
+        : buildShadowsocksLink({ method, password: clientPassword, host: iranIp, port, remark: `GRE-${input.name}` });
+      if (!link) {
         throw new Error('generated Shadowsocks link does not match the IRAN endpoint, selected port, method, or client password');
       }
       const greHealth = await this.remote(iran, `ip link show ${shellQuote(`gre-${peer}`)} 2>/dev/null | grep -q '<[^>]*UP'`, 15000);
@@ -289,8 +300,8 @@ class RouteOrchestrator {
       };
     } catch (err) {
       const rollback = [];
-      if (hostId) {
-        try { await client.deleteHost(hostId); rollback.push('host'); } catch (rollbackErr) { rollback.push(`host failed: ${rollbackErr.message}`); }
+      if (hostGroupId) {
+        try { await client.deleteHost(hostGroupId); rollback.push('host'); } catch (rollbackErr) { rollback.push(`host failed: ${rollbackErr.message}`); }
       }
       if (inboundId) {
         try { await client.deleteInbound(inboundId); rollback.push('inbound'); } catch (rollbackErr) { rollback.push(`inbound failed: ${rollbackErr.message}`); }
