@@ -192,6 +192,8 @@ function applyRouteLivePreflight(RouteOrchestrator) {
         host_mode: capabilities.hostMode,
         panel_version_snapshot: version && version.version ? version.version : null,
       });
+      this.event(routeId, 'client_model_detected', 'PASS', `client=${capabilities.clientModel}; hosts=${capabilities.hostMode}`);
+      this.event(routeId, 'xui_capability', 'PASS', `client=${capabilities.clientModel}; hosts=${capabilities.hostMode}`);
       this.reportPanelMetadata(panel, { version, clientModel: capabilities.clientModel, hostMode: capabilities.hostMode });
     } catch (err) {
       const message = contextualError('3x-ui panel capability probe', err, XUI_TIMEOUT_MS);
