@@ -1866,6 +1866,10 @@ function renderFailureSummary(route) {
 
 async function openRouteTimeline(route) {
   stopProvisioningTimeline();
+  // Attempt separators are tracked across incremental renders, so the counter
+  // has to start fresh for each modal. Otherwise opening a route at attempt 1
+  // after viewing one at attempt 2 silently drops the "Attempt #1" header.
+  timelineAttemptSeen = 1;
   const detail = await api(`/api/gre-routes/${route.id}`).catch(() => route);
   const merged = { ...route, ...detail };
   openModal(timelineShellHtml(headerFor(merged)));
@@ -1896,6 +1900,7 @@ async function refreshTimeline(routeId, known = null) {
 
 function startProvisioningTimeline(created) {
   stopProvisioningTimeline();
+  timelineAttemptSeen = 1;
   const initial = {
     id: created.route_id,
     name: created.name,

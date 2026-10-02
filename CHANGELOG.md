@@ -4,6 +4,22 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.2] - 2026-10-02
+
+### Fixed
+
+- The provisioning timeline no longer drops the `Attempt #1` header. Attempt
+  separators are tracked across incremental renders in a module-level counter
+  that was never reset per modal, so opening a route at attempt 1 after viewing
+  one at attempt 2 silently omitted the separator. Both entry points (the create
+  dialog and the row's Timeline action) now reset it, and the create/retry path
+  seeds it so a retried route shows its attempt boundaries correctly.
+
+Everything below (the updater rewrite, build identity, panel diagnostics, the
+provisioning timeline, reconcile and the route lifecycle controls) plus the
+native-module install policy first shipped in v2.12.1 with no other functional
+changes here.
+
 ## [2.12.1] - 2026-10-02
 
 ### Fixed
