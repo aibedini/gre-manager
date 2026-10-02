@@ -9,6 +9,16 @@ const { WebSocketServer } = require('ws');
 const { openDb } = require('./db');
 const cryptoUtil = require('./crypto');
 const ssh = require('./ssh');
+const { RouteOrchestrator } = require('./route-orchestrator');
+const { applyRouteLivePreflight } = require('./route-live-preflight');
+
+// Apply the live-preflight layer before the router creates its orchestrator.
+// `legacy` exists only for the old synchronous integration fixture; production
+// defaults to live mode and the dedicated live-preflight suite exercises it.
+if (process.env.HUB_ROUTE_PREFLIGHT_MODE !== 'legacy') {
+  applyRouteLivePreflight(RouteOrchestrator);
+}
+
 const { createRouter, consumeTicket, makeSshOpts } = require('./routes');
 const versionInfo = require('./version');
 
@@ -24,7 +34,6 @@ const cryptKey = cryptoUtil.loadKey(DATA_DIR);
 // reserved but never finished. Flag them for review — never destroy remote
 // state whose real condition we cannot know — and let Reconcile inspect them.
 try {
-  const { RouteOrchestrator } = require('./route-orchestrator');
   const stranded = new RouteOrchestrator({ db, cryptKey, sshOptsFor: () => ({}) }).sweepAbandoned();
   if (stranded.length) console.warn(`gre-hub: flagged ${stranded.length} interrupted route(s) as STALE: ${stranded.join(', ')}`);
 } catch (err) {
