@@ -75,8 +75,8 @@ async function verifyPort(orchestrator, route, client) {
   const usage = await orchestrator.collectUsage(iran, foreign, client);
 
   const preferred = orchestrator.inspectCandidate(usage, iran.id, foreign.id, route.port);
-  const ownRegistryOnly = preferred.conflict_route === route.name && !remoteEvidence(preferred);
-  if (preferred.free || ownRegistryOnly) return { port: route.port, changed: false };
+  const otherRegistryConflict = orchestrator.registryConflict(iran.id, foreign.id, route.port, route.id);
+  if (!remoteEvidence(preferred) && !otherRegistryConflict) return { port: route.port, changed: false };
 
   for (let port = DEFAULT_START; port <= DEFAULT_END; port++) {
     if (port === route.port || AVOID_PORTS.has(port)) continue;
@@ -94,17 +94,17 @@ async function verifyPort(orchestrator, route, client) {
   throw new Error(`port ${route.port} is occupied and no free TCP+UDP port was found in ${DEFAULT_START}-${DEFAULT_END}`);
 }
 
-async function checkDirection(orchestrator, routeId, stageName, source, destination, sourceLabel, destinationLabel) {
+async function checkDirection(orchestrator, routeId, stageName, source, sourceIp, destination, destinationIp, sourceLabel, destinationLabel) {
   const stage = orchestrator.stage(routeId, stageName,
-    `${sourceLabel} ${source.name} (${source.host}) -> ${destinationLabel} ${destination.name} (${destination.host})`);
+    `${sourceLabel} ${source.name} (${sourceIp}) -> ${destinationLabel} ${destination.name} (${destinationIp})`);
   try {
-    const result = await orchestrator.remote(source, `ping -4 -c 2 -W 2 ${destination.host}`, 15000);
+    const result = await orchestrator.remote(source, `ping -4 -c 2 -W 2 ${destinationIp}`, 15000);
     if (result.rc !== 0) {
       const detail = String(result.stderr || result.stdout || `ping exited ${result.rc}`).trim().slice(0, 1000);
       stage.fail(`${sourceLabel} -> ${destinationLabel} unreachable: ${detail}`);
-      throw new Error(`${sourceLabel} cannot reach ${destinationLabel} public IP ${destination.host}: ${detail}`);
+      throw new Error(`${sourceLabel} cannot reach ${destinationLabel} public IP ${destinationIp}: ${detail}`);
     }
-    stage.pass(`${sourceLabel} ${source.host} -> ${destinationLabel} ${destination.host}: reachable`);
+    stage.pass(`${sourceLabel} ${sourceIp} -> ${destinationLabel} ${destinationIp}: reachable`);
   } catch (err) {
     if (!String(err.message || '').includes('cannot reach')) {
       stage.fail(contextualError(`${sourceLabel} -> ${destinationLabel} reachability check`, err, 15000));
@@ -244,11 +244,23 @@ function applyRouteLivePreflight(RouteOrchestrator) {
       throw new Error(message);
     }
 
+    const ipStage = this.stage(routeId, 'public_ip_preflight', 'Resolving public IPv4 for IRAN and FOREIGN');
+    let iranIp;
+    let foreignIp;
+    try {
+      [iranIp, foreignIp] = await Promise.all([this.publicIp(iran), this.publicIp(foreign)]);
+      ipStage.pass(`IRAN ${iranIp}; FOREIGN ${foreignIp}`);
+    } catch (err) {
+      const message = contextualError('public IPv4 detection', err, 30000);
+      ipStage.fail(message);
+      throw new Error(message);
+    }
+
     // Explicit per-direction checks. These are before originalRun(), therefore
     // no GRE node/peer/inbound can be created when either public path is blocked.
     await Promise.all([
-      checkDirection(this, routeId, 'connectivity_iran_to_foreign', iran, foreign, 'IRAN', 'FOREIGN'),
-      checkDirection(this, routeId, 'connectivity_foreign_to_iran', foreign, iran, 'FOREIGN', 'IRAN'),
+      checkDirection(this, routeId, 'connectivity_iran_to_foreign', iran, iranIp, foreign, foreignIp, 'IRAN', 'FOREIGN'),
+      checkDirection(this, routeId, 'connectivity_foreign_to_iran', foreign, foreignIp, iran, iranIp, 'FOREIGN', 'IRAN'),
     ]);
     this.event(routeId, 'connectivity_preflight', 'PASS', 'IRAN -> FOREIGN and FOREIGN -> IRAN public reachability passed');
 
