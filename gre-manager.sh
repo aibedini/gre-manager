@@ -62,7 +62,7 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are validated then sourced by design
 set -uo pipefail
 
-VERSION="2.13.2"
+VERSION="2.13.3"
 
 GITHUB_REPO="aibedini/gre-manager"
 

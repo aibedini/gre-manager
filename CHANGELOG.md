@@ -4,6 +4,17 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.13.3] - 2026-10-03
+
+### Fixed
+
+- Auto Route now prefers the fast `/panel/api/inbounds/list/slim` inventory on
+  3x-ui v3.7 panels where `/panel/api/inbounds/options` exists but can stall.
+- A timeout from one lightweight inbound-port endpoint now advances to the next
+  compatible endpoint instead of failing the entire route immediately.
+- Provisioning still stops safely when every lightweight and legacy inventory
+  endpoint fails, preserving collision protection before GRE changes begin.
+
 ## [2.13.2] - 2026-10-03
 
 ### Fixed

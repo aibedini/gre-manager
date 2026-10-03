@@ -20,8 +20,9 @@ const PORT_XUI_TIMEOUT_MS = Math.max(5000, Number(process.env.HUB_PORT_XUI_TIMEO
 // Do not ask 3x-ui for the heavyweight full inbound list here: on a panel with a
 // large client population `/panel/api/inbounds/list` can spend tens of seconds
 // serializing traffic/client payloads. 3x-ui v3.7 exposes `/options` specifically
-// as the lightweight id/remark/protocol/port projection; `/list/slim` is the
-// next-best compatible fallback.
+// as lightweight id/remark/protocol/port projections. Prefer `/list/slim`:
+// some real v3.7 panels expose `/options` but build it slowly enough to time
+// out. A timeout on one projection must not prevent trying the other.
 function portProbeCommand() {
   return [
     "echo '---listeners---'", 'ss -H -lntup 2>/dev/null || true',
@@ -109,13 +110,13 @@ async function listInboundPortIndex(client) {
   const previousTimeout = Number(client.timeoutMs) || XUI_TIMEOUT_MS;
   client.timeoutMs = Math.min(previousTimeout, PORT_XUI_TIMEOUT_MS);
   try {
-    for (const path of ['/panel/api/inbounds/options', '/panel/api/inbounds/list/slim']) {
+    for (const path of ['/panel/api/inbounds/list/slim', '/panel/api/inbounds/options']) {
       let result;
       try {
         result = await client.request(path, { allowFailure: true });
       } catch (err) {
-        if (timeoutLike(err) || !endpointUnavailable(err)) throw err;
-        continue;
+        if (timeoutLike(err) || endpointUnavailable(err)) continue;
+        throw err;
       }
       if (result && result.ok) {
         const rows = unwrapPanelPayload(result.data);

@@ -148,10 +148,10 @@ async function prepare(orchestrator) {
     ok(orchestrator.stageLog.some((e) => e.name === stage && e.status === 'PASS'), `${stage} must emit PASS`);
   }
 
-  ok(orchestrator.requestPaths.includes('/panel/api/inbounds/options'), 'port check must use the lightweight 3x-ui inbound options endpoint');
+  ok(orchestrator.requestPaths.includes('/panel/api/inbounds/list/slim'), 'port check must prefer the lightweight 3x-ui slim endpoint');
   ok(!orchestrator.requestPaths.includes('/panel/api/inbounds/list'), '3x-ui 3.7 port check must not fetch the heavyweight full inbound list');
   const xuiPass = orchestrator.stageLog.find((e) => e.name === 'port_check_xui' && e.status === 'PASS');
-  ok(/\/panel\/api\/inbounds\/options/.test(xuiPass.detail), 'timeline must report which lightweight endpoint supplied the port inventory');
+  ok(/\/panel\/api\/inbounds\/list\/slim/.test(xuiPass.detail), 'timeline must report which lightweight endpoint supplied the port inventory');
 
   ok(orchestrator.eventsLog.some((e) => e.stage === 'connectivity_preflight' && e.status === 'PASS'), 'bidirectional connectivity summary must be persisted');
 
@@ -159,7 +159,15 @@ async function prepare(orchestrator) {
   const message = contextualError('3x-ui client preflight', abort, 45000);
   ok(message.includes('3x-ui client preflight timed out after 45s'), 'opaque AbortError must gain stage and timeout context');
 
-  const failing = new FakeOrchestrator({ failXuiPortQuery: true });
+  const fallbackAfterTimeout = new FakeOrchestrator({ failXuiPortQuery: true, slimUnavailable: true });
+  const fallbackPrepared = await prepare(fallbackAfterTimeout);
+  await fallbackAfterTimeout.run(77, fallbackPrepared);
+  ok(fallbackAfterTimeout.requestPaths.includes('/panel/api/inbounds/list'),
+    'a timeout on one lightweight endpoint must continue through the safe fallback chain');
+  ok(fallbackAfterTimeout.originalCalled, 'provisioning must continue after a fallback inventory succeeds');
+
+  const failing = new FakeOrchestrator({ failXuiPortQuery: true, slimUnavailable: true });
+  failing._client.listInbounds = async () => { throw new Error('The operation was aborted due to timeout'); };
   const failingPrepared = await prepare(failing);
   let failure = null;
   try {
@@ -167,7 +175,7 @@ async function prepare(orchestrator) {
   } catch (err) {
     failure = err;
   }
-  ok(failure, 'a failed lightweight 3x-ui port query must stop provisioning');
+  ok(failure, 'failure of every 3x-ui port inventory endpoint must stop provisioning');
   ok(/3x-ui inbound-port query timed out after 12s/.test(failure.message), 'port failure must identify 3x-ui and the bounded 12s timeout');
   ok(failing.stageLog.some((e) => e.name === 'port_check_xui' && e.status === 'FAIL' && /12s/.test(e.detail)), 'timeline must mark port_check_xui FAIL with the exact timeout');
   ok(failing.stageLog.some((e) => e.name === 'port_check_iran' && e.status === 'PASS'), 'IRAN port inventory result remains visible when 3x-ui fails');
