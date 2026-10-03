@@ -4,6 +4,47 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.13.4] - 2026-10-03
+
+### Fixed
+
+- **`link_fetch` could hang until it timed out when reusing an existing
+  first-class 3x-ui client**, failing the route with
+  `3x-ui did not return a Shadowsocks link for the existing client 'navid' ...
+  The operation was aborted due to timeout`. 3x-ui v3.1+ stores first-class
+  client credentials in a global client row, and
+  `GET /panel/api/clients/links/:email` expands links across **every** inbound
+  that client is attached to. On a panel where the client is attached to many
+  inbounds — the normal situation for a long-lived identity such as `navid` —
+  that enumeration is slow enough to exhaust the request budget, and the previous
+  code retried it twice with 500ms/1500ms backoff before giving up.
+- Route provisioning no longer calls `/panel/api/clients/links/:email` for an
+  existing first-class client. It reads the authoritative record from
+  `GET /panel/api/clients/get/:email` instead, which is a single cheap lookup and
+  contains the exact password 3x-ui copied into the newly created Shadowsocks
+  inbound during attach. Embedded/legacy panels keep using the original
+  panel-issued link path, because there the credential source really is the
+  inbound settings object.
+- A route that created its own client still rebuilds the link from the credential
+  it owns, with no panel round trip at all.
+- If a first-class client record has no password, provisioning now fails
+  immediately with an explicit message instead of falling through to the slow
+  link enumeration and timing out.
+- The `link_fetch` / `link_validate` timeline text is source-neutral, so it no
+  longer claims a panel-issued link was fetched when the credential actually came
+  from the first-class client record:
+  - `RUNNING link_fetch` → `Resolving Shadowsocks credential and share link for navid`
+  - `PASS link_fetch` → `Client credential resolved; share link ready`
+  - `PASS link_validate` → `Endpoint, method and client credential validated`
+
+### Tests
+
+- New `scripts/credential-fastpath-test.js` (21 assertions) pins the behaviour:
+  exactly one `/clients/get` call, **zero** `/clients/links` calls, the slow
+  legacy resolver bypassed, the existing password preserved byte-for-byte into
+  the rebuilt link, the link method/host/port matching the new route, the
+  embedded and legacy paths unchanged, and the new timeline wording.
+
 ## [2.13.3] - 2026-10-03
 
 ### Fixed
