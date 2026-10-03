@@ -11,6 +11,7 @@ const cryptoUtil = require('./crypto');
 const ssh = require('./ssh');
 const { RouteOrchestrator } = require('./route-orchestrator');
 const { applyRouteLivePreflight } = require('./route-live-preflight');
+const { applyRouteCredentialFastPath } = require('./route-credential-fastpath');
 
 // Apply the live-preflight layer before the router creates its orchestrator.
 // `legacy` exists only for the old synchronous integration fixture; production
@@ -18,6 +19,10 @@ const { applyRouteLivePreflight } = require('./route-live-preflight');
 if (process.env.HUB_ROUTE_PREFLIGHT_MODE !== 'legacy') {
   applyRouteLivePreflight(RouteOrchestrator);
 }
+// Existing first-class 3x-ui clients expose their authoritative Shadowsocks
+// password via /clients/get. Avoid the much heavier /clients/links expansion
+// when provisioning a route, which can time out on busy panels.
+applyRouteCredentialFastPath(RouteOrchestrator);
 
 const { createRouter, consumeTicket, makeSshOpts } = require('./routes');
 const versionInfo = require('./version');
