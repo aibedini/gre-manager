@@ -38,6 +38,39 @@ function applyRouteCredentialFastPath(RouteOrchestrator) {
     throw new Error('RouteOrchestrator.resolveClientCredential is required');
   }
 
+  // The core orchestrator predates this fast path and describes link_fetch as
+  // a panel-link request. Keep the timeline truthful regardless of whether the
+  // credential came from a first-class client record, a route-owned key, or a
+  // legacy panel-issued link.
+  if (typeof proto.stage === 'function') {
+    const originalStage = proto.stage;
+    proto.stage = function credentialAwareStage(routeId, name, detail) {
+      const startDetail = name === 'link_fetch'
+        ? String(detail || '').replace(/^Requesting the panel-issued share link for /, 'Resolving Shadowsocks credential and share link for ')
+        : detail;
+      const stage = originalStage.call(this, routeId, name, startDetail);
+      if (name === 'link_fetch' && stage && typeof stage.pass === 'function') {
+        const originalPass = stage.pass.bind(stage);
+        stage.pass = (message) => originalPass(
+          message === 'Panel link received' ? 'Client credential resolved; share link ready' : message
+        );
+      }
+      return stage;
+    };
+  }
+
+  if (typeof proto.event === 'function') {
+    const originalEvent = proto.event;
+    proto.event = function credentialAwareEvent(routeId, stage, status, detail) {
+      let safeDetail = detail;
+      if (stage === 'link_validate' && status === 'PASS' &&
+          detail === 'Endpoint, method and client credential validated against the panel-issued link') {
+        safeDetail = 'Endpoint, method and client credential validated';
+      }
+      return originalEvent.call(this, routeId, stage, status, safeDetail);
+    };
+  }
+
   proto.resolveClientCredential = async function resolveClientCredentialFast(args = {}) {
     const {
       client,
