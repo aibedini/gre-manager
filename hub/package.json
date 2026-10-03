@@ -1,6 +1,6 @@
 {
   "name": "gre-hub",
-  "version": "2.13.4",
+  "version": "2.13.5",
   "private": true,
   "description": "Central web dashboard and SSH hub for gre-manager servers",
   "main": "server/index.js",

@@ -4,6 +4,67 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.13.5] - 2026-10-03
+
+### Fixed
+
+- **The post-attach credential read could also block until the 45s timeout.**
+  v2.13.4 correctly removed the slow `/panel/api/clients/links/:email`
+  enumeration, but its replacement — a post-attach
+  `GET /panel/api/clients/get/:email` — proved to be just as slow on a real
+  3x-ui v3.7.0 panel. Route provisioning failed at the last step with:
+  `3x-ui could not read the first-class client 'navid' after attachment:
+  The operation was aborted due to timeout`, after `client_preflight`,
+  `inbound_add`, `client_attach` and `managed_host_add` had all already passed.
+  The client-detail endpoint builds attachment, traffic and tunnel metadata, so
+  asking for it again while the panel is busy is the wrong source for a
+  credential we have already read once.
+
+### Changed
+
+- For an existing first-class client, the credential is now captured during the
+  **already-successful pre-mutation `client_preflight`** read of
+  `GET /panel/api/clients/get/:email`. It is held in memory on the reused
+  `XuiClient` instance (a non-enumerable symbol-keyed map, never persisted) and
+  consumed exactly once by `link_fetch` after `client_attach`.
+- Normal live route provisioning therefore performs **no credential-related
+  3x-ui request at all after `client_attach`**: zero post-attach
+  `/panel/api/clients/get/:email` and zero `/panel/api/clients/links/:email`.
+  `link_fetch` completes immediately instead of waiting on the panel.
+- The cache is one-shot and time-bounded (2 minutes): a stale entry from an
+  earlier attempt can never donate a password, and each preflight read clears any
+  previous value before storing a new one.
+- If the preflight credential is unavailable (legacy preflight mode, or an empty
+  global password), the **only** fallback is
+  `GET /panel/api/inbounds/get/<new inbound id>`, extracting the password from
+  `settings.clients[]` for exactly the inbound this route just created. That read
+  is bounded to one inbound. It still never falls back to `/clients/get` or
+  `/clients/links` after attach.
+- The fallback validates that the inbound is Shadowsocks and that the attached
+  client's method matches the route before accepting its password, so a wrong or
+  partial read fails loudly instead of producing a link that cannot connect.
+- A route that created its own client still rebuilds the link from the credential
+  it owns, with no panel round trip.
+- Embedded/legacy panels are unchanged and keep the per-inbound panel-link path,
+  because there the credential source already is the inbound settings object.
+- No credential and no complete `ss://` link is ever written to `route_events`;
+  the persisted timeline carries only the source-neutral wording.
+- The existing global client is never recreated, never deleted and its password
+  is never changed: this path only reads and reuses what the panel already has.
+
+### Tests
+
+- `scripts/credential-fastpath-test.js` grew to 31 assertions and now pins the
+  whole matrix: exactly one `/clients/get` read (the preflight one), **zero**
+  post-attach panel requests when the preflight credential was captured, the
+  real password preserved byte-for-byte into the rebuilt link, the
+  `/panel/api/inbounds/get/:id` fallback issuing exactly one bounded read and no
+  `/clients/get`, a missing credential failing loudly instead of hanging, the
+  route-owned and embedded paths unchanged, and the timeline wording.
+- `scripts/_xui-mock.js` models the single-inbound detail endpoint so the
+  fallback is exercised against a realistic panel rather than a stub that cannot
+  answer it.
+
 ## [2.13.4] - 2026-10-03
 
 ### Fixed
