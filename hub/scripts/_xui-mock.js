@@ -46,6 +46,7 @@ const VERSION_FIXTURES = {
       'POST /panel/api/inbounds/updateClient/:clientId': true,
       'POST /panel/api/inbounds/:id/delClient/:clientId': true,
       'GET /panel/api/inbounds/getClientLinks/:id/:email': false,
+      'GET /panel/api/inbounds/get/:id': true,
       'POST /panel/api/inbounds/add': true,
       'GET /panel/api/inbounds/list': true,
       'GET /panel/api/hosts/list': false,
@@ -63,6 +64,7 @@ const VERSION_FIXTURES = {
       'POST /panel/api/inbounds/updateClient/:clientId': true,
       'POST /panel/api/inbounds/:id/delClient/:clientId': true,
       'GET /panel/api/inbounds/getClientLinks/:id/:email': true,
+      'GET /panel/api/inbounds/get/:id': true,
       'POST /panel/api/inbounds/add': true,
       'GET /panel/api/inbounds/list': true,
       'GET /panel/api/hosts/list': false,
@@ -77,6 +79,7 @@ const VERSION_FIXTURES = {
     hostsApi: false,
     endpoints: {
       'POST /panel/api/inbounds/addClient': false,
+      'GET /panel/api/inbounds/get/:id': true,
       'POST /panel/api/inbounds/add': true,
       'GET /panel/api/inbounds/list': true,
       'GET /panel/api/hosts/list': false,
@@ -95,6 +98,7 @@ const VERSION_FIXTURES = {
     hostsApi: true,
     endpoints: {
       'POST /panel/api/inbounds/addClient': false,
+      'GET /panel/api/inbounds/get/:id': true,
       'POST /panel/api/inbounds/add': true,
       'GET /panel/api/inbounds/list': true,
       'GET /panel/api/hosts/list': true,
@@ -288,6 +292,24 @@ function makeMockPanel(options = {}) {
         protocol: inbound.protocol,
         settings: JSON.stringify(inbound.settings),
       })));
+    }
+    const getInbound = lower.match(/^\/panel\/api\/inbounds\/get\/(\d+)$/);
+    if (getInbound) {
+      const inbound = findInbound(Number(getInbound[1]));
+      if (!inbound) return fail('record not found');
+      // Upstream GetInboundDetail returns one full inbound and keeps the full
+      // settings.clients[] objects. Return a detached copy so a caller cannot
+      // mutate panel state through the mock response object.
+      return ok({
+        id: inbound.id,
+        port: inbound.port,
+        remark: inbound.remark,
+        protocol: inbound.protocol,
+        settings: JSON.stringify({
+          ...inbound.settings,
+          clients: (inbound.settings.clients || []).map((client) => ({ ...client })),
+        }),
+      });
     }
     if (lower === '/panel/api/inbounds/add') {
       const payload = call.body || {};
