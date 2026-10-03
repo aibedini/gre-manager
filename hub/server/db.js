@@ -194,6 +194,16 @@ function openDb(dataDir) {
   ensureColumn(db, 'gre_routes', 'current_stage', 'current_stage TEXT');
   ensureColumn(db, 'gre_routes', 'panel_version_snapshot', 'panel_version_snapshot TEXT');
   ensureColumn(db, 'gre_routes', 'host_mode', "host_mode TEXT CHECK (host_mode IN ('managed_hosts','external_proxy'))");
+  // Persistent, encrypted client configuration so an ACTIVE route can always be
+  // copied again — after a browser refresh, and after the hub restarts. The
+  // in-memory routeResults cache is a convenience, never the source of truth.
+  ensureColumn(db, 'gre_routes', 'outbound_enc', 'outbound_enc TEXT');
+  ensureColumn(db, 'gre_routes', 'config_updated_at', 'config_updated_at INTEGER');
+  // Safe, non-secret summary of the last runtime validation (component -> PASS/WARN/FAIL).
+  ensureColumn(db, 'gre_routes', 'runtime_checks', 'runtime_checks TEXT');
+  // Public IRAN endpoint the client config points at. Stored so a config can be
+  // reconstructed without re-detecting public IPs over SSH.
+  ensureColumn(db, 'gre_routes', 'iran_endpoint', 'iran_endpoint TEXT');
   ensureColumn(db, 'route_events', 'attempt_no', 'attempt_no INTEGER NOT NULL DEFAULT 1');
 
   db.pragma(`user_version = ${SCHEMA_VERSION}`);

@@ -4,6 +4,145 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.14.0] - 2026-10-03
+
+Three production issues solved together, plus the client picker rework that was
+started in the same branch.
+
+### Fixed
+
+- **`runtime_validation` could hang for 45 seconds and then fail with no usable
+  detail.** In production a fully successful route —
+  `client_preflight`, `port_check`, both connectivity checks, `gre_pairing`,
+  `foreign_node_add`, `iran_peer_add`, `inbound_add`, `client_attach`,
+  `managed_host_add`, `link_fetch` and `link_validate` all PASS — died at
+  `runtime_validation` with `The operation was aborted due to timeout`, and the
+  rollback then removed a working tunnel. The cause was a single opaque promise
+  that called the heavyweight `/panel/api/inbounds/list` inventory (which
+  serializes every inbound's full settings blob) while sequentially chaining
+  several SSH reads, so one slow subsystem consumed the whole request budget.
+  It is now a set of small, independently timed checks:
+
+  | Stage | What it proves | Timeout |
+  | --- | --- | --- |
+  | `runtime_gre_iran` | IRAN `gre-<peer>` link exists and is UP | 10s |
+  | `runtime_gre_foreign` | FOREIGN `gre-<peer>` link exists and is UP | 10s |
+  | `runtime_iran_tcp_rule` | IRAN forwarding rule for the port | 10s |
+  | `runtime_iran_udp_rule` | IRAN UDP forwarding rule for the port | 10s |
+  | `runtime_foreign_tcp_listener` | something listens on `:port` | 10s |
+  | `runtime_foreign_udp_listener` | UDP listener on `:port` | 10s |
+  | `runtime_xui_inbound` | inbound detail for the route's inbound id | 10s |
+  | `runtime_xui_client` | the client appears in that inbound's `settings.clients[]` | 0s |
+  | `runtime_managed_host` | managed host present (metadata-only) | 10s |
+  | `runtime_e2e_tcp` | TCP connect to the IRAN public endpoint | 5s |
+  | `runtime_validation` | summary of all of the above | — |
+
+  Each emits its own `RUNNING` then `PASS`/`FAIL`, all independent checks run in
+  parallel via `allSettled` so one slow probe cannot cancel a sibling, and the
+  failure names the exact component:
+  `Runtime validation failed at IRAN TCP forwarding rule: no IRAN forwarding rule
+  for 3001`. The old opaque timeout string is gone.
+- **Runtime validation no longer touches any heavyweight panel endpoint.** The
+  only panel read is `GET /panel/api/inbounds/get/<inboundId>`; client membership
+  is answered from that same response, so `/inbounds/list`, `/clients/list`,
+  `/clients/links` and a post-attach `/clients/get` are all avoided.
+- **Duplicate pre-provision work removed.** `run()` re-detected public IPs and
+  re-ran bidirectional ping reachability even though the live preflight had just
+  proved both. Those `public_ip`/`connectivity` stages are gone; the preflight
+  owns public-path availability and runtime owns GRE/forwarding/listener/inbound.
+- **Delete is now idempotent.** Production hit a 409 on a route whose rollback had
+  already removed everything: Delete re-issued the removals, the GRE CLI answered
+  `Peer 'ir01' does not exist`, and the whole delete failed. Deletion's desired end
+  state is "resource absent", so each component is inspected first and an
+  already-absent resource is reported `ALREADY_ABSENT` as a **success**. A delete
+  that races and returns "not found" is tolerated the same way; only a genuine
+  error is a failure. The response is structured:
+  `{ ok, deleted, components: [{ name, previous, result, detail }], failures }`.
+  The globally existing client is still never deleted — only this route's
+  attachment is removed, and a route-created client that other inbounds still use
+  is detached and explicitly preserved.
+- **`rollback` no longer logs `[object Object]`.** Panel helpers return envelopes,
+  and interpolating one produced `client navid attachment removed: [object Object]`.
+  Results are now described safely, rollback steps report the exact stage
+  (`rollback_client_detach`, `rollback_inbound`, `rollback_iran_peer`,
+  `rollback_foreign_node`), and a resource that is already gone is a PASS.
+- **The route configuration is permanently retrievable.** `link_fetch` used to
+  produce a share link that only lived in the process-memory `routeResults` map,
+  so Copy Config stopped working after a hub restart. The effective configuration
+  is now persisted **encrypted** on the route row (`share_link_enc`,
+  `outbound_enc`, `config_updated_at`, plus `iran_endpoint`) and revealed through
+  a dedicated authenticated endpoint. An ACTIVE route from an earlier release that
+  has an encrypted credential but no stored link is reconstructed locally from
+  method + credential + IRAN endpoint + port and then persisted — no 3x-ui call and
+  never an invented credential. A FAILED route exposes nothing, and only an ACTIVE
+  route may reveal a configuration.
+
+### Added
+
+- `GET /api/gre-routes/:id/config` (ACTIVE only, `Cache-Control: no-store`):
+  returns `{ route_id, name, status, link, outbound, endpoint: { host, port } }`.
+  Never included in the route list, never in the timeline, never in logs, and the
+  reveal is audited as `route_config_reveal` with the route id and name only —
+  never the secret.
+- A **Config** action on every ACTIVE route row, with Reveal, Copy config,
+  Copy JSON and Show QR. Copying never contacts 3x-ui, never re-creates the client
+  and never changes the password. Non-ACTIVE routes show a disabled action with
+  "No active configuration — provisioning did not complete."
+- Shared read-only inspection primitives (`hub/server/route-inspection.js`),
+  now the single implementation of "what does the world actually look like":
+  `inspectGreInterface`, `inspectForwarding`, `inspectListeners`, `inspectInbound`,
+  `clientInInbound`, `inspectClientAttachment`, `inspectManagedHost`,
+  `inspectPortAllocation`, `probeTcpConnect`. Runtime validation, reconcile and
+  delete all use them, so the same question can no longer get two different
+  answers depending on which code path asks. Reconcile's own `grep -q` GRE probe
+  was replaced by the shared one.
+- A persisted, secret-free per-component validation summary
+  (`gre_routes.runtime_checks`), e.g.
+  `{"gre_iran":"PASS","xui_inbound":"PASS","e2e_tcp":"PASS",...}`, so the UI and
+  Reconcile can show what was actually verified.
+
+### Changed
+
+- The 202 create response now includes the panel's cached `client_model`
+  (and `panel_client_model`/`panel_version`), so the timeline header reads
+  `First-class / multi-inbound` from the first render instead of `unknown` — the
+  hub already knows the value from its last probe.
+- The client picker no longer downloads the panel inventory. It seeds one page
+  (`?paged=1&pageSize=20`), searches through the panel's paged endpoint with a
+  250 ms debounce, aborts a superseded request, and drops an out-of-order
+  response. Opening Create Route renders the cached panel model immediately,
+  starts the client page and the port check **in parallel**, and never blocks the
+  form.
+- `listFirstClassClients()` no longer calls `/panel/api/inbounds/list`; inbound
+  remarks come from the lightweight metadata projection, and the paged path does
+  not fetch them at all.
+- The event secret scrubber now covers share links (`ss://`, `vmess://`,
+  `vless://`, `trojan://`), `password`/`passwd`/`secret`/`privateKey` in prose and
+  JSON, `Authorization: Bearer`, cookies, CSRF tokens, session tokens and PEM
+  private-key blocks — while deliberately preserving route name, client email,
+  inbound id, IP, port, stage and panel version.
+
+### Tests
+
+- New `scripts/v214-test.js` (12 assertions): every runtime sub-stage exists and
+  announces RUNNING then PASS; runtime validation issues no heavyweight panel
+  call; a missing forwarding rule and an unreachable endpoint each fail at their
+  own named stage with a `RuntimeValidationError`; the persisted summary is
+  per-component and secret-free; a cleanly rolled-back route deletes successfully
+  with `ALREADY_ABSENT` components; a route-exclusive client may be deleted while
+  a shared one is preserved; an ACTIVE route exposes a valid config pointing at
+  the IRAN endpoint; **the config survives a hub restart with identical output and
+  zero panel calls**; a FAILED route exposes no config; and the inspection
+  primitives recognise already-absent errors while every check keeps its own
+  bounded timeout.
+- New `scripts/redaction-test.js` (18 assertions): 15 secret shapes are proven to
+  be scrubbed, operational facts are proven to survive, `event()` is proven to
+  sanitise on the way in, and empty/non-string input cannot throw.
+- `_harness.js` needed three small extensions to model the new probes: an
+  end-to-end TCP branch, a `MISSING` answer for a removed GRE peer, and a DOWN
+  link instead of a non-zero rc so a not-UP tunnel is distinguishable from a
+  broken probe.
+
 ## [2.13.5] - 2026-10-03
 
 ### Fixed

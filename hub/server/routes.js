@@ -4,6 +4,7 @@
 
 const express = require('express');
 const crypto = require('crypto');
+const QRCode = require('qrcode');
 const auth = require('./auth');
 const discovery = require('./discovery');
 const actions = require('./actions');
@@ -702,14 +703,49 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     }
   });
 
+  // Client picker feed.
+  //
+  // Opening the Create Route dialog must not probe the panel for capabilities
+  // (the hub already persisted the model in xui_panels during the last probe) and
+  // must not download the whole client inventory. `?paged=1` returns one page and
+  // supports `?search=`, which is what the dialog uses; without it the endpoint
+  // keeps its original full-listing contract for any other caller.
   authed.get('/xui-panels/:id/clients', wrap(async (req, res) => {
     const panel = db.prepare('SELECT * FROM xui_panels WHERE id = ?').get(req.params.id);
     if (!panel) return res.status(404).json({ error: 'not found' });
     const client = routeOrchestrator.client(panel);
-    const capabilities = await client.resolveCapabilities();
-    const clients = await client.listClients();
+
+    const paged = req.query.paged === '1';
+    const known = { clientModel: panel.client_model || null };
+
+    // Without a stored model we cannot avoid the probe. With one, the dialog
+    // renders immediately from the cache and never pays for detection.
+    const capabilities = known.clientModel
+      ? { clientModel: known.clientModel, hostMode: panel.host_mode || null }
+      : await client.resolveCapabilities();
+
+    const result = await client.listClients({
+      known,
+      paged,
+      search: req.query.search || '',
+      page: Number(req.query.page) || 1,
+      pageSize: Number(req.query.pageSize) || 20,
+      withInboundRemarks: false,
+    });
+
+    if (paged && result && Array.isArray(result.clients)) {
+      return res.json({
+        clients: result.clients,
+        paged: result.paged,
+        total: result.total,
+        page: result.page,
+        pageSize: result.pageSize,
+        client_model: capabilities.clientModel,
+        host_mode: capabilities.hostMode,
+      });
+    }
     res.json({
-      clients,
+      clients: Array.isArray(result) ? result : [],
       client_model: capabilities.clientModel,
       host_mode: capabilities.hostMode,
     });
@@ -727,6 +763,54 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     res.json(result);
   }));
 
+  // Persistent configuration reveal.
+  //
+  // The configuration an operator needs to copy is stored encrypted on the route
+  // row, so it survives a browser refresh and a hub restart. The in-memory
+  // routeResults cache is only a convenience for the run that just finished.
+  //
+  // ACTIVE only. A FAILED or cleaned-up route has no usable configuration, and a
+  // soft-deleted route must never reveal one.
+  authed.get('/gre-routes/:id/config', wrap(async (req, res) => {
+    const id = Number(req.params.id);
+    const route = db.prepare('SELECT * FROM gre_routes WHERE id = ? AND deleted_at IS NULL').get(id);
+    if (!route) return res.status(404).json({ error: 'not found' });
+    if (route.status !== 'ACTIVE') {
+      return res.status(409).json({
+        error: 'No active configuration — provisioning did not complete.',
+        status: route.status,
+      });
+    }
+
+    let config = null;
+    try {
+      config = routeOrchestrator.routeConfig(id);
+    } catch (err) {
+      return res.status(409).json({ error: err.message, status: route.status });
+    }
+    if (!config) {
+      return res.status(409).json({
+        error: 'Configuration cannot be reconstructed safely; Reconcile/Retry is required.',
+        status: route.status,
+      });
+    }
+
+    // Audit the reveal, never the secret.
+    try {
+      audit(db, {
+        kind: 'route',
+        action: 'route_config_reveal',
+        params: { route_id: id, name: route.name },
+        rc: 0,
+        output: 'configuration revealed',
+      });
+    } catch { /* audit must never break a reveal */ }
+
+    res.set('Cache-Control', 'no-store');
+    res.set('Pragma', 'no-cache');
+    res.json(config);
+  }));
+
   authed.get('/gre-routes', (req, res) => {
     res.json(routeOrchestrator.listRoutes(req.query.reveal === '1'));
   });
@@ -740,18 +824,29 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     if (running && req.query.wait === '1') await running;
     const route = routeOrchestrator.safeRoute(id);
     if (!route) return res.status(404).json({ error: 'not found' });
-    // `link` is present here only for a run this hub process just completed,
-    // and only for an ACTIVE route; nothing is decrypted otherwise.
-    if (req.query.result === '1' && routeResults.has(id)) {
-      const cached = routeResults.get(id);
-      return res.json({
-        ...route,
-        link: route.status === 'ACTIVE' ? cached.link : null,
-        qr_data_url: route.status === 'ACTIVE' ? cached.qr_data_url : null,
-        outbound: route.status === 'ACTIVE' ? cached.outbound : null,
-        iran_endpoint: cached.iran_endpoint,
-        inbound_id: cached.inbound_id != null ? cached.inbound_id : route.inbound_id,
-      });
+
+    // The result projection is built from the DB, not from process memory, so it
+    // still works after a restart. `link`/`outbound`/QR are only ever produced
+    // for an ACTIVE route and never appear in the list endpoint.
+    if (req.query.result === '1' && route.status === 'ACTIVE') {
+      let config = null;
+      try { config = routeOrchestrator.routeConfig(id); } catch { config = null; }
+      if (config) {
+        // The post-provision result is fetched once by the dialog that just
+        // created the route, so the QR is included by default. The dedicated
+        // /config endpoint does not need it, so QR generation there stays opt-in
+        // via ?qr=1.
+        const qr_data_url = await QRCode.toDataURL(config.link, { errorCorrectionLevel: 'M', margin: 2, width: 320 });
+        res.set('Cache-Control', 'no-store');
+        return res.json({
+          ...route,
+          link: config.link,
+          outbound: config.outbound,
+          qr_data_url,
+          iran_endpoint: config.endpoint.host,
+          inbound_id: config.inbound_id != null ? config.inbound_id : route.inbound_id,
+        });
+      }
     }
     res.json(route);
   }));
@@ -817,6 +912,12 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
           inbound_id: outcome.ok ? outcome.result.inbound_id : null,
         });
       });
+    // The hub already knows this panel's client model from its last probe. In
+    // live mode the synchronous preflight deliberately does not probe, so without
+    // this the timeline header would read "unknown" even though the value is on
+    // hand. Include it so the header is correct from the first render.
+    const panelRow = db.prepare('SELECT client_model, host_mode, panel_version FROM xui_panels WHERE id = ?')
+      .get(Number(body.panel_id)) || {};
     res.status(202).json({
       route_id: prepared.route_id,
       status: 'RESERVED',
@@ -825,8 +926,10 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
       method: prepared.method,
       client_email: prepared.client_email,
       client_mode: prepared.client_mode,
-      client_model: prepared.client_model,
-      host_mode: prepared.host_mode,
+      client_model: prepared.client_model || panelRow.client_model || null,
+      host_mode: prepared.host_mode || panelRow.host_mode || null,
+      panel_client_model: panelRow.client_model || null,
+      panel_version: panelRow.panel_version || null,
     });
   }));
 

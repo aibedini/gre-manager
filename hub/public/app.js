@@ -28,7 +28,7 @@ const state = {
   routesPollGeneration: 0, // invalidates an in-flight poll after the modal closes
 };
 
-async function api(path, { method = 'GET', body, ok = null } = {}) {
+async function api(path, { method = 'GET', body, ok = null, signal = null } = {}) {
   const headers = {};
   if (body) headers['Content-Type'] = 'application/json';
   if (method !== 'GET' && state.csrf) headers['x-csrf-token'] = state.csrf;
@@ -36,6 +36,7 @@ async function api(path, { method = 'GET', body, ok = null } = {}) {
     method,
     headers,
     body: body ? JSON.stringify(body) : undefined,
+    signal: signal || undefined,
   });
   let data = null;
   try { data = await res.json(); } catch { /* empty body */ }
@@ -1328,6 +1329,9 @@ async function loadRoutes() {
             <td>${timeAgo(r.created_at)}</td>
             <td class="row-actions">
               <button class="btn btn-ghost btn-sm btn-timeline" data-id="${r.id}" data-name="${esc(r.name)}">Timeline</button>
+              ${r.status === 'ACTIVE'
+                ? `<button class="btn btn-ghost btn-sm btn-config" data-id="${r.id}">Config</button>`
+                : `<button class="btn btn-ghost btn-sm" disabled title="No active configuration — provisioning did not complete.">Config</button>`}
               <button class="btn btn-ghost btn-sm btn-reconcile" data-id="${r.id}">Reconcile</button>
               <button class="btn btn-ghost btn-sm btn-edit-route" data-id="${r.id}">Edit</button>
               ${r.status === 'ACTIVE' ? '' : `<button class="btn btn-ghost btn-sm btn-retry-route" data-id="${r.id}">Retry</button>`}
@@ -1337,6 +1341,9 @@ async function loadRoutes() {
       </table>`;
     $$('.btn-timeline', wrap).forEach((btn) => btn.addEventListener('click', () => {
       openRouteTimeline({ id: Number(btn.dataset.id), name: btn.dataset.name });
+    }));
+    $$('.btn-config', wrap).forEach((btn) => btn.addEventListener('click', () => {
+      openRouteConfigModal(Number(btn.dataset.id));
     }));
     $$('.btn-reconcile', wrap).forEach((btn) => btn.addEventListener('click', () => {
       openReconcileModal(Number(btn.dataset.id), btn);
@@ -1455,10 +1462,19 @@ $('#btn-add-route').addEventListener('click', async () => {
       </div>
       <div class="field">
         <label>3x-ui client</label>
-        <select name="client_choice"><option value="__new__">Add new client...</option></select>
-        <div class="hint" id="client-model">Detecting 3x-ui client model…</div>
+        <select name="client_mode" id="client-mode">
+          <option value="new">Add new client...</option>
+          <option value="existing">Attach an existing client</option>
+        </select>
+        <div class="hint" id="client-model"></div>
         <div class="hint" id="client-choice-hint"></div>
-        <div class="hint" id="client-load">Loading clients from 3x-ui...</div>
+      </div>
+      <div class="field hidden" id="existing-client-wrap">
+        <label>Search existing client</label>
+        <input name="client_search" id="client-search" list="client-options" autocomplete="off"
+               spellcheck="false" placeholder="Type a name, e.g. navid" />
+        <datalist id="client-options"></datalist>
+        <div class="hint" id="client-load"></div>
       </div>
       <div class="field" id="new-client-wrap"><label>New client name</label><input name="client_name" required maxlength="80" placeholder="navid" /><div class="hint">Creates a new 3x-ui client for this route.</div></div>
       <div class="field"><label>Preferred port (optional)</label><input name="port" type="number" min="1024" max="65535" placeholder="auto: 3000–3999" /></div>
@@ -1469,16 +1485,33 @@ $('#btn-add-route').addEventListener('click', async () => {
   $('.modal-cancel').addEventListener('click', closeModal);
   const form = $('#route-form');
   let clientModel = null;
+  const CLIENT_PAGE_SIZE = 20;
+  const CLIENT_SEARCH_DEBOUNCE_MS = 250;
+  // Cached results keyed by search term, so re-typing a prefix is instant and we
+  // never re-query the panel for the same page of a live dialog.
+  const clientPageCache = new Map();
+  // Labels currently offered by the datalist, plus the last label the user picked.
+  // This lets the dialog reject a typed-but-nonexistent client before submitting.
+  let clientOptions = [];
+  let pickedClient = '';
+  const isNewClient = () => form.client_mode.value === 'new';
   const clientHint = () => {
-    const isNew = form.client_choice.value === '__new__';
-    if (isNew) return 'Creates a new 3x-ui client for this route.';
+    if (isNewClient()) return 'Creates a new 3x-ui client for this route.';
     return clientModel === 'embedded'
       ? 'Client credentials are stored inside each inbound; the real credential of the selected client is reused.'
       : 'Will be attached to the new inbound; the client will not be recreated.';
   };
+  const typedClientValue = () => String(form.client_search.value || '').trim();
+  const selectedEmail = () => {
+    const typed = typedClientValue();
+    if (pickedClient && typed === pickedClient) return pickedClient.split(/\s+—\s+/)[0].trim();
+    // Fall back to the "email — attachment" prefix, then to the raw text.
+    return typed.split(/\s+—\s+/)[0].trim();
+  };
   const syncClient = () => {
-    const isNew = form.client_choice.value === '__new__';
+    const isNew = isNewClient();
     $('#new-client-wrap').classList.toggle('hidden', !isNew);
+    $('#existing-client-wrap').classList.toggle('hidden', isNew);
     form.client_name.required = isNew;
     const hint = $('#new-client-wrap .hint');
     if (hint) hint.textContent = clientHint();
@@ -1492,7 +1525,7 @@ $('#btn-add-route').addEventListener('click', async () => {
     const box = $('#panel-info');
     if (!box) return;
     const panel = state.panels.find((p) => String(p.id) === String(form.panel_id.value)) || {};
-    const isNew = form.client_choice.value === '__new__';
+    const isNew = isNewClient();
     const rows = [
       `Panel: ${panel.name || '—'}`,
       `3x-ui: ${panel.panel_version ? `v${panel.panel_version}` : 'version unknown'}`,
@@ -1505,39 +1538,111 @@ $('#btn-add-route').addEventListener('click', async () => {
         : 'Existing client will be attached to the new inbound. It will not be recreated.');
     }
     box.innerHTML = rows.map((line) => esc(line)).join('<br>');
+    // The model comes from the hub's stored panel probe, so this is known before
+    // the dialog finishes opening — no "Detecting…" round trip.
     const model = $('#client-model');
     if (model) {
       const resolved = panel.client_model || clientModel;
       if (resolved === 'first_class') model.textContent = '3x-ui client model: First-class / multi-inbound';
       else if (resolved === 'embedded') model.textContent = '3x-ui client model: Legacy embedded';
-      else model.textContent = 'Detecting 3x-ui client model…';
+      else model.textContent = '3x-ui client model: unknown (probe the panel)';
     }
   };
-  const loadClients = async () => {
-    $('#client-load').textContent = 'Loading clients from 3x-ui...';
+  const clientOptionLabel = (client) => {
+    const ids = Array.isArray(client.inbound_ids) ? client.inbound_ids : [];
+    const where = client.inbound_remark
+      || (ids.length ? `inbound ${ids[0]}${ids.length > 1 ? ` +${ids.length - 1}` : ''}` : 'not attached yet');
+    return `${client.email} — ${where}`;
+  };
+  // One page of clients, never the whole inventory. `search` goes to the panel so
+  // a busy panel with thousands of clients stays responsive. A superseded search
+  // is aborted so a slow response cannot land after a newer one.
+  let clientFetchController = null;
+  const fetchClientPage = async (search = '', { abortPrevious = false } = {}) => {
+    const key = search.trim().toLowerCase();
+    if (clientPageCache.has(key)) return clientPageCache.get(key);
+    if (abortPrevious && clientFetchController) {
+      try { clientFetchController.abort(); } catch { /* already finished */ }
+    }
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    if (abortPrevious) clientFetchController = controller;
+    const qs = new URLSearchParams({ paged: '1', page: '1', pageSize: String(CLIENT_PAGE_SIZE) });
+    if (key) qs.set('search', key);
+    let payload;
     try {
-      const payload = await api(`/api/xui-panels/${form.panel_id.value}/clients`);
-      const clients = Array.isArray(payload) ? payload : (payload.clients || []);
-      clientModel = Array.isArray(payload) ? (clients[0] && clients[0].model) || null : payload.client_model || null;
-      form.client_choice.innerHTML = clients.map((client) => {
-        const where = client.inbound_remark || (Array.isArray(client.inbound_ids) && client.inbound_ids.length
-          ? `inbound ${client.inbound_ids.join(', ')}`
-          : 'not attached to any inbound');
-        return `<option value="${esc(client.email)}">${esc(client.email)} - ${esc(where)}</option>`;
-      }).join('') + '<option value="__new__">Add new client...</option>';
-      $('#client-load').textContent = clients.length ? `${clients.length} client(s) found` : 'No client found; create a new one.';
-      syncClient();
-    } catch (err) { $('#client-load').textContent = err.message; }
+      payload = await api(`/api/xui-panels/${form.panel_id.value}/clients?${qs.toString()}`,
+        controller ? { signal: controller.signal } : undefined);
+    } catch (err) {
+      if (err && (err.name === 'AbortError' || /abort/i.test(err.message))) return null;
+      throw err;
+    }
+    const result = {
+      clients: (payload && payload.clients) || [],
+      total: payload && payload.total,
+      paged: !!(payload && payload.paged),
+    };
+    if (!search.trim()) clientModel = (payload && payload.client_model) || clientModel;
+    clientPageCache.set(key, result);
+    return result;
+  };
+  const renderClientOptions = (clients, { searching = false, total = null } = {}) => {
+    const list = $('#client-options');
+    clientOptions = clients.map((client) => clientOptionLabel(client));
+    list.innerHTML = clientOptions.map((label) => `<option value="${esc(label)}"></option>`).join('');
+    const shown = clients.length;
+    let text;
+    if (!shown) text = searching ? 'No matching client.' : 'No client found; create a new one instead.';
+    else if (searching) text = `${shown} match(es)${Number.isFinite(total) ? ` of ${total}` : ''} — keep typing to narrow.`;
+    else text = `Showing the first ${shown}${Number.isFinite(total) ? ` of ${total}` : ''} client(s) — type to search.`;
+    $('#client-load').textContent = text;
+    // A slow response must not wipe what the user already committed to.
+    if (pickedClient && !clientOptions.includes(pickedClient)) {
+      form.client_search.value = '';
+      pickedClient = '';
+    }
+  };
+  // Seed the picker with one page. Never blocks the dialog.
+  const loadInitialClients = async () => {
+    try {
+      const result = await fetchClientPage('');
+      if (!result) return;
+      renderClientOptions(result.clients, { total: result.total });
+    } catch (err) {
+      $('#client-load').textContent = err.message;
+    }
+  };
+  // Debounced paged search. Two guards against a stale result winning: the
+  // in-flight request is aborted, and a sequence number drops any response that
+  // still arrives out of order.
+  let searchTimer = null;
+  let searchSeq = 0;
+  const onClientSearchInput = () => {
+    clearTimeout(searchTimer);
+    // Track an exact datalist pick (datalist selection fires `input`).
+    pickedClient = clientOptions.includes(typedClientValue()) ? typedClientValue() : '';
+    const term = typedClientValue();
+    if (!term) { loadInitialClients(); return; }
+    $('#client-load').textContent = 'Searching…';
+    searchTimer = setTimeout(async () => {
+      const seq = ++searchSeq;
+      try {
+        const result = await fetchClientPage(term, { abortPrevious: true });
+        if (!result || seq !== searchSeq) return;
+        renderClientOptions(result.clients, { searching: true, total: result.total });
+      } catch (err) {
+        if (seq === searchSeq) $('#client-load').textContent = err.message;
+      }
+    }, CLIENT_SEARCH_DEBOUNCE_MS);
   };
   const body = () => {
-    const isNew = form.client_choice.value === '__new__';
+    const isNew = isNewClient();
     return {
       name: form.name.value.trim(),
       iran_server_id: Number(form.iran_server_id.value),
       foreign_server_id: Number(form.foreign_server_id.value),
       panel_id: Number(form.panel_id.value),
       client_mode: isNew ? 'new' : 'existing',
-      client_email: isNew ? form.client_name.value.trim() : form.client_choice.value,
+      client_email: isNew ? form.client_name.value.trim() : selectedEmail(),
       port: form.port.value ? Number(form.port.value) : undefined,
       range_start: 3000, range_end: 3999,
     };
@@ -1553,17 +1658,44 @@ $('#btn-add-route').addEventListener('click', async () => {
     finally { btn.disabled = false; btn.textContent = 'Check port'; }
   };
   $('#btn-check-port').addEventListener('click', checkPort);
-  form.client_choice.addEventListener('change', syncClient);
-  form.panel_id.addEventListener('change', async () => { clientModel = null; await loadClients(); await checkPort(); });
+  form.client_mode.addEventListener('change', syncClient);
+  form.client_search.addEventListener('input', onClientSearchInput);
+  form.panel_id.addEventListener('change', async () => {
+    clientModel = null;
+    clientPageCache.clear();
+    searchSeq++;
+    form.client_search.value = '';
+    renderPanelInfo();
+    // Independent work: neither waits for the other.
+    await Promise.all([loadInitialClients(), checkPort()]);
+  });
   form.iran_server_id.addEventListener('change', checkPort);
   form.foreign_server_id.addEventListener('change', checkPort);
-  await loadClients();
-  await checkPort();
+  syncClient();
+  // The port check and the first client page are independent requests: run them
+  // together so the dialog is usable as soon as either finishes.
+  await Promise.all([loadInitialClients(), checkPort()]);
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const btn = $('#btn-create-route'); btn.disabled = true; btn.textContent = 'Creating…';
     $('#route-error').textContent = '';
     const payload = body();
+    // An existing client must have come from the panel listing; a typo would
+    // otherwise fail later with a confusing panel-side error.
+    if (payload.client_mode === 'existing') {
+      const typed = typedClientValue();
+      const known = clientOptions.includes(typed) || (pickedClient && typed === pickedClient);
+      if (!typed) {
+        $('#route-error').textContent = 'Select an existing client or switch to "Add new client...".';
+        btn.disabled = false; btn.textContent = 'Create route';
+        return;
+      }
+      if (!known) {
+        $('#route-error').textContent = `"${typed}" is not one of the listed clients. Pick one from the suggestions.`;
+        btn.disabled = false; btn.textContent = 'Create route';
+        return;
+      }
+    }
     try {
       // 202 + route_id comes back as soon as validation, client preflight,
       // port reservation and the route row are done. The rest runs in the
@@ -1589,6 +1721,97 @@ function componentRow(component) {
     <td><span class="badge ${cls}">${esc(component.status)}</span></td>
     <td class="muted">${esc(component.detail || '')}</td>
   </tr>`;
+}
+
+// Persistent route configuration.
+//
+// The config comes from the hub's encrypted route row (GET /gre-routes/:id/config),
+// so it is still available after a browser refresh and after the hub restarts.
+// Copying never contacts 3x-ui, never re-creates the client and never changes the
+// password.
+async function openRouteConfigModal(routeId) {
+  let config;
+  try {
+    config = await api(`/api/gre-routes/${routeId}/config`);
+  } catch (err) {
+    toast(err.message, true);
+    return;
+  }
+  const link = String(config.link || '');
+  const masked = link ? `${link.slice(0, 12)}${'•'.repeat(Math.max(8, Math.min(24, link.length - 12)))}` : '';
+  const outboundJson = config.outbound ? JSON.stringify(config.outbound, null, 2) : '';
+  openModal(`
+    <h2>Configuration — ${esc(config.name || `route ${routeId}`)}</h2>
+    <p class="sub">Endpoint <strong>${esc(config.endpoint?.host || '—')}:${esc(config.endpoint?.port ?? '—')}</strong>
+      · method <strong>${esc(config.method || '—')}</strong>
+      · client <strong>${esc(config.client_email || '—')}</strong></p>
+
+    <div class="field">
+      <label>Shadowsocks config</label>
+      <div class="hint" id="cfg-link">${esc(masked)}</div>
+      <div class="foot" style="justify-content:flex-start">
+        <button type="button" class="btn btn-sm" id="btn-reveal-config">Reveal</button>
+        <button type="button" class="btn btn-sm" id="btn-copy-config">Copy config</button>
+        <button type="button" class="btn btn-ghost btn-sm" id="btn-copy-outbound">Copy JSON</button>
+        <button type="button" class="btn btn-ghost btn-sm" id="btn-show-qr">Show QR</button>
+      </div>
+    </div>
+
+    <div class="field hidden" id="cfg-qr-wrap"><div id="cfg-qr"></div></div>
+
+    <div class="field">
+      <label>Outbound JSON</label>
+      <pre class="cfg-out" id="cfg-outbound">${esc(outboundJson)}</pre>
+    </div>
+
+    <div class="foot"><button type="button" class="btn modal-cancel">Close</button></div>`);
+
+  $('.modal-cancel').addEventListener('click', closeModal);
+
+  const copy = async (text, label) => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        // Fallback for a non-secure origin, where the async clipboard API is absent.
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+      }
+      toast(`${label} copied`);
+    } catch (err) {
+      toast(`Copy failed: ${err.message}`, true);
+    }
+  };
+
+  $('#btn-reveal-config').addEventListener('click', () => {
+    $('#cfg-link').textContent = link;
+    toast('Configuration revealed');
+  });
+  $('#btn-copy-config').addEventListener('click', () => copy(link, 'Config'));
+  $('#btn-copy-outbound').addEventListener('click', () => copy(outboundJson, 'Outbound JSON'));
+  $('#btn-show-qr').addEventListener('click', async () => {
+    const wrap = $('#cfg-qr-wrap');
+    if (!wrap) return;
+    if (!wrap.classList.contains('hidden')) { wrap.classList.add('hidden'); return; }
+    try {
+      const payload = await api(`/api/gre-routes/${routeId}?result=1`);
+      if (payload.qr_data_url) {
+        $('#cfg-qr').innerHTML = `<img alt="Shadowsocks QR" src="${esc(payload.qr_data_url)}" width="240" height="240" />`;
+      } else {
+        $('#cfg-qr').textContent = 'QR code unavailable.';
+      }
+    } catch (err) {
+      $('#cfg-qr').textContent = err.message;
+    }
+    wrap.classList.remove('hidden');
+  });
 }
 
 async function openReconcileModal(routeId, button = null) {

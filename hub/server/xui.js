@@ -274,6 +274,40 @@ class XuiClient {
     return Array.isArray(obj) ? obj : [];
   }
 
+  // Panel payloads arrive wrapped twice: the transport unwraps the HTTP layer,
+  // then 3x-ui's own `{ success, msg, obj }` envelope remains. These helpers strip
+  // both so callers get the real array/object.
+  static panelPayloadOrNull(data) {
+    if (!data || !data.ok) return null;
+    return unwrap(data.data);
+  }
+
+  static panelRows(data) {
+    const payload = XuiClient.panelPayloadOrNull(data);
+    if (Array.isArray(payload)) return payload;
+    return asArray(payload && (payload.items || payload.records || payload.clients || payload.obj));
+  }
+
+  async listInboundMetadata() {
+    // Try each lightweight projection in turn. "Endpoint not there" (404/405) means
+    // an older panel and is fine; any other failure is a real panel problem and
+    // must surface rather than silently degrade to "no inbound metadata".
+    for (const path of ['/panel/api/inbounds/list/slim', '/panel/api/inbounds/options']) {
+      const result = await this.request(path, { allowFailure: true });
+      if (!result || !result.ok) {
+        const status = result && result.status;
+        if (status === 404 || status === 405) continue;
+        const body = result && result.data;
+        const detail = body && (body.msg || body.error) || `HTTP ${status}`;
+        throw new Error(`3x-ui GET ${path} failed: ${detail}`);
+      }
+      const payload = unwrap(result.data);
+      if (Array.isArray(payload)) return payload;
+      return [];
+    }
+    return [];
+  }
+
   async addInbound(payload) {
     const data = await this.request('/panel/api/inbounds/add', { method: 'POST', body: payload });
     const obj = unwrap(data);
@@ -293,6 +327,21 @@ class XuiClient {
 
   addHost(payload) {
     return this.request('/panel/api/hosts/add', { method: 'POST', body: payload });
+  }
+
+  // Narrow host listing used by validation/reconcile. Panels without the hosts
+  // API answer 404/405, which is "no managed hosts", not a failure.
+  async listHosts() {
+    const result = await this.request('/panel/api/hosts/list', { allowFailure: true });
+    if (!result || !result.ok) {
+      if (result && (result.status === 404 || result.status === 405)) return [];
+      const body = result && result.data;
+      const detail = body && (body.msg || body.error) || `HTTP ${result && result.status}`;
+      throw new Error(`3x-ui GET /panel/api/hosts/list failed: ${detail}`);
+    }
+    const payload = unwrap(result.data);
+    if (Array.isArray(payload)) return payload;
+    return asArray(payload && (payload.items || payload.hosts || payload.obj));
   }
 
   deleteHost(groupId) {
@@ -395,14 +444,85 @@ class XuiClient {
     return clients;
   }
 
+  // Paged first-class client search.
+  //
+  // 3x-ui v3.7 exposes `GET /panel/api/clients/list/paged?page&pageSize&search`
+  // and returns a slim ClientSlim projection (no password/auth/flow/traffic), so
+  // the payload stays small on panels with thousands of clients. Opening the
+  // Create Route dialog must never download the whole client inventory, and it
+  // must never pull /inbounds/list just to decorate a dropdown: that endpoint is
+  // the same heavyweight one the port check had to stop using.
+  //
+  // `inboundIds` already comes back per client, which is all the picker needs.
+  // Inbound remarks are opt-in (`withInboundRemarks`) and use the cheap
+  // metadata endpoint, so the interactive path stays offline.
+  async listFirstClassClientsPaged({ search = '', page = 1, pageSize = 20, withInboundRemarks = false } = {}) {
+    const size = Math.min(Math.max(Number(pageSize) || 20, 1), 200);
+    const current = Math.max(Number(page) || 1, 1);
+    const query = new URLSearchParams({ page: String(current), pageSize: String(size) });
+    const term = String(search || '').trim();
+    if (term) query.set('search', term);
+
+    const data = await this.request(`/panel/api/clients/list/paged?${query.toString()}`, { allowFailure: true });
+    if (!data || !data.ok) {
+      const status = data && data.status;
+      // Panel predates the paged endpoint: fall back to the full list, still
+      // without touching /inbounds/list, and slice it here. Rare, and only for
+      // older panels — a modern panel never pays for the full inventory.
+      if (status === 404 || status === 405) {
+        const all = await this.listFirstClassClients();
+        const matched = term
+          ? all.filter((item) => item.email.toLowerCase().includes(term.toLowerCase()))
+          : all;
+        return {
+          clients: matched.slice(0, size),
+          paged: false,
+          total: matched.length,
+          page: 1,
+          pageSize: size,
+        };
+      }
+      const body = data && data.data;
+      const detail = body && (body.msg || body.error) || `HTTP ${status}`;
+      throw new Error(`3x-ui GET /panel/api/clients/list/paged failed: ${detail}`);
+    }
+
+    const payload = XuiClient.panelPayloadOrNull(data);
+    const rows = Array.isArray(payload) ? payload : asArray(payload && (payload.items || payload.records || payload.clients));
+    const total = payload && !Array.isArray(payload) && Number.isFinite(Number(payload.total)) ? Number(payload.total) : null;
+
+    let byId = null;
+    if (withInboundRemarks) {
+      const inbounds = await this.listInboundMetadata().catch(() => []);
+      byId = new Map(inbounds.map((item) => [Number(item.id), item]));
+    }
+
+    const clients = rows.map((row) => {
+      const email = String(row && (row.email || row.name) || '').trim();
+      const inboundIds = asArray(row && (row.inboundIds || row.inbound_ids || row.inbounds))
+        .map(Number).filter((n) => Number.isInteger(n) && n > 0);
+      const first = byId ? byId.get(inboundIds[0]) || null : null;
+      return {
+        email,
+        inbound_ids: inboundIds,
+        inbound_id: inboundIds.length ? inboundIds[0] : null,
+        inbound_remark: first ? String(first.remark || '') : '',
+        protocol: first ? String(first.protocol || '') : '',
+        model: 'first_class',
+      };
+    }).filter((item) => item.email);
+
+    return { clients, paged: true, total, page: current, pageSize: size };
+  }
+
+  // Full first-class listing. Kept for callers that genuinely need everything
+  // (never the interactive picker). It resolves inbound remarks through the cheap
+  // metadata endpoint, never through /inbounds/list.
   async listFirstClassClients() {
     const data = await this.request('/panel/api/clients/list');
     const rows = asArray(unwrap(data));
     if (!rows.length) return [];
-    // inboundIds alone is not enough for the UI: resolve remark/protocol for
-    // the first attachment so the dropdown can show where a client lives.
-    let inbounds = [];
-    try { inbounds = await this.listInbounds(); } catch { inbounds = []; }
+    const inbounds = await this.listInboundMetadata().catch(() => []);
     const byId = new Map(inbounds.map((item) => [Number(item.id), item]));
     return rows.map((row) => {
       const email = String(row && (row.email || row.name) || '').trim();
@@ -420,11 +540,19 @@ class XuiClient {
     }).filter((item) => item.email);
   }
 
-  async listClients() {
-    const capabilities = await this.resolveCapabilities();
-    return capabilities.clientModel === 'first_class'
-      ? this.listFirstClassClients()
-      : this.listEmbeddedClients();
+  // Unified listing.
+  //
+  // `known` lets an interactive caller supply the client model the hub already
+  // persisted during a panel probe, so opening a dialog does not trigger another
+  // capability probe against the panel. `paged` switches the first-class path to
+  // the lightweight paged search; it defaults to off so existing callers keep the
+  // complete listing.
+  async listClients({ known = null, paged = false, search = '', page = 1, pageSize = 20, withInboundRemarks = false } = {}) {
+    const knownModel = known && (known.clientModel || known.client_model);
+    const capabilities = knownModel ? { clientModel: knownModel } : await this.resolveCapabilities();
+    if (capabilities.clientModel !== 'first_class') return this.listEmbeddedClients();
+    if (!paged) return this.listFirstClassClients();
+    return this.listFirstClassClientsPaged({ search, page, pageSize, withInboundRemarks });
   }
 
   // Public single-client read. Returns the normalized UI shape or null.

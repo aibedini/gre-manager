@@ -167,6 +167,8 @@ function makeMockPanel(options = {}) {
   const htmlVersion = options.htmlVersion || null;
   const linkDelayMs = Number(options.linkDelayMs ?? 0);
   const linksPaused = { value: linkDelayMs > 0 };
+  // Set false to model a panel that predates /clients/list/paged.
+  const pagedClients = options.pagedClients !== false;
 
   const state = {
     nextInboundId: 100,
@@ -251,6 +253,7 @@ function makeMockPanel(options = {}) {
     const call = record(url, opts);
     const path = call.path;
     const lower = path;
+    const query = new URL(String(url)).searchParams;
 
     // --- auth ---------------------------------------------------------
     if (lower === '/csrf-token') return json({ success: false }, 404);
@@ -282,8 +285,42 @@ function makeMockPanel(options = {}) {
         inboundIds: [...row.inboundIds],
       })));
     }
+    // Lightweight paged search (3x-ui v3.7). Returns the ClientSlim projection:
+    // no password/auth/flow, just what a picker needs. `pagedClients: false`
+    // models an older panel that only has the full listing.
+    if (lower === '/panel/api/clients/list/paged') {
+      if (clientModel !== FIRST_CLASS || pagedClients === false) return json({ msg: 'not found' }, 404);
+      const page = Math.max(Number(query.get('page') || 1), 1);
+      const size = Math.min(Math.max(Number(query.get('pageSize') || 20), 1), 200);
+      const term = String(query.get('search') || '').trim().toLowerCase();
+      const matched = term
+        ? state.clientRows.filter((row) => String(row.email).toLowerCase().includes(term))
+        : state.clientRows.slice();
+      const start = (page - 1) * size;
+      return ok({
+        items: matched.slice(start, start + size).map((row) => ({
+          id: row.id,
+          email: row.email,
+          method: row.method,
+          inboundIds: [...row.inboundIds],
+        })),
+        total: matched.length,
+        page,
+        pageSize: size,
+      });
+    }
 
     // --- inbounds -----------------------------------------------------
+    // Metadata-only projections. These exist so the client picker never has to
+    // pull /inbounds/list (which serializes every inbound's full settings blob).
+    if (lower === '/panel/api/inbounds/list/slim' || lower === '/panel/api/inbounds/options') {
+      return ok(state.inbounds.map((inbound) => ({
+        id: inbound.id,
+        port: inbound.port,
+        remark: inbound.remark,
+        protocol: inbound.protocol,
+      })));
+    }
     if (lower === '/panel/api/inbounds/list') {
       return ok(state.inbounds.map((inbound) => ({
         id: inbound.id,

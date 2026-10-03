@@ -63,7 +63,10 @@ function makeSshMock({ getState = () => ({}), log = [], failCommandTest = null }
     const entry = { server: server.name, command, opts };
     log.push(entry);
     const state = getState() || {};
-    const inboundCreated = !!state.inboundCreated;
+    // Sampled fresh at each branch: wrapping transports set `state.inboundCreated`
+    // immediately after the call that created the inbound returns, so a snapshot
+    // taken at entry would still report "no inbound" on the next probe.
+    const inboundCreatedNow = () => !!(getState() || {}).inboundCreated;
 
     const portMatch = command.match(/--tcp-ports\s+'(\d+)'/);
     if (portMatch) activePort = Number(portMatch[1]);
@@ -77,13 +80,27 @@ function makeSshMock({ getState = () => ({}), log = [], failCommandTest = null }
     }
 
     if (command.includes('ss -H')) {
-      if (!inboundCreated || !activePort) return { rc: 0, stdout: '' };
+      // Forwarding evidence means "the peer for this port exists". `greExists`
+      // tracks physical create/remove through the GRE CLI, so it is accurate
+      // mid-run and cannot leak between tests — unlike `state.inboundCreated`,
+      // which wrapping transports update only after the creating call returned.
+      if (!activePort || !greExists) return { rc: 0, stdout: '' };
+      // `forgetPortRules` models a peer that exists while its forwarding rules or
+      // listeners do not — the case runtime validation must name precisely.
+      if (state.forgetPortRules === true) return { rc: 0, stdout: 'nothing here\n' };
       return server.name === 'iran'
         ? { rc: 0, stdout: `-A PREROUTING -p tcp --dport ${activePort}\n-A PREROUTING -p udp --dport ${activePort}\n` }
         : { rc: 0, stdout: `tcp LISTEN 0 10 0.0.0.0:${activePort}\nudp UNCONN 0 0 0.0.0.0:${activePort}\n` };
     }
     if (command === 'gre iran peer suggest --json' || command.startsWith('gre node suggest')) {
       return { rc: 0, stdout: JSON.stringify({ name: 'ir01', subnet_base: '10.200', idx: 1, key: 1001 }) };
+    }
+    // End-to-end TCP reachability probe used by runtime validation.
+    if (command.includes('/dev/tcp/')) {
+      const shouldFail = failCommandTest || state.failCommandTest;
+      if (shouldFail && shouldFail(command)) return { rc: 1, stdout: '', stderr: 'simulated failure' };
+      if (state.e2eTcpFails === true) return { rc: 1, stdout: '', stderr: 'connection refused' };
+      return { rc: 0, stdout: 'connected' };
     }
     if (command.startsWith('ping ') || command.startsWith('gre ') || command.startsWith('ip link') || command.startsWith('timeout 8')) {
       const shouldFail = failCommandTest || state.failCommandTest;
@@ -93,8 +110,13 @@ function makeSshMock({ getState = () => ({}), log = [], failCommandTest = null }
       // Reconcile asks whether the GRE link is up. `state.greUp === false`
       // models a peer that exists but is not forwarding.
       if (command.startsWith('ip link')) {
-        if (state.greUp === false) return { rc: 1, stdout: '', stderr: '' };
-        if (state.greEnabled === true && !greExists) return { rc: 1, stdout: '', stderr: '' };
+        // `greUp === false` models a peer that exists but is not forwarding. It
+        // must look like a real `ip link` answer with the UP flag missing, not a
+        // non-zero rc: a failed command is indistinguishable from a broken probe,
+        // while a DOWN link is a definite finding.
+        if (state.greUp === false) return { rc: 0, stdout: '9: gre-ir01: <POINTOPOINT,NOARP> mtu 1476\n' };
+        // `greEnabled` models a peer that should exist but was already removed.
+        if (state.greEnabled === true && !greExists) return { rc: 0, stdout: 'MISSING' };
       }
       return { rc: 0, stdout: 'UP' };
     }

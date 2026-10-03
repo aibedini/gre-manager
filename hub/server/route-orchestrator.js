@@ -8,6 +8,18 @@ const {
   XuiClient, parseShadowsocksLink, buildShadowsocksLink, selectShadowsocksLink, isValidShadowsocksPassword,
 } = require('./xui');
 const { encrypt, decrypt } = require('./crypto');
+const inspection = require('./route-inspection');
+const {
+  isAlreadyAbsentError,
+  inspectGreInterface,
+  inspectForwarding,
+  inspectListeners,
+  inspectInbound,
+  clientInInbound,
+  inspectManagedHost,
+  inspectPortAllocation,
+  probeTcpConnect,
+} = inspection;
 
 const DEFAULT_RANGE = [3000, 3999];
 const AVOID_PORTS = new Set([22, 25, 53, 80, 110, 143, 443, 465, 587, 993, 995, 2053, 3000, 3306, 5432, 6379, 8080, 8443]);
@@ -28,6 +40,45 @@ const RUN_TIMEOUT_MS = 15 * 60 * 1000;
 
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+// The client-facing Shadowsocks outbound. Stored encrypted alongside the share
+// link so the configuration survives a hub restart without any panel call.
+function buildOutbound({ link, host, port, method, password, name }) {
+  return {
+    tag: `gre-${String(name || 'route').toLowerCase()}`,
+    protocol: 'shadowsocks',
+    settings: {
+      servers: [{ address: host, port: Number(port), method, password, uot: false }],
+    },
+    streamSettings: { network: 'tcp' },
+    share_link: link,
+  };
+}
+
+// A runtime validation failure that names the exact component, so the UI never
+// has to say "The operation was aborted due to timeout" again.
+const RUNTIME_LABELS = {
+  runtime_gre_iran: 'IRAN GRE interface',
+  runtime_gre_foreign: 'FOREIGN GRE interface',
+  runtime_iran_tcp_rule: 'IRAN TCP forwarding rule',
+  runtime_iran_udp_rule: 'IRAN UDP forwarding rule',
+  runtime_foreign_tcp_listener: 'FOREIGN TCP listener',
+  runtime_foreign_udp_listener: 'FOREIGN UDP listener',
+  runtime_xui_inbound: '3x-ui inbound',
+  runtime_xui_client: '3x-ui client attachment',
+  runtime_managed_host: 'managed host',
+  runtime_e2e_tcp: 'end-to-end TCP',
+};
+
+class RuntimeValidationError extends Error {
+  constructor(component, detail, checks) {
+    super(detail);
+    this.name = 'RuntimeValidationError';
+    this.component = component;
+    this.componentLabel = RUNTIME_LABELS[component] || component;
+    this.checks = checks || {};
+  }
 }
 
 function securePassword(bytes = 24) {
@@ -257,8 +308,37 @@ class RouteOrchestrator {
 
   // --- events -------------------------------------------------------------
 
+  // Everything written to route_events goes through this. It must remove the
+  // things that would let someone reconstruct a working client, while keeping the
+  // operational facts an operator needs: route name, client email, inbound id,
+  // IP, port, stage and panel version all survive.
+  static redact(text) {
+    return String(text === null || text === undefined ? '' : text)
+      // Whole share links first, before the password inside them is considered.
+      .replace(/ss:\/\/\S+/gi, '[redacted-link]')
+      .replace(/vmess:\/\/\S+/gi, '[redacted-link]')
+      .replace(/vless:\/\/\S+/gi, '[redacted-link]')
+      .replace(/trojan:\/\/\S+/gi, '[redacted-link]')
+      // Credentials in prose or in JSON.
+      .replace(/("?(?:password|passwd|pass|secret|private_key|privateKey)"?\s*[:=]\s*")([^"]+)(")/gi,
+        '$1[redacted]$3')
+      .replace(/("?(?:password|passwd|pass|secret|private_key|privateKey)"?\s*[:=]\s*)([^\s,;}"']+)/gi,
+        '$1[redacted]')
+      // Auth headers and tokens.
+      .replace(/(authorization\s*:\s*bearer\s+)\S+/gi, '$1[redacted]')
+      .replace(/(bearer\s+)[A-Za-z0-9._~+/=-]{12,}/gi, '$1[redacted]')
+      .replace(/(cookie\s*:\s*)\S+/gi, '$1[redacted]')
+      .replace(/((?:^|[^A-Za-z0-9])x-csrf-token\s*[:=]\s*)\S+/gi, '$1[redacted]')
+      // PEM blocks.
+      .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+        '[redacted-private-key]')
+      // 3x-ui session tokens look like a bare long hex/base64 blob in a JSON body.
+      .replace(/("?(?:token|session|cookie)"?\s*[:=]\s*")([^"]{8,})(")/gi, '$1[redacted]$3')
+      .slice(0, 4000);
+  }
+
   event(routeId, stage, status, detail = '') {
-    const safe = String(detail || '').replace(/ss:\/\/\S+/gi, '[redacted-link]').slice(0, 4000);
+    const safe = RouteOrchestrator.redact(detail);
     // Stamp every row with the attempt it belongs to, so a retried route keeps
     // every previous attempt in the same persistent log and the UI can group
     // and label them instead of showing one confusing stream.
@@ -372,9 +452,12 @@ class RouteOrchestrator {
   safeRoute(routeId) {
     const row = this.route(routeId);
     if (!row) return null;
-    const { client_password_enc, share_link_enc, ...safe } = row;
+    // Every ciphertext column stays server-side; the dedicated /config endpoint
+    // is the only way to obtain the configuration.
+    const { client_password_enc, share_link_enc, outbound_enc, ...safe } = row;
     safe.client_model = row.client_model || null;
     safe.client_mode = row.client_mode || null;
+    safe.has_config = row.status === 'ACTIVE' && !!row.share_link_enc;
     return safe;
   }
 
@@ -782,43 +865,21 @@ class RouteOrchestrator {
         ? 'Endpoint and method validated; credential rebuilt from the password created by this route'
         : 'Endpoint, method and client credential validated against the panel-issued link');
 
-      const runtimeStage = this.stage(routeId, 'runtime_validation', 'GRE state, listeners, inbound and end-to-end TCP');
-      const greHealth = await this.remote(iran, `ip link show ${shellQuote(`gre-${peer}`)} 2>/dev/null | grep -q '<[^>]*UP'`, 15000);
-      if (greHealth.rc !== 0) {
-        runtimeStage.fail('GRE tunnel was created but its link is not UP');
-        throw new Error('GRE tunnel was created but its link is not UP');
-      }
-      const runtime = await this.collectUsage(iran, foreign, client);
-      const iranRules = portEvidence(runtime.iranOutput, port);
-      const foreignListeners = portEvidence(runtime.foreignOutput, port);
-      const hasTcp = foreignListeners.some((line) => /^tcp\b/i.test(line));
-      const hasUdp = foreignListeners.some((line) => /^udp\b/i.test(line));
-      const liveInbound = runtime.inbounds.some((item) => Number(item.id) === inboundId && Number(item.port) === port);
-      if (!iranRules.length || !hasTcp || !hasUdp || !liveInbound) {
-        runtimeStage.fail('expected GRE forwarding, TCP+UDP listeners and the 3x-ui inbound were not all present');
-        throw new Error('runtime validation failed: expected GRE forwarding, TCP+UDP listeners, and 3x-ui inbound were not all present');
-      }
-      const tcpProbe = await this.remote(foreign,
-        `timeout 8 bash -c ${shellQuote(`exec 3<>/dev/tcp/${iranIp}/${port}`)}`, 15000);
-      if (tcpProbe.rc !== 0) {
-        runtimeStage.fail(`end-to-end TCP probe to ${iranIp}:${port} failed`);
-        throw new Error(`end-to-end TCP probe to ${iranIp}:${port} failed`);
-      }
-      runtimeStage.pass('GRE UP; TCP+UDP listeners; inbound; end-to-end TCP');
+      const runtime = await this.validateRuntime({
+        routeId, iran, foreign, client, clientModel, email, port, inboundId,
+        peer, hostGroupId, hostMode, iranIp,
+      });
+
+      const outbound = buildOutbound({ link, host: iranIp, port, method, password: effectivePassword, name: routeName });
 
       const now = Date.now();
       this.db.transaction(() => {
-        this.db.prepare(`UPDATE gre_routes SET inbound_id=?, capability=?, host_mode=?, client_model=?, client_password_enc=?, share_link_enc=?, status='ACTIVE', last_error=NULL, current_stage=NULL, rollback_state='NONE', updated_at=? WHERE id=?`)
-          .run(inboundId, hostMode, hostMode, clientModel, encrypt(this.cryptKey, effectivePassword), encrypt(this.cryptKey, link), now, routeId);
+        this.db.prepare(`UPDATE gre_routes SET inbound_id=?, capability=?, host_mode=?, client_model=?, client_password_enc=?, share_link_enc=?, outbound_enc=?, config_updated_at=?, runtime_checks=?, iran_endpoint=?, status='ACTIVE', last_error=NULL, current_stage=NULL, rollback_state='NONE', updated_at=? WHERE id=?`)
+          .run(inboundId, hostMode, hostMode, clientModel, encrypt(this.cryptKey, effectivePassword), encrypt(this.cryptKey, link), encrypt(this.cryptKey, JSON.stringify(outbound)), now, JSON.stringify(runtime.checks), iranIp, now, routeId);
         this.db.prepare(`UPDATE port_allocations SET status='ACTIVE', updated_at=? WHERE route_id=?`).run(now, routeId);
       })();
       this.event(routeId, 'active', 'PASS', 'Route marked ACTIVE');
 
-      const outbound = {
-        tag: `gre-${String(routeName).toLowerCase()}`,
-        protocol: 'shadowsocks',
-        settings: { servers: [{ address: iranIp, port, method, password: effectivePassword }] },
-      };
       const qr_data_url = await QRCode.toDataURL(link, { errorCorrectionLevel: 'M', margin: 2, width: 320 });
       return {
         id: routeId,
@@ -834,7 +895,7 @@ class RouteOrchestrator {
         outbound,
         qr_data_url,
         events: this.events(routeId),
-        checks: { gre: 'UP', tcp: 'PASS', udp: 'LISTENING', xui: 'PASS', link: 'PASS' },
+        checks: runtime.checks,
       };
     } catch (err) {
       const failedStage = (() => {
@@ -876,15 +937,36 @@ class RouteOrchestrator {
       clientAttached, clientCreated, iranCreated, foreignCreated, peer, iran, foreign,
     } = ctx;
     const rollback = [];
-    const step = async (name, stage, fn) => {
+    const warnings = [];
+
+    // Never interpolate a raw result object: panel helpers return envelopes, and
+    // `${obj}` produced the production artefact "attachment removed: [object Object]".
+    const describe = (value, fallback) => {
+      if (value === null || value === undefined) return fallback;
+      if (typeof value === 'string') return value.trim() || fallback;
+      if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+      const candidate = value.message || value.msg || value.detail || value.status;
+      return candidate ? String(candidate) : fallback;
+    };
+
+    const step = async (label, stage, fn) => {
       try {
         const detail = await fn();
-        rollback.push(name);
-        if (stage) this.event(routeId, stage, 'PASS', `${name} removed${detail ? `: ${detail}` : ''}`);
+        rollback.push(label);
+        if (stage) this.event(routeId, stage, 'PASS', `${label} removed: ${describe(detail, 'done')}`);
         return true;
       } catch (err) {
-        rollback.push(`${name} failed: ${err.message}`);
-        if (stage) this.event(routeId, stage, 'FAIL', `${name} removal failed: ${err.message}`);
+        // A resource rollback removes may already be gone (the failing step could
+        // have been the creation itself). That is a successful end state.
+        if (isAlreadyAbsentError(err)) {
+          rollback.push(`${label} (already absent)`);
+          if (stage) this.event(routeId, stage, 'PASS', `${label} already absent`);
+          return true;
+        }
+        const detail = describe(err, 'unknown error');
+        rollback.push(`${label} failed: ${detail}`);
+        warnings.push(`${label}: ${detail}`);
+        if (stage) this.event(routeId, stage, 'FAIL', `${label} removal failed: ${detail}`);
         return false;
       }
     };
@@ -897,23 +979,32 @@ class RouteOrchestrator {
     } else if (clientAttached && clientModel === 'first_class' && inboundId) {
       await step(`client ${email} attachment`, 'rollback_client_detach', () => client.detachClient(email, [inboundId]));
     }
-    if (hostGroupId) await step('managed host', 'rollback_managed_host', () => client.deleteHost(hostGroupId));
+    if (hostGroupId) await step(`managed host ${hostGroupId}`, 'rollback_managed_host', () => client.deleteHost(hostGroupId));
     // Deleting the inbound also removes any embedded (legacy) client entry.
-    if (inboundId) await step('inbound', 'rollback_inbound', () => client.deleteInbound(inboundId));
+    if (inboundId) await step(`inbound #${inboundId}`, 'rollback_inbound', () => client.deleteInbound(inboundId));
     if (iranCreated && peer && iran) {
-      await step('IRAN peer', 'rollback_iran_peer', async () => {
+      await step(`IRAN peer ${peer}`, 'rollback_iran_peer', async () => {
         const result = await this.remote(iran, actions.buildAction('peer_remove', { name: peer }), 300000);
-        if (result.rc !== 0) throw new Error(result.stderr || result.stdout || `rc=${result.rc}`);
-        return peer;
+        if (result.rc !== 0) {
+          const err = new Error(result.stderr || result.stdout || `rc=${result.rc}`);
+          err.stderr = result.stderr;
+          throw err;
+        }
+        return `peer ${peer}`;
       });
     }
     if (foreignCreated && peer && foreign) {
-      await step('FOREIGN node', 'rollback_foreign_node', async () => {
+      await step(`FOREIGN node ${peer}`, 'rollback_foreign_node', async () => {
         const result = await this.remote(foreign, actions.buildAction('node_remove', { name: peer }), 300000);
-        if (result.rc !== 0) throw new Error(result.stderr || result.stdout || `rc=${result.rc}`);
-        return peer;
+        if (result.rc !== 0) {
+          const err = new Error(result.stderr || result.stdout || `rc=${result.rc}`);
+          err.stderr = result.stderr;
+          throw err;
+        }
+        return `node ${peer}`;
       });
     }
+    rollback.warnings = warnings;
     return rollback;
   }
 
@@ -1303,6 +1394,26 @@ class RouteOrchestrator {
    * the attachment to this route's inbound is removed. A route-created client
    * is removed only when no other inbound still uses it.
    */
+  // ------------------------------------------------------------------
+  // Delete
+  //
+  // Idempotent by design: the desired end state is "resource absent", so a
+  // resource that is already gone is SUCCESS, not an error. Production hit the
+  // opposite behaviour — rollback had already removed peer/node, Delete then
+  // re-issued the removal, the CLI answered "Peer 'ir01' does not exist" and the
+  // whole delete returned 409.
+  //
+  // Each component is therefore:
+  //   1. inspected read-only (cheap, bounded) to learn the actual state,
+  //   2. PASSed as ALREADY_ABSENT when it is already gone,
+  //   3. deleted when present,
+  //   4. still tolerated as ALREADY_ABSENT if the delete races and reports
+  //      "does not exist",
+  //   5. only a real, unexpected error is a failure.
+  //
+  // The globally existing client is never deleted: for client_mode=existing we
+  // only ever remove this route's attachment.
+  // ------------------------------------------------------------------
   async deleteRoute(routeId) {
     const id = Number(routeId);
     const route = this.route(id);
@@ -1310,44 +1421,86 @@ class RouteOrchestrator {
     const iran = this.server(route.iran_server_id);
     const foreign = this.server(route.foreign_server_id);
     const client = this.client(this.panel(route.panel_id));
-    const removed = [];
     const failures = [];
+    const components = [];
     const clientModel = route.client_model || null;
 
-    const step = async (name, fn) => {
+    // A component result is recorded for every step, including the happy path,
+    // so the UI can show "already absent" as a success.
+    const record = (name, previous, result, detail) => {
+      components.push({ name, previous, result, detail });
+      const status = result === 'FAILED' ? 'FAIL' : 'PASS';
+      this.event(id, `delete_${name}`, status, detail);
+      if (result === 'FAILED') failures.push({ name, error: detail });
+    };
+
+    // Run a delete step that tolerates "already absent" answers from the CLI.
+    const tolerant = async (name, previous, fn) => {
       try {
         const detail = await fn();
-        removed.push(name);
-        this.event(id, `delete_${name}`, 'PASS', detail || name);
+        record(name, previous, 'DELETED', detail || name);
       } catch (err) {
-        failures.push({ name, error: err.message });
-        this.event(id, `delete_${name}`, 'FAIL', err.message);
+        if (isAlreadyAbsentError(err)) {
+          record(name, previous, 'ALREADY_ABSENT', `${name} was already absent (${err.message})`);
+          return;
+        }
+        record(name, previous, 'FAILED', err.message);
       }
     };
 
-    // 1. Client relationship.
-    if (clientModel === 'first_class') {
-      if (route.client_attached_by_route) {
-        await step('client_attachment', async () => {
-          if (!route.inbound_id) return 'no inbound recorded; nothing to detach';
-          await client.detachClient(route.client_email, [route.inbound_id]);
+    // ---- 1. Client relationship -------------------------------------
+    if (clientModel === 'first_class' && route.client_attached_by_route && !route.client_created_by_route) {
+      if (!route.inbound_id) {
+        record('client_attachment', 'ABSENT', 'ALREADY_ABSENT', 'no inbound recorded; nothing to detach');
+      } else {
+        // Ask the inbound itself (one bounded read) instead of /clients/get.
+        const inbound = await inspectInbound(this, client, route.inbound_id);
+        const attached = inbound.present ? clientInInbound(inbound, route.client_email) : false;
+        if (!inbound.present || !attached) {
           this.ownership(id, { client_attached_by_route: 0 });
-          return `detached ${route.client_email} from inbound ${route.inbound_id} (client preserved)`;
-        });
-      } else if (route.client_created_by_route) {
-        await step('client', async () => {
-          // Only safe when nothing else still references it.
-          let otherAttachments = [];
-          try {
-            const record = await client.getFirstClassClient(route.client_email);
-            const ids = record ? (record.inboundIds || []).map(Number) : [];
-            otherAttachments = ids.filter((inboundId) => Number(inboundId) !== Number(route.inbound_id));
-          } catch { otherAttachments = []; }
-          if (otherAttachments.length) {
-            if (route.inbound_id) await client.detachClient(route.client_email, [route.inbound_id]);
-            this.ownership(id, { client_attached_by_route: 0, client_created_by_route: 0 });
+          record('client_attachment', 'ABSENT', 'ALREADY_ABSENT',
+            inbound.present
+              ? `${route.client_email} is not attached to inbound ${route.inbound_id}`
+              : `inbound ${route.inbound_id} is already gone, so the attachment is gone`);
+        } else {
+          await tolerant('client_attachment', 'PRESENT', async () => {
+            await client.detachClient(route.client_email, [route.inbound_id]);
+            this.ownership(id, { client_attached_by_route: 0 });
+            return `${route.client_email} detached from inbound ${route.inbound_id} (global client preserved)`;
+          });
+        }
+      }
+    } else if (clientModel === 'first_class' && route.client_created_by_route) {
+      // Route-owned client. It is GLOBAL state, so before deleting it we must be
+      // sure nothing else still references it. One /clients/get is acceptable
+      // here: this is the delete path, not provisioning, and refusing to delete a
+      // shared identity is far more important than saving a request.
+      let otherAttachments = [];
+      try {
+        const record = await client.getFirstClassClient(route.client_email);
+        const ids = record ? (record.inboundIds || []).map(Number) : [];
+        otherAttachments = ids.filter((inboundId) => Number(inboundId) !== Number(route.inbound_id));
+      } catch { otherAttachments = []; }
+
+      if (otherAttachments.length) {
+        // Preserve the client; remove only this route's attachment.
+        if (route.inbound_id) {
+          await tolerant('client', 'PRESENT', async () => {
+            await client.detachClient(route.client_email, [route.inbound_id]);
+            this.ownership(id, { client_attached_by_route: 0 });
             return `${route.client_email} is still used by inbound(s) ${otherAttachments.join(', ')}; detached from ${route.inbound_id} instead of deleting`;
-          }
+          });
+        } else {
+          record('client', 'PRESENT', 'ALREADY_ABSENT', `${route.client_email} shared with inbound(s) ${otherAttachments.join(', ')}; preserved`);
+        }
+        components.push({
+          name: 'client_preserved',
+          previous: 'PRESENT',
+          result: 'PRESERVED',
+          detail: `${route.client_email} kept because inbound(s) ${otherAttachments.join(', ')} still use it`,
+        });
+      } else {
+        await tolerant('client', 'PRESENT', async () => {
           await client.deleteClient(route.client_email);
           this.ownership(id, { client_created_by_route: 0 });
           return `deleted route-created client ${route.client_email}`;
@@ -1355,47 +1508,72 @@ class RouteOrchestrator {
       }
     }
 
-    // 2. Managed host.
+    // ---- 2. Managed host --------------------------------------------
     if (route.host_group_id) {
-      await step('managed_host', async () => {
+      await tolerant('managed_host', 'PRESENT', async () => {
         await client.deleteHost(route.host_group_id);
         this.ownership(id, { host_group_id: null });
         return `removed host ${route.host_group_id}`;
       });
+    } else {
+      record('managed_host', 'ABSENT', 'ALREADY_ABSENT', 'no managed host recorded');
     }
 
-    // 3. Inbound (also removes any embedded legacy client entry).
+    // ---- 3. Inbound -------------------------------------------------
     if (route.inbound_id) {
-      await step('inbound', async () => {
-        await client.deleteInbound(route.inbound_id);
-        return `removed inbound ${route.inbound_id}`;
-      });
+      const inbound = await inspectInbound(this, client, route.inbound_id);
+      if (!inbound.present) {
+        record('inbound', 'ABSENT', 'ALREADY_ABSENT', `inbound ${route.inbound_id} already absent`);
+      } else {
+        await tolerant('inbound', 'PRESENT', async () => {
+          await client.deleteInbound(route.inbound_id);
+          return `removed inbound ${route.inbound_id}`;
+        });
+      }
+    } else {
+      record('inbound', 'ABSENT', 'ALREADY_ABSENT', 'no inbound recorded');
     }
 
-    // 4. GRE, IRAN first then FOREIGN (mirrors the rollback order).
+    // ---- 4. GRE -----------------------------------------------------
     if (route.peer_name) {
-      await step('iran_peer', async () => {
-        const result = await this.remote(iran, actions.buildAction('peer_remove', { name: route.peer_name }), 300000);
-        if (result.rc !== 0) throw new Error(result.stderr || result.stdout || `rc=${result.rc}`);
-        return `removed IRAN peer ${route.peer_name}`;
-      });
-      await step('foreign_node', async () => {
-        const result = await this.remote(foreign, actions.buildAction('node_remove', { name: route.peer_name }), 300000);
-        if (result.rc !== 0) throw new Error(result.stderr || result.stdout || `rc=${result.rc}`);
-        return `removed FOREIGN node ${route.peer_name}`;
-      });
+      const [iranGre, foreignGre] = await Promise.all([
+        inspectGreInterface(this, iran, route.peer_name, 'IRAN'),
+        inspectGreInterface(this, foreign, route.peer_name, 'FOREIGN'),
+      ]);
+      if (!iranGre.present) {
+        record('iran_peer', 'ABSENT', 'ALREADY_ABSENT', `IRAN peer ${route.peer_name} already absent`);
+      } else {
+        await tolerant('iran_peer', 'PRESENT', async () => {
+          const result = await this.remote(iran, actions.buildAction('peer_remove', { name: route.peer_name }), 300000);
+          if (result.rc !== 0) throw new Error(result.stderr || result.stdout || `rc=${result.rc}`);
+          return `removed IRAN peer ${route.peer_name}`;
+        });
+      }
+      if (!foreignGre.present) {
+        record('foreign_node', 'ABSENT', 'ALREADY_ABSENT', `FOREIGN node ${route.peer_name} already absent`);
+      } else {
+        await tolerant('foreign_node', 'PRESENT', async () => {
+          const result = await this.remote(foreign, actions.buildAction('node_remove', { name: route.peer_name }), 300000);
+          if (result.rc !== 0) throw new Error(result.stderr || result.stdout || `rc=${result.rc}`);
+          return `removed FOREIGN node ${route.peer_name}`;
+        });
+      }
+    } else {
+      record('iran_peer', 'ABSENT', 'ALREADY_ABSENT', 'no peer recorded');
+      record('foreign_node', 'ABSENT', 'ALREADY_ABSENT', 'no peer recorded');
     }
 
-    // 5. Port allocation.
-    await step('port_allocation', async () => {
+    // ---- 5. Port allocation (local, always safe) --------------------
+    const allocation = inspectPortAllocation(this.db, id);
+    await tolerant('port_allocation', allocation.present ? 'PRESENT' : 'ABSENT', async () => {
       this.db.prepare("UPDATE port_allocations SET status = 'RELEASED', updated_at = ? WHERE route_id = ?").run(Date.now(), id);
-      return `released port ${route.port}`;
+      return allocation.port ? `released port ${allocation.port}` : 'allocation released';
     });
 
     const now = Date.now();
     const ok = failures.length === 0;
     if (ok) {
-      this.db.prepare("UPDATE gre_routes SET deleted_at = ?, status = 'STALE', current_stage = NULL, rollback_state = 'CLEAN', updated_at = ? WHERE id = ?")
+      this.db.prepare("UPDATE gre_routes SET deleted_at = ?, status = 'STALE', current_stage = NULL, rollback_state = 'CLEAN', share_link_enc = NULL, outbound_enc = NULL, config_updated_at = NULL, updated_at = ? WHERE id = ?")
         .run(now, now, id);
       this.event(id, 'deleted', 'PASS', 'Route removed; event history is preserved');
     } else {
@@ -1410,12 +1588,214 @@ class RouteOrchestrator {
       route_id: id,
       name: route.name,
       deleted: ok,
-      removed,
+      components,
       failures,
-      preserved: route.client_attached_by_route
-        ? [`3x-ui client "${route.client_email}" (only the attachment was removed)`]
+      removed: components.filter((c) => c.result === 'DELETED').map((c) => c.name),
+      already_absent: components.filter((c) => c.result === 'ALREADY_ABSENT').map((c) => c.name),
+      preserved: route.client_attached_by_route || route.client_mode === 'existing'
+        ? [`3x-ui client "${route.client_email}" (global client preserved; only this route's attachment was removed)`]
         : [],
     };
+  }
+
+  // ------------------------------------------------------------------
+  // Runtime validation
+  //
+  // Production proved that one opaque promise covering "everything after
+  // provisioning" can consume the entire request budget and then fail with
+  // "The operation was aborted due to timeout" and no idea which subsystem was
+  // at fault. So this is a set of small, independently timed checks:
+  //
+  //   * every check has its own bounded timeout,
+  //   * they run in parallel via allSettled, so one slow subsystem cannot
+  //     cancel a sibling that already succeeded,
+  //   * each emits its own RUNNING then PASS/FAIL stage,
+  //   * the thrown error names the exact component,
+  //   * the only panel read is the single-inbound detail lookup. No
+  //     /inbounds/list, no /clients/list, no /clients/links, and no /clients/get.
+  // ------------------------------------------------------------------
+  async validateRuntime({ routeId, iran, foreign, client, clientModel, email, port, inboundId, peer, hostGroupId, hostMode, iranIp }) {
+    const stages = [
+      ['runtime_gre_iran', `IRAN interface gre-${peer} state`],
+      ['runtime_gre_foreign', `FOREIGN interface gre-${peer} state`],
+      ['runtime_iran_tcp_rule', `IRAN TCP forwarding rule for ${port}`],
+      ['runtime_iran_udp_rule', `IRAN UDP forwarding rule for ${port}`],
+      ['runtime_foreign_tcp_listener', `FOREIGN TCP listener on :${port}`],
+      ['runtime_foreign_udp_listener', `FOREIGN UDP listener on :${port}`],
+      ['runtime_xui_inbound', `3x-ui inbound #${inboundId}`],
+      ['runtime_xui_client', `client ${email} membership in inbound #${inboundId}`],
+      ['runtime_managed_host', hostGroupId ? `managed host ${hostGroupId}` : 'managed host'],
+      ['runtime_e2e_tcp', `TCP connect to ${iranIp}:${port}`],
+    ];
+
+    // Announce every check first so the timeline has a stable, predictable shape
+    // even though the checks themselves finish out of order in parallel.
+    const handles = new Map();
+    for (const [name, detail] of stages) {
+      handles.set(name, this.stage(routeId, name, detail));
+    }
+
+    const [greIran, greForeign, forwarding, listeners, inbound, managedHost] = await Promise.all([
+      inspectGreInterface(this, iran, peer, 'IRAN'),
+      inspectGreInterface(this, foreign, peer, 'FOREIGN'),
+      inspectForwarding(this, iran, port, portEvidence),
+      inspectListeners(this, foreign, port, portEvidence),
+      inspectInbound(this, client, inboundId),
+      hostMode === 'managed_hosts'
+        ? inspectManagedHost(this, client, hostGroupId)
+        : Promise.resolve({ present: null, optional: true, detail: 'external proxy mode; no managed host expected' }),
+    ]);
+
+    // Membership is answered from the single-inbound response we already hold, so
+    // first-class panels are never asked for /clients/get after attach.
+    const attached = inbound.present ? clientInInbound(inbound, email) : false;
+
+    // The published endpoint is only worth probing once the pieces that carry it
+    // are known to exist; probing a dead path just burns the TCP budget.
+    const pathReady = !!(greIran.up && greForeign.up && forwarding.tcp && listeners.tcp);
+    const e2e = pathReady
+      ? await probeTcpConnect(this, foreign, iranIp, port)
+      : { connected: null, skipped: true, detail: 'skipped: forwarding path was not confirmed' };
+
+    // component -> check result. `optional` failures WARN instead of failing the
+    // route: panel metadata that does not affect forwarding must not destroy a
+    // working tunnel.
+    const results = {
+      runtime_gre_iran: { pass: greIran.up === true, detail: greIran.detail, required: true, value: greIran.up ? 'PASS' : 'FAIL' },
+      runtime_gre_foreign: { pass: greForeign.up === true, detail: greForeign.detail, required: true, value: greForeign.up ? 'PASS' : 'FAIL' },
+      runtime_iran_tcp_rule: { pass: forwarding.tcp === true, detail: forwarding.detail, required: true },
+      runtime_iran_udp_rule: { pass: forwarding.udp === true, detail: forwarding.detail, required: true },
+      runtime_foreign_tcp_listener: { pass: listeners.tcp === true, detail: listeners.detail, required: true },
+      runtime_foreign_udp_listener: { pass: listeners.udp === true, detail: listeners.detail, required: true },
+      runtime_xui_inbound: { pass: inbound.present === true, detail: inbound.detail, required: true },
+      runtime_xui_client: { pass: attached === true, detail: attached ? `${email} attached to inbound #${inboundId}` : (inbound.present ? `${email} is not present in inbound #${inboundId}` : `inbound #${inboundId} absent, so the attachment is absent`), required: true },
+      runtime_managed_host: hostMode === 'managed_hosts'
+        ? { pass: managedHost.present === true, detail: managedHost.detail, required: true }
+        : { pass: true, optional: true, detail: managedHost.detail, value: 'N/A' },
+      runtime_e2e_tcp: { pass: e2e.connected === true, detail: e2e.detail, required: true, skipped: !!e2e.skipped },
+    };
+
+    // Emit verdicts in declaration order for a readable timeline.
+    const failures = [];
+    const warnings = [];
+    for (const [name] of stages) {
+      const handle = handles.get(name);
+      const result = results[name];
+      if (!result) continue;
+      if (result.pass) {
+        handle.pass(result.detail);
+      } else if (result.optional) {
+        // Honest WARN: recorded as a failure event but compensated below so the
+        // route is not torn down for metadata that does not carry traffic.
+        handle.fail(`WARN: ${result.detail}`);
+        warnings.push(`${RUNTIME_LABELS[name]}: ${result.detail}`);
+      } else {
+        handle.fail(result.detail);
+        failures.push({ name, label: RUNTIME_LABELS[name], detail: result.detail });
+      }
+    }
+
+    const checks = {};
+    for (const [name, result] of Object.entries(results)) {
+      const key = name.replace(/^runtime_/, '');
+      checks[key] = result.pass ? 'PASS' : (result.optional ? 'WARN' : 'FAIL');
+    }
+
+    const summary = this.stage(routeId, 'runtime_validation', 'All runtime checks');
+    if (failures.length) {
+      const first = failures[0];
+      const more = failures.length > 1 ? ` (+${failures.length - 1} more)` : '';
+      summary.fail(`${first.label}: ${first.detail}${more}`);
+      const err = new RuntimeValidationError(first.name, `Runtime validation failed at ${first.label}: ${first.detail}`, checks);
+      err.failures = failures;
+      throw err;
+    }
+    summary.pass(warnings.length
+      ? `all runtime checks passed (${warnings.length} warning: ${warnings[0]})`
+      : 'all runtime checks passed');
+
+    return { checks, warnings };
+  }
+
+  // ------------------------------------------------------------------
+  // Persistent configuration
+  //
+  // The share link is stored encrypted on the route row, so Copy Config keeps
+  // working after a browser refresh and after a hub restart. The in-memory
+  // cache is never required.
+  //
+  // An ACTIVE route from an older release may have an encrypted credential but no
+  // stored link. That case is reconstructed locally from method + credential +
+  // IRAN endpoint + port and then persisted — no 3x-ui call, and never an
+  // invented credential.
+  // ------------------------------------------------------------------
+  routeConfig(routeId) {
+    const route = this.route(Number(routeId));
+    if (!route || route.deleted_at) return null;
+    if (route.status !== 'ACTIVE') return null;
+
+    const host = route.iran_endpoint || this.iranEndpointFor(route);
+    const port = Number(route.port);
+    const method = route.method;
+
+    let link = null;
+    let outbound = null;
+
+    if (route.share_link_enc) {
+      try { link = decrypt(this.cryptKey, route.share_link_enc); } catch { link = null; }
+    }
+    if (route.outbound_enc) {
+      try { outbound = JSON.parse(decrypt(this.cryptKey, route.outbound_enc)); } catch { outbound = null; }
+    }
+
+    if (!link) {
+      // Reconstruct from the encrypted credential we already own.
+      let password = null;
+      if (route.client_password_enc) {
+        try { password = decrypt(this.cryptKey, route.client_password_enc); } catch { password = null; }
+      }
+      if (!password || !host || !Number.isInteger(port) || !method) {
+        throw new Error('Configuration cannot be reconstructed safely; Reconcile/Retry is required.');
+      }
+      link = buildShadowsocksLink({ method, password, host, port, remark: route.name || '' });
+      const rebuilt = buildOutbound({ link, host, port, method, password, name: route.name });
+      const now = Date.now();
+      this.db.prepare('UPDATE gre_routes SET share_link_enc=?, outbound_enc=?, config_updated_at=?, updated_at=? WHERE id=?')
+        .run(encrypt(this.cryptKey, link), encrypt(this.cryptKey, JSON.stringify(rebuilt)), now, now, route.id);
+      outbound = rebuilt;
+    }
+
+    if (!outbound) {
+      // Link exists but the outbound projection was never stored: derive it from
+      // the link we hold rather than making one up.
+      let parsed = null;
+      try { parsed = parseShadowsocksLink(link); } catch { parsed = null; }
+      if (parsed && parsed.password) {
+        outbound = buildOutbound({ link, host: parsed.host || host, port: parsed.port || port, method: parsed.method || method, password: parsed.password, name: route.name });
+      }
+    }
+
+    return {
+      route_id: route.id,
+      name: route.name,
+      status: route.status,
+      client_mode: route.client_mode || null,
+      client_email: route.client_email || null,
+      method,
+      link,
+      outbound,
+      endpoint: { host, port },
+      inbound_id: route.inbound_id != null ? Number(route.inbound_id) : null,
+      updated_at: route.config_updated_at || null,
+    };
+  }
+
+  // Stored endpoint for routes created before iran_endpoint was captured.
+  iranEndpointFor(route) {
+    try {
+      const server = this.server(route.iran_server_id);
+      return server && server.publicIp ? server.publicIp : null;
+    } catch { return null; }
   }
 
   async reconcile(routeId) {
@@ -1449,14 +1829,15 @@ class RouteOrchestrator {
       WHERE p.route_id = ?
     `).get(route.id);
 
-    // GRE interface state needs a dedicated probe; it is the one thing that
-    // distinguishes "peer exists" from "peer actually forwards".
+    // GRE interface state uses the same read-only primitive as runtime
+    // validation and delete, so "is the peer there" can never be answered two
+    // different ways depending on which code path asks.
     let greUp = null;
+    let greDetail = null;
     if (route.peer_name) {
-      try {
-        const probe = await this.remote(iran, `ip link show ${shellQuote(`gre-${route.peer_name}`)} 2>/dev/null | grep -q '<[^>]*UP'`, 15000);
-        greUp = probe.rc === 0;
-      } catch { greUp = null; }
+      const gre = await inspectGreInterface(this, iran, route.peer_name, 'IRAN');
+      greUp = gre.present === null ? null : (gre.present && gre.up);
+      greDetail = gre.detail;
     }
 
     // Client relationship, asked of the panel itself where the API allows it.

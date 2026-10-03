@@ -75,6 +75,8 @@ jobs:
           tar xzf gre-hub.tar.gz -C "$TMP"
           for f in hub/VERSION hub/build-info.json hub/.npmrc hub/package.json hub/package-lock.json \
                    hub/server/index.js hub/server/version.js hub/server/xui.js \
+                   hub/server/route-inspection.js hub/server/route-credential-fastpath.js \
+                   hub/server/route-live-preflight.js \
                    hub/server/route-orchestrator.js hub/server/routes.js hub/server/db.js \
                    hub/public/app.js hub/public/index.html hub/public/style.css; do
             [ -f "$TMP/$f" ] || { echo "::error::gre-hub.tar.gz is missing $f"; exit 1; }
