@@ -4,6 +4,22 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.13.2] - 2026-10-03
+
+### Fixed
+
+- **A successful `npm ci` is no longer treated as proof of a working hub.** The
+  hub cannot start without a compiled `better-sqlite3` binding, and npm reports a
+  fully successful install even when it silently skipped that build — whether it
+  does so depends on the npm version and on `allow-scripts` / `ignore-scripts`
+  settings the installer does not control. The updater now loads
+  `better-sqlite3` in the staged directory before swapping it in, attempts
+  `npm rebuild` and a toolchain install on failure, and if the driver still
+  cannot load it **refuses the deployment and leaves the working installation
+  untouched**, with the exact repair commands. Previously this surfaced as an
+  opaque `Could not locate the bindings file` crash after the service had already
+  been replaced.
+
 ## [2.13.1] - 2026-10-03
 
 ### Fixed

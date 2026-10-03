@@ -62,7 +62,7 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are validated then sourced by design
 set -uo pipefail
 
-VERSION="2.13.1"
+VERSION="2.13.2"
 
 GITHUB_REPO="aibedini/gre-manager"
 
@@ -1974,6 +1974,51 @@ hub_npm_ci() { # hub_npm_ci DIR
     return 1
 }
 
+# Installing the dependency tree is not the same as having a working database
+# driver. better-sqlite3 needs a compiled binding, and npm reports a completely
+# successful install even when it silently skipped that build (the behaviour
+# depends on the npm version and on allow-scripts / ignore-scripts settings we do
+# not control). When the binding is missing the hub dies at startup with an
+# opaque "Could not locate the bindings file", so check for it here and try to
+# repair it before we ever hand the service over.
+hub_verify_native_deps() { # hub_verify_native_deps DIR
+    local dir="$1"
+    if [[ "${HUB_SKIP_NPM:-0}" == "1" ]]; then
+        return 0
+    fi
+    if [[ -n "${HUB_TEST_NPM_CMD:-}" ]]; then
+        return 0
+    fi
+    (cd "$dir" && node -e "require('better-sqlite3')" >/dev/null 2>&1) && return 0
+
+    warn "better-sqlite3 has no working binding after install; rebuilding natively..."
+    (cd "$dir" && npm rebuild better-sqlite3 --no-audit --no-fund) >/dev/null 2>&1 || true
+    if (cd "$dir" && node -e "require('better-sqlite3')" >/dev/null 2>&1); then
+        return 0
+    fi
+
+    # A source build needs a toolchain; install one and make one final attempt.
+    warn "Installing build tools and rebuilding better-sqlite3..."
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get install -y build-essential python3 >/dev/null 2>&1 || true
+    elif command -v dnf >/dev/null 2>&1; then
+        dnf install -y gcc-c++ make python3 >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y gcc-c++ make python3 >/dev/null 2>&1 || true
+    fi
+    (cd "$dir" && npm rebuild better-sqlite3 --no-audit --no-fund) >/dev/null 2>&1 || true
+    if (cd "$dir" && node -e "require('better-sqlite3')" >/dev/null 2>&1); then
+        return 0
+    fi
+
+    err "gre-hub cannot load its database driver (better-sqlite3 has no compiled binding)."
+    err "The installation was left untouched. Fix on the target host and retry:"
+    err "  cd $dir && npm rebuild better-sqlite3"
+    err "  Installing a C++ toolchain first usually fixes it:"
+    err "  apt-get install -y build-essential python3   # or dnf/yum equivalent"
+    return 1
+}
+
 # Download a release tarball + its checksum and verify them. Prints nothing on
 # success; the verified archive is left at $2.
 hub_fetch_release() { # hub_fetch_release TAG DEST_TGZ
@@ -2068,6 +2113,10 @@ hub_deploy_tarball() { # hub_deploy_tarball TGZ TAG
     fi
 
     hub_npm_ci "$stage" || { err "Dependency installation failed; $HUB_DIR was left untouched."; return 1; }
+    # A successful `npm ci` is not proof of a usable database driver, and the hub
+    # cannot start without one. Verify (and try to repair) before swapping in the
+    # new build, so a broken install never reaches the running service.
+    hub_verify_native_deps "$stage" || return 1
 
     mkdir -p "$HUB_DIR"
     backup="${HUB_DIR}.old.$$"
