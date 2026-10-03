@@ -4,6 +4,26 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.13.1] - 2026-10-03
+
+### Fixed
+
+- Auto Route `port_check` no longer uses the heavyweight 3x-ui full inbound list
+  on modern panels, which could spend tens of seconds serializing traffic and
+  client payloads and made the port safety scan exceed its timeout on panels with
+  a large client population.
+- Use `/panel/api/inbounds/options` first.
+- Fall back to `/panel/api/inbounds/list/slim` where supported.
+- Full `/panel/api/inbounds/list` is legacy fallback only.
+- Split port safety diagnostics into:
+  `port_check_iran`, `port_check_foreign`, `port_check_xui`.
+- 3x-ui inbound-port query has a bounded timeout
+  (`HUB_PORT_XUI_TIMEOUT_MS`, default 12s), separate from the 20s host inventory
+  timeout (`HUB_PORT_SSH_TIMEOUT_MS`), and the previous client timeout is restored
+  afterwards so the provisioning run keeps its own budget.
+- Exact failing subsystem is now shown in the route timeline.
+- No GRE mutation may start if any port safety check fails.
+
 ## [2.13.0] - 2026-10-03
 
 Adds the live Auto Route preflight timeline contributed upstream in

@@ -8,7 +8,7 @@ function ok(value, message) { assert.ok(value, message); assertions++; }
 function equal(actual, expected, message) { assert.strictEqual(actual, expected, message); assertions++; }
 
 class FakeOrchestrator {
-  constructor({ failXuiPortQuery = false } = {}) {
+  constructor({ failXuiPortQuery = false, optionsUnavailable = false, slimUnavailable = false } = {}) {
     this.eventsLog = [];
     this.stageLog = [];
     this.clientCalls = 0;
@@ -26,11 +26,17 @@ class FakeOrchestrator {
           throw new Error('The operation was aborted due to timeout');
         }
         if (path === '/panel/api/inbounds/options') {
+          if (optionsUnavailable) return { ok: false, status: 404, data: null };
           return {
             ok: true,
             status: 200,
             data: { success: true, obj: [{ id: 10, remark: 'existing', protocol: 'shadowsocks', port: 3049 }] },
           };
+        }
+        if (path === '/panel/api/inbounds/list/slim') {
+          if (slimUnavailable) return { ok: false, status: 404, data: null };
+          // Some builds wrap the payload in `data` instead of `obj`.
+          return { ok: true, status: 200, data: { success: true, data: [{ id: 11, port: 3051 }] } };
         }
         return { ok: false, status: 404, data: null };
       },
@@ -167,6 +173,33 @@ async function prepare(orchestrator) {
   ok(failing.stageLog.some((e) => e.name === 'port_check_iran' && e.status === 'PASS'), 'IRAN port inventory result remains visible when 3x-ui fails');
   ok(failing.stageLog.some((e) => e.name === 'port_check_foreign' && e.status === 'PASS'), 'FOREIGN port inventory result remains visible when 3x-ui fails');
   ok(!failing.originalCalled, 'no GRE mutation may start after a failed port inventory');
+
+  // --- fallback chain ---------------------------------------------------
+  // Panels that predate /options must still be checked, via /list/slim first and
+  // the full list only as a last resort. These paths are what a legacy or
+  // partially upgraded panel actually takes, so they need direct coverage.
+
+  const slimOnly = new FakeOrchestrator({ optionsUnavailable: true });
+  const slimPrepared = await prepare(slimOnly);
+  await slimOnly.run(77, slimPrepared);
+  ok(slimOnly.requestPaths.includes('/panel/api/inbounds/list/slim'),
+    'a panel without /options must fall back to /panel/api/inbounds/list/slim');
+  ok(!slimOnly.requestPaths.includes('/panel/api/inbounds/list'),
+    'the slim fallback must not fall through to the heavyweight full list');
+  const slimPass = slimOnly.stageLog.find((e) => e.name === 'port_check_xui' && e.status === 'PASS');
+  ok(/\/panel\/api\/inbounds\/list\/slim/.test(slimPass.detail),
+    'the timeline must name the slim endpoint as the source');
+  ok(/1 inbound\(s\) read/.test(slimPass.detail),
+    'a `data`-wrapped payload must be unwrapped and counted');
+
+  const legacyOnly = new FakeOrchestrator({ optionsUnavailable: true, slimUnavailable: true });
+  const legacyPrepared = await prepare(legacyOnly);
+  await legacyOnly.run(77, legacyPrepared);
+  ok(legacyOnly.requestPaths.includes('/panel/api/inbounds/list'),
+    'when neither lightweight endpoint exists the full list is the legacy fallback');
+  const legacyPass = legacyOnly.stageLog.find((e) => e.name === 'port_check_xui' && e.status === 'PASS');
+  ok(/legacy fallback/.test(legacyPass.detail),
+    'the timeline must say the legacy endpoint was used');
 
   console.log(`live-preflight-test: ${assertions} assertions passed`);
 })().catch((err) => {
