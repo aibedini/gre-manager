@@ -4,6 +4,54 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.15.2] - 2026-10-05
+
+### Fixed
+
+- **The per-server API exposed probe health only under a nested `probe` key.**
+  v2.15.1 returned `probe: { health, discovery }` but not the top-level `health`
+  and `discovery` fields the interface is specified in terms of, so any client
+  reading the documented shape saw both axes as *unknown* for every server — the
+  same class of silent misreport this series of fixes exists to remove. The two
+  endpoints now return the axes under **all three** keys:
+
+  ```json
+  {
+    "snapshot": { "roles": ["FOREIGN"], "manager": { "version": "2.8.2" } },
+    "health":    { "ok": true,  "checked_at": 0, "duration_ms": 1200, "error_class": null, "error": null, "reason": null },
+    "discovery": { "ok": false, "checked_at": 0, "duration_ms": 15000, "error_class": "timeout",
+                   "error": "gre status --json timed out after 15s", "reason": "SSH timeout" },
+    "probe":     { "health": { }, "discovery": { } }
+  }
+  ```
+
+  `health` and `discovery` are top-level for the current client, and the nested
+  `probe` object carries the same values so a browser holding a cached v2.15.1
+  `app.js` keeps working. Exposing only one of them silently blinds whoever is on
+  the other side, which is exactly what happened here.
+- `POST /api/servers/:id/discover` and `POST /api/servers/:id/health` now carry the
+  same top-level `health`/`discovery` keys as the list endpoints, so the drawer
+  updates both axes from the discover response itself instead of waiting for the
+  next full reload. All probe responses go through one projection helper, so they
+  cannot drift out of shape again.
+- The server card tooltip showed the generic error class ("SSH timeout") where the
+  specific cause was available. It now prefers `error` — the recorded cause such as
+  `gre status --json timed out after 15s` — and falls back to the class label.
+
+### Tests
+
+- New `scripts/api-shape-test.js` (31 assertions). It boots a real gre-hub against
+  a temp data dir, seeds a server whose last known topology is FOREIGN with
+  transport healthy and discovery timed out, and asserts over HTTP that
+  `GET /api/servers` and `GET /api/servers/:id` return the identical shape, that
+  both carry the top-level axes as well as the nested ones, that the last known
+  FOREIGN topology survives the failure, that the version is still reported, that
+  `NO MANAGER` is not claimed, and that a server with no probe state reports `null`
+  axes rather than `false` ones. It also asserts the rendered UI state is
+  `group=foreign ssh=healthy discovery=failed`, and that no secret material appears
+  in either payload. Verified in reverse: restoring the nested-only shape makes the
+  suite fail on the missing top-level keys.
+
 ## [2.15.1] - 2026-10-05
 
 ### Fixed

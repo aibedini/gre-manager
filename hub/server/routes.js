@@ -208,10 +208,21 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
 
   // The projection sent to the client: transport health and discovery health as
   // two independent facts, never merged, never carrying secrets.
-  const publicProbe = (id) => {
-    const { health, discovery: disc } = getProbeState(id);
-    return { health, discovery: disc };
+  //
+  // They are exposed BOTH as top-level `health`/`discovery` keys and nested under
+  // `probe`, and all three carry the same objects. That is deliberate, not
+  // redundancy: a browser holding a cached older app.js reads the nested shape,
+  // and the current client reads the top-level one. Exposing only one of them
+  // makes every server render as "unknown" for whoever is on the other side.
+  const probeProjection = (id) => {
+    const { health, discovery } = getProbeState(id);
+    const probe = { health, discovery };
+    return { health, discovery, probe };
   };
+
+  // One projection for every response that reports probe state, so the discover,
+  // health and list endpoints can never drift out of shape with each other.
+  const publicProbe = (id) => probeProjection(id);
 
   // --- discovery orchestration -----------------------------------------
   // One bounded queue for every automated probe, so a refresh can never open a
@@ -445,7 +456,7 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     res.json(rows.map((r) => ({
       ...publicServer(r),
       snapshot: getSnapshot(r.id),
-      probe: publicProbe(r.id),
+      ...probeProjection(r.id),
       connectivity: connectivityFor(r.id),
     })));
   });
@@ -532,7 +543,7 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     res.json({
       ...publicServer(server),
       snapshot: getSnapshot(server.id),
-      probe: publicProbe(server.id),
+      ...probeProjection(server.id),
       connectivity: connectivityFor(server.id),
     });
   });
@@ -626,12 +637,23 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     auditEvent(server.id, server.name, 'discover', null, result.ok ? 0 : 1,
       result.ok ? 'authoritative snapshot updated' : `probe failed (${(result.probe.discovery && result.probe.discovery.error_class) || 'unknown'})`);
     // Still a usable 200 for the frontend: the payload distinguishes success from
-    // failure via `ok`/`probe`, and a failure never touched the snapshot.
-    if (result.ok) return res.json({ ...result.snapshot, ok: true, snapshot: result.snapshot, probe: result.probe });
+    // failure via `ok`/`probe`/`discovery`, and a failure never touched the snapshot.
+    if (result.ok) {
+      return res.json({
+        ...result.snapshot,
+        ok: true,
+        snapshot: result.snapshot,
+        health: result.probe.health,
+        discovery: result.probe.discovery,
+        probe: result.probe,
+      });
+    }
     res.json({
       ok: false,
       error: result.error,
       error_class: result.error_class,
+      health: result.probe.health,
+      discovery: result.probe.discovery,
       probe: result.probe,
       snapshot: getSnapshot(server.id),
     });
@@ -644,7 +666,13 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     if (!server) return res.status(404).json({ error: 'not found' });
     const result = await runHealthProbe(server);
     if (result.hostkey_mismatch) return hostKeyMismatchResponse(res, server, result.presented_fp);
-    res.json({ ok: result.ok, probe: result.probe, snapshot: getSnapshot(server.id) });
+    res.json({
+      ok: result.ok,
+      health: result.probe.health,
+      discovery: result.probe.discovery,
+      probe: result.probe,
+      snapshot: getSnapshot(server.id),
+    });
   }));
 
   // Refresh every server's availability. Returns immediately with the queue

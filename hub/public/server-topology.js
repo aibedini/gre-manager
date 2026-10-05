@@ -52,16 +52,23 @@
     return ({ iran: 'IRAN', foreign: 'FOREIGN', dual: 'DUAL ROLE', unconfigured: 'UNCONFIGURED' })[key] || 'UNCONFIGURED';
   }
 
-  // Availability has TWO independent axes, and the UI must not merge them:
-  //   health    — can the hub reach this server over SSH at all
-  //   discovery — did the last full discovery manage to read its topology
-  // A healthy SSH session with a failed discovery is the exact case that used to
-  // display as "HEALTHY" while nothing was actually known about the server.
+  // Read one probe axis.
+  //
+  // The hub exposes the two axes BOTH as top-level `health`/`discovery` keys and
+  // nested under `probe`, so all three of these are live in the field at once:
+  //   server.discovery            — current hub
+  //   server.probe.discovery      — hub from the previous release
+  //   server.probe.ok             — flat single-axis shape, older still
+  // Checking each in turn means neither a cached app.js nor a hub mid-upgrade
+  // renders every server as "unknown".
   function probeAxis(server, axis) {
-    var probe = server && server.probe;
-    if (!probe) return null;
-    // Tolerate the pre-v2.15.1 flat shape so an older hub response still renders.
-    if (probe[axis]) return probe[axis];
+    if (!server) return null;
+    var direct = server[axis];
+    if (direct && typeof direct === 'object') return direct;
+    var probe = server.probe;
+    if (!probe || typeof probe !== 'object') return null;
+    if (probe[axis] && typeof probe[axis] === 'object') return probe[axis];
+    // Pre-split flat shape: `probe` WAS the discovery axis.
     if (axis === 'discovery' && probe.ok !== undefined) return probe;
     return null;
   }
@@ -92,11 +99,15 @@
     return 'DISCOVERY UNKNOWN';
   }
 
+  // The message an operator should see. `error` is the specific cause recorded by
+  // the probe ("gre status --json timed out after 15s"); `reason` is the generic
+  // class label ("SSH timeout"). Prefer the specific one — it is the difference
+  // between a tooltip that helps and one that just restates the badge.
   function probeReason(server, axis) {
     var which = axis || (discoveryState(server) === 'failed' ? 'discovery' : 'health');
     var found = probeAxis(server, which);
     if (!found || found.ok !== false) return '';
-    return found.reason || found.error || 'Probe failed';
+    return found.error || found.reason || 'Probe failed';
   }
 
   // Does this server still need a successful discovery before it can be grouped?

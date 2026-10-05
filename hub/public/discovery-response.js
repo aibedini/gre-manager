@@ -59,12 +59,22 @@
   // in it, so the card and the drawer never disagree.
   function apply(server, data, servers) {
     var result = read(data);
-    if (result.probe) server.probe = result.probe;
+    // The discover payload exposes the axes both top-level and under `probe`; keep
+    // whichever it actually sent so the next render does not read a stale value.
+    if (result.probe) {
+      server.probe = result.probe;
+      if (data && data.health) server.health = data.health;
+      if (data && data.discovery) server.discovery = data.discovery;
+    }
     if (result.ok && result.snapshot) server.snapshot = result.snapshot;
     if (Array.isArray(servers)) {
       var listed = servers.find(function (item) { return Number(item.id) === Number(server.id); });
       if (listed) {
-        if (result.probe) listed.probe = result.probe;
+        if (result.probe) {
+          listed.probe = result.probe;
+          if (data && data.health) listed.health = data.health;
+          if (data && data.discovery) listed.discovery = data.discovery;
+        }
         if (result.ok && result.snapshot) listed.snapshot = result.snapshot;
       }
     }
