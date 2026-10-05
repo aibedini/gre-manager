@@ -19,14 +19,33 @@ const ssh = require('./ssh');
 // Kernel-created dummy GRE devices, never manager-managed.
 const SYSTEM_DEVICES = new Set(['gre0', 'gretap0', 'erspan0', 'ip6gre0', 'ip6tnl0', 'tunl0', 'sit0']);
 
+// The probe deliberately records the exit status AND both streams of the status
+// subcommand.
+//
+// Without this, `timeout 15 gre status --json 2>/dev/null` could time out, crash
+// or print nothing, and the surrounding script would still print every marker and
+// exit 0 — so a topology-less run looked like a clean discovery with roles: [].
+// stdout and stderr are captured into separate files first so a stream that emits
+// both can never interleave into unparseable JSON.
 const PROBE = [
+  'PROBE_TMP="$(mktemp -d 2>/dev/null || echo /tmp/gre-probe-$$)"',
+  'mkdir -p "$PROBE_TMP" 2>/dev/null || true',
+  'trap \'rm -rf "$PROBE_TMP"\' EXIT',
   'echo "@@BEGIN gre@@"',
   'if command -v gre >/dev/null 2>&1; then',
   '  echo "installed=1"',
   '  gre --version 2>/dev/null | head -n 1',
+  '  timeout 15 gre status --json >"$PROBE_TMP/status.out" 2>"$PROBE_TMP/status.err"',
+  '  echo "status_rc=$?"',
   '  echo "@@BEGIN status_json@@"',
-  '  timeout 15 gre status --json 2>/dev/null',
+  '  cat "$PROBE_TMP/status.out" 2>/dev/null',
   '  echo "@@END status_json@@"',
+  '  echo "@@BEGIN status_stderr@@"',
+  // Truncated defensively: this text is passed through sanitisation before it is
+  // ever stored or shown, but keeping the probe payload small protects the
+  // transport from a subcommand that decides to be chatty.
+  '  head -c 4000 "$PROBE_TMP/status.err" 2>/dev/null',
+  '  echo "@@END status_stderr@@"',
   'else',
   '  echo "installed=0"',
   'fi',
@@ -81,6 +100,69 @@ function parseKeyVals(text) {
   return out;
 }
 
+// Extract a server's roles from `gre status --json` output across the versions
+// that are actually in production.
+//
+// The shape has changed over the project's life, so this detects what is present
+// rather than switching on a version number: a hardcoded version table would be
+// wrong the moment someone runs a build whose version string is unexpected.
+//
+// Recognised, in order of preference:
+//   roles:  ["IRAN","FOREIGN"]            explicit list
+//   role:   "IRAN" | "both" | "dual"      singular string
+//   mode:   "iran" | "foreign" | "both"   older wording
+//   plus topology evidence: iran_peers / nodes / peers arrays, and the presence
+//   of role-specific keys (foreign_ip, subnet_base, key, tun).
+//
+// Returns { roles, evidence } so the caller can tell "no roles configured" from
+// "roles exist but the schema was not understood".
+function extractRoles(status) {
+  if (!status || typeof status !== 'object') return { roles: [], evidence: [] };
+
+  const out = new Set();
+  const evidence = [];
+  const add = (value, why) => {
+    const text = String(value === null || value === undefined ? '' : value).trim().toUpperCase();
+    if (!text) return;
+    if (text === 'BOTH' || text === 'DUAL' || text === 'IRAN+FOREIGN' || text === 'IRAN_FOREIGN') {
+      out.add('IRAN');
+      out.add('FOREIGN');
+      evidence.push(`${why}=${text}`);
+      return;
+    }
+    if (text === 'IRAN' || text === 'FOREIGN') {
+      out.add(text);
+      evidence.push(`${why}=${text}`);
+    }
+  };
+
+  if (Array.isArray(status.roles)) {
+    for (const role of status.roles) add(role, 'roles[]');
+  }
+  if (typeof status.role === 'string') add(status.role, 'role');
+  if (typeof status.mode === 'string') add(status.mode, 'mode');
+  if (typeof status.node_role === 'string') add(status.node_role, 'node_role');
+  if (status.is_iran === true) add('IRAN', 'is_iran');
+  if (status.is_foreign === true) add('FOREIGN', 'is_foreign');
+
+  // Topology evidence: a node with foreign peers is an IRAN node; a node that
+  // knows its own tunnel subnet/key is a FOREIGN node. These are fallbacks for
+  // schemas that never carried an explicit role field.
+  const iranPeers = status.iran_peers || status.peers || status.foreign_peers;
+  if (Array.isArray(iranPeers) && iranPeers.length) {
+    if (!out.has('IRAN')) { out.add('IRAN'); evidence.push('iran_peers[]'); }
+  }
+  const nodes = status.nodes || status.foreign_nodes;
+  if (Array.isArray(nodes) && nodes.length) {
+    if (!out.has('FOREIGN')) { out.add('FOREIGN'); evidence.push('nodes[]'); }
+  }
+  if (status.foreign_ip || status.subnet_base) {
+    if (!out.has('FOREIGN')) { out.add('FOREIGN'); evidence.push(status.foreign_ip ? 'foreign_ip' : 'subnet_base'); }
+  }
+
+  return { roles: [...out], evidence };
+}
+
 function parseProbe(stdout) {
   const sections = parseSections(stdout);
 
@@ -93,12 +175,39 @@ function parseProbe(stdout) {
     version = vm ? vm[1] : (versionLine || 'unknown');
   }
 
+  // `status_rc` is emitted by the probe script. When it is absent (an older
+  // probe), fall back to "the section parsed", which keeps the previous
+  // behaviour for panels the hub cannot upgrade.
+  const hasStatusRc = greInfo.status_rc !== undefined;
+  const statusRc = hasStatusRc ? Number(greInfo.status_rc) : (installed ? 0 : null);
+  const statusRaw = sections.status_json === undefined ? '' : String(sections.status_json);
+  const statusStderr = sections.status_stderr ? sanitizeMessage(sections.status_stderr) : '';
+
   let status = null;
-  if (installed && sections.status_json) {
-    try {
-      status = JSON.parse(sections.status_json);
-    } catch {
-      status = { parse_error: true, raw: sections.status_json.slice(0, 2000) };
+  let statusError = null;
+  if (installed) {
+    if (hasStatusRc && !Number.isFinite(statusRc)) {
+      statusError = { class: 'malformed', detail: `gre status reported an unreadable exit code (${greInfo.status_rc})` };
+    } else if (statusRc === 124) {
+      statusError = { class: 'timeout', detail: 'gre status --json timed out after 15s' };
+    } else if (statusRc !== 0) {
+      statusError = {
+        class: 'remote',
+        detail: statusStderr || `gre status --json exited with rc=${statusRc}`,
+      };
+    } else if (!statusRaw.trim()) {
+      statusError = { class: 'malformed', detail: 'gre status --json produced no output' };
+    } else {
+      try {
+        status = JSON.parse(statusRaw);
+        if (!status || typeof status !== 'object' || Array.isArray(status)) {
+          status = null;
+          statusError = { class: 'malformed', detail: 'gre status --json did not return an object' };
+        }
+      } catch {
+        status = null;
+        statusError = { class: 'malformed', detail: 'gre status --json returned output that is not valid JSON' };
+      }
     }
   }
 
@@ -121,13 +230,19 @@ function parseProbe(stdout) {
     legacy.broad_masquerade_rules > 0 ||
     legacy.input_icmp_drop_rules > 0;
 
-  const roles = (status && Array.isArray(status.roles) ? status.roles : []).map((r) => String(r).toUpperCase());
+  const roleInfo = extractRoles(status);
 
   return {
     taken_at: new Date().toISOString(),
     manager: { installed, version },
-    roles,
+    roles: roleInfo.roles,
+    role_evidence: roleInfo.evidence,
     status,
+    // Set when the manager is present but its state could not be read. The caller
+    // must treat this as an incomplete discovery and keep the previous snapshot.
+    status_error: statusError,
+    status_rc: hasStatusRc ? statusRc : null,
+    status_stderr: statusStderr || null,
     tunnels_up: status && typeof status.tunnels_up === 'number' ? status.tunnels_up : null,
     service: status ? status.service || null : null,
     watchdog: status ? status.watchdog || null : null,
@@ -244,10 +359,29 @@ function classifyProbeResult(result) {
 
   const snapshot = parseProbe(stdout);
   if (result.stderr && result.stderr.trim() && snapshot.manager.installed) {
-    // Informational only: the structured sections are authoritative, and the
-    // manager being installed means the probe itself completed.
+    // Informational only: the structured sections are authoritative.
     snapshot.probe_stderr = sanitizeMessage(result.stderr).slice(0, 1000);
   }
+
+  // The manager is present, but its state could not be read. That is an INCOMPLETE
+  // discovery, not an empty one: the SSH session succeeded and every marker was
+  // printed, yet nothing trustworthy came back about roles. Treating this as
+  // success is what allowed a card to read "UNKNOWN / v2.8.2 / HEALTHY" with no
+  // topology behind it.
+  if (snapshot.manager.installed && snapshot.status_error) {
+    const failure = snapshot.status_error;
+    return {
+      ok: false,
+      errorClass: failure.class,
+      reason: failure.class === 'timeout'
+        ? 'gre status timed out'
+        : (failure.class === 'malformed' ? 'gre status output unusable' : ERROR_CLASSES[failure.class].reason),
+      detail: failure.detail,
+      incomplete: true,
+      snapshot,
+    };
+  }
+
   return { ok: true, snapshot };
 }
 
@@ -375,6 +509,7 @@ module.exports = {
   classifyProbeResult,
   probeHealth,
   parseProbe,
+  extractRoles,
   parseGreTunnelNames,
   sanitizeMessage,
   errorReason,

@@ -319,12 +319,13 @@ function badgesFor(server) {
 
 function healthDot(server) {
   const snap = server.snapshot;
-  // Probe availability drives the dot; topology lives in the group and badges.
-  const health = probeHealth(server);
-  if (health === 'failed') return 'err';
+  // The dot reports REACHABILITY only; topology lives in the group and badges.
+  if (healthState(server) === 'failed') return 'err';
   if ((server.connectivity || []).some((pair) =>
     !pair.iran_to_foreign.reachable || !pair.foreign_to_iran.reachable)) return 'err';
   if (!server.has_secret && !server.key_installed) return 'err';
+  // Reachable but no topology read yet: attention needed, not an outage.
+  if (snap && snap.manager && snap.manager.installed && discoveryState(server) === 'failed') return 'warn';
   if (!snap) return 'unknown';
   if (!snap.manager || !snap.manager.installed) return 'warn';
   const peers = peerList(snap);
@@ -364,6 +365,21 @@ function connectivityHtml(server) {
   }).join('')}</div>`;
 }
 
+// "What did a discovery response tell me" lives in /discovery-response.js, shared
+// with the tests. The card and the drawer both go through it, which is what stops
+// them drifting apart — the drawer previously stored a failure envelope as if it
+// were a snapshot.
+const { read: readDiscoverResponseShared, apply: applyDiscoverResponse } = window.DiscoveryResponse;
+
+function readDiscoverResponse(data) {
+  return readDiscoverResponseShared(data);
+}
+
+// Apply a discovery result to one server object and keep state.servers in step.
+function applyDiscoverResult(server, data) {
+  return applyDiscoverResponse(server, data, state.servers);
+}
+
 // Topology comes ONLY from the authoritative snapshot — the last discovery that
 // genuinely succeeded. Probe availability is a separate axis and must never be
 // able to move a server between groups: a server whose SSH is temporarily
@@ -373,7 +389,8 @@ function connectivityHtml(server) {
 // topology comes only from the authoritative snapshot, availability only from the
 // latest probe, so a failed probe can never move a server between groups.
 const {
-  roleGroup, probeHealth, probeHealthLabel, probeReason, snapshotFreshness, PROBE_HEALTH_CLASS,
+  roleGroup, healthState, discoveryState, healthLabel, discoveryLabel, probeReason, needsDiscovery,
+  snapshotFreshness, PROBE_HEALTH_CLASS,
 } = window.ServerTopology;
 
 function renderServers() {
@@ -393,17 +410,22 @@ function renderServers() {
     const peerLine = peers
       ? `<div class="card-peers-title muted">${peers.length} ${snap.status.nodes ? 'iran node' : 'foreign peer'}${peers.length === 1 ? '' : 's'}</div>${peerNamesHtml(snap)}`
       : '';
-    // Probe availability is rendered on its own line, visually distinct from the
-    // topology badges, so a failed probe can never be mistaken for a role change.
-    const health = probeHealth(s);
+    // Transport health and discovery health are shown as two separate badges.
+    // Merging them is what produced "HEALTHY" on a server whose topology had
+    // never actually been read.
+    const health = healthState(s);
+    const disc = discoveryState(s);
     const freshness = snapshotFreshness(s);
-    const reason = probeReason(s);
+    const healthWhy = probeReason(s, 'health');
+    const discWhy = probeReason(s, 'discovery');
     const probeLine = `
       <div class="card-probe">
-        <span class="badge ${PROBE_HEALTH_CLASS[health]}" ${reason ? `title="${esc(reason)}"` : ''}>${esc(probeHealthLabel(s))}</span>
+        <span class="badge ${PROBE_HEALTH_CLASS[health]}" ${healthWhy ? `title="${esc(healthWhy)}"` : ''}>${esc(healthLabel(s))}</span>
+        <span class="badge ${PROBE_HEALTH_CLASS[disc === 'ok' ? 'healthy' : disc]}" ${discWhy ? `title="${esc(discWhy)}"` : ''}>${esc(discoveryLabel(s))}</span>
+        ${needsDiscovery(s) && health === 'healthy' ? '<span class="badge yellow" title="SSH works, but no successful discovery has read this server\'s roles yet.">NEEDS DISCOVERY</span>' : ''}
         <span class="muted">${esc(freshness.known ? `verified ${timeAgo(snap.taken_at)}` : 'never verified')}</span>
         ${freshness.stale && freshness.known ? '<span class="badge gray" title="The last successful discovery is old; the topology may no longer be current.">SNAPSHOT STALE</span>' : ''}
-        ${reason ? `<div class="muted card-probe-reason">${esc(reason)}</div>` : ''}
+        ${(discWhy || healthWhy) ? `<div class="muted card-probe-reason">${esc(discWhy || healthWhy)}</div>` : ''}
       </div>`;
     return `
       <div class="card" style="--i:${i}" data-id="${s.id}">
@@ -450,13 +472,9 @@ function renderServers() {
       btn.textContent = '…';
       try {
         const data = await api(`/api/servers/${server.id}/discover`, { method: 'POST' });
-        // Two response shapes: the new one carries an explicit verdict plus the
-        // authoritative snapshot; the old one was the snapshot itself.
-        const isVerdict = data && (data.probe || data.snapshot !== undefined || data.ok !== undefined);
-        if (isVerdict && data.ok === false) {
-          // The probe failed, so the topology was intentionally left untouched.
-          const why = (data.probe && (data.probe.reason || data.probe.error)) || data.error || 'probe failed';
-          toast(`Discovery failed for ${server.name}: ${why} — last verified topology kept`, true);
+        const result = applyDiscoverResult(server, data);
+        if (!result.ok) {
+          toast(`Discovery failed for ${server.name}: ${result.reason} — last verified topology kept`, true);
         } else {
           toast(`Discovery complete: ${server.name}`);
         }
@@ -730,21 +748,47 @@ function renderOverview() {
     </div>`;
 
   let body = '';
-  const drawerProbe = server.probe || null;
+  // NOTE: the local is `s`. Referencing an undefined `server` here threw
+  // ReferenceError before el.innerHTML was ever assigned, which blanked the whole
+  // Overview and left every handler below (including Run discovery) unbound.
+  const drawerProbe = s.probe || null;
+  const drawerHealth = drawerProbe && drawerProbe.health ? drawerProbe.health : null;
+  const drawerDiscovery = drawerProbe && drawerProbe.discovery ? drawerProbe.discovery : null;
   // A failed probe is reported as a banner above the last known good data, not
   // instead of it: hiding the topology because SSH is briefly down would lose the
-  // operator the information they opened the drawer for.
-  const probeBanner = drawerProbe && drawerProbe.ok === false
+  // operator the information they opened the drawer for. Transport health and
+  // discovery health are reported separately, because a healthy SSH session says
+  // nothing about whether the topology could be read.
+  const bannerLines = [];
+  if (drawerHealth && drawerHealth.ok === false) {
+    bannerLines.push(`SSH: ${esc(drawerHealth.reason || 'unreachable')}${drawerHealth.error ? ` — ${esc(drawerHealth.error)}` : ''}`);
+  }
+  if (drawerDiscovery && drawerDiscovery.ok === false) {
+    bannerLines.push(`Discovery: ${esc(drawerDiscovery.reason || 'failed')}${drawerDiscovery.error ? ` — ${esc(drawerDiscovery.error)}` : ''}`);
+  }
+  const probeBanner = bannerLines.length
     ? `<div class="section probe-banner">
-         <h3>Probe failed${drawerProbe.checked_at ? ` <span class="muted">${timeAgo(drawerProbe.checked_at)}</span>` : ''}</h3>
-         <div class="muted">${esc(drawerProbe.reason || 'Probe failed')}${drawerProbe.error ? ` — ${esc(drawerProbe.error)}` : ''}</div>
-         <div class="muted">The topology below is the last verified state and has not been changed by this failure.</div>
+         <h3>${drawerHealth && drawerHealth.ok === false ? 'SSH probe failed' : 'Discovery failed'}${
+           (drawerDiscovery && drawerDiscovery.checked_at) || (drawerHealth && drawerHealth.checked_at)
+             ? ` <span class="muted">${timeAgo((drawerDiscovery && drawerDiscovery.checked_at) || drawerHealth.checked_at)}</span>` : ''}</h3>
+         ${bannerLines.map((line) => `<div class="muted">${line}</div>`).join('')}
+         <div class="muted">${snap
+           ? 'The topology below is the last verified state and has not been changed by this failure.'
+           : 'This server has no verified topology yet. Run discovery when it is reachable.'}</div>
        </div>`
     : '';
-  if (!snap && drawerProbe && drawerProbe.ok === false) {
-    body = `${probeBanner}<div class="empty">This server has never been discovered successfully, so its role is unknown.</div>`;
+  const anyProbeFailed = !!((drawerHealth && drawerHealth.ok === false) || (drawerDiscovery && drawerDiscovery.ok === false));
+  if (!snap && anyProbeFailed) {
+    // Be explicit rather than showing a bare "UNKNOWN": the transport may be fine
+    // while the topology was never obtained, and those are different problems.
+    const transportOk = drawerHealth && drawerHealth.ok === true;
+    body = `${probeBanner}<div class="empty">TOPOLOGY UNKNOWN — ${transportOk
+      ? 'SSH is healthy but no successful discovery has read this server\'s roles yet. Run discovery.'
+      : 'this server has never been discovered successfully, so its role is unknown.'}</div>`;
   } else if (!snap) {
-    body = '<div class="empty">No discovery data yet. Run discovery to probe this server.</div>';
+    // No snapshot and no failure recorded: still say plainly that the topology is
+    // unknown rather than leaving the operator to infer it from an empty panel.
+    body = `${probeBanner}<div class="empty">TOPOLOGY UNKNOWN — this server has no discovery result yet. Run discovery to read its roles.</div>`;
   } else if (snap.error) {
     // Legacy snapshot written by a pre-fix release: a failed probe was stored as
     // state. Show it honestly and say the role is unknown.
@@ -811,11 +855,15 @@ function renderOverview() {
     const btn = $('#ov-discover');
     btn.disabled = true; btn.textContent = 'Discovering…';
     try {
-      const snap = await api(`/api/servers/${s.id}/discover`, { method: 'POST' });
-      s.snapshot = snap;
+      const data = await api(`/api/servers/${s.id}/discover`, { method: 'POST' });
+      // Shared with the card handler: a failure envelope must NEVER be stored as
+      // this server's snapshot, and the previous topology must survive.
+      const result = applyDiscoverResult(s, data);
       renderOverview();
       loadServers();
-      toast('Discovery complete');
+      toast(result.ok
+        ? 'Discovery complete'
+        : `Discovery failed: ${result.reason} — last verified topology kept`, !result.ok);
     } catch (err) {
       if (!handleHostKeyError(s, err)) toast(err.message, true);
       btn.disabled = false; btn.textContent = 'Run discovery';
@@ -1113,21 +1161,10 @@ function openActionForm(def) {
       const server = state.current;
       try {
         const data = await api(`/api/servers/${server.id}/discover`, { method: 'POST' });
-        // Two response shapes: the new one carries an explicit verdict plus the
-        // authoritative snapshot, the old one was the snapshot itself.
-        const isVerdict = data && (data.probe || data.snapshot !== undefined || data.ok !== undefined);
-        if (isVerdict && data.ok === false) {
-          throw new Error(data.probe && (data.probe.reason || data.probe.error) || data.error || 'Discovery failed');
-        }
-        const snapshot = isVerdict ? data.snapshot : data;
+        const result = applyDiscoverResult(server, data);
+        if (!result.ok) throw new Error(result.reason || 'Discovery failed');
+        const snapshot = server.snapshot;
         if (!snapshot) throw new Error('Discovery produced no snapshot');
-        server.snapshot = snapshot;
-        if (isVerdict && data.probe) server.probe = data.probe;
-        const listed = state.servers.find((item) => item.id === server.id);
-        if (listed) {
-          listed.snapshot = snapshot;
-          if (isVerdict && data.probe) listed.probe = data.probe;
-        }
         for (const field of resourceFields) {
           const select = $(`#action-form [name="${field.name}"]`);
           const hint = $(`#${def.id}-${field.name}-status`);

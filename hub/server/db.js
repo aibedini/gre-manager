@@ -153,11 +153,10 @@ function openDb(dataDir) {
     CREATE INDEX IF NOT EXISTS idx_routes_pair ON gre_routes(iran_server_id, foreign_server_id);
     CREATE INDEX IF NOT EXISTS idx_ports_status ON port_allocations(status);
     CREATE INDEX IF NOT EXISTS idx_route_events_route ON route_events(route_id, id);
-    -- Probe health is deliberately SEPARATE from the authoritative snapshot row.
-    -- A failed probe is an availability fact about the hub's ability to reach the
-    -- server; it says nothing about the server's topology. Keeping them apart is
-    -- what stops a transient SSH failure from erasing a valid role.
-    -- This table is additive: existing rows and the snapshot blob are untouched.
+    -- Transport health and discovery health are TWO SEPARATE facts and must not
+    -- share a row: a successful lightweight health probe ten seconds after a
+    -- failed full discovery used to erase the discovery failure, so the UI said
+    -- HEALTHY while topology was still unreadable.
     CREATE TABLE IF NOT EXISTS server_probe_state (
       server_id     INTEGER PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,
       ok            INTEGER NOT NULL,
@@ -220,6 +219,34 @@ function openDb(dataDir) {
   // reconstructed without re-detecting public IPs over SSH.
   ensureColumn(db, 'gre_routes', 'iran_endpoint', 'iran_endpoint TEXT');
   ensureColumn(db, 'route_events', 'attempt_no', 'attempt_no INTEGER NOT NULL DEFAULT 1');
+
+  // Split transport health from discovery health on the probe table. Additive:
+  // the legacy ok/checked_at/error_* columns are kept and are migrated into the
+  // `discovery_*` set once, so an existing row is not lost.
+  ensureColumn(db, 'server_probe_state', 'health_ok', 'health_ok INTEGER');
+  ensureColumn(db, 'server_probe_state', 'health_checked_at', 'health_checked_at INTEGER');
+  ensureColumn(db, 'server_probe_state', 'health_duration_ms', 'health_duration_ms INTEGER');
+  ensureColumn(db, 'server_probe_state', 'health_error_class', 'health_error_class TEXT');
+  ensureColumn(db, 'server_probe_state', 'health_error_message', 'health_error_message TEXT');
+  ensureColumn(db, 'server_probe_state', 'discovery_ok', 'discovery_ok INTEGER');
+  ensureColumn(db, 'server_probe_state', 'discovery_checked_at', 'discovery_checked_at INTEGER');
+  ensureColumn(db, 'server_probe_state', 'discovery_duration_ms', 'discovery_duration_ms INTEGER');
+  ensureColumn(db, 'server_probe_state', 'discovery_error_class', 'discovery_error_class TEXT');
+  ensureColumn(db, 'server_probe_state', 'discovery_error_message', 'discovery_error_message TEXT');
+  // One-time carry-over of a pre-split row. Guarded so it cannot overwrite a row
+  // that has already been migrated, and never destructive: the legacy columns
+  // stay in place.
+  try {
+    db.prepare(`
+      UPDATE server_probe_state
+         SET discovery_ok = ok,
+             discovery_checked_at = checked_at,
+             discovery_duration_ms = duration_ms,
+             discovery_error_class = error_class,
+             discovery_error_message = error_message
+       WHERE discovery_checked_at IS NULL AND checked_at IS NOT NULL
+    `).run();
+  } catch { /* pre-split table absent or already migrated */ }
 
   db.pragma(`user_version = ${SCHEMA_VERSION}`);
   return db;

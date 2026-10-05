@@ -4,6 +4,92 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.15.1] - 2026-10-05
+
+### Fixed
+
+- **The Server drawer rendered a blank Overview.** `renderOverview()` referenced an
+  undefined `server` identifier while its local is `s`, so the function threw
+  `ReferenceError: server is not defined` *before* assigning `el.innerHTML`. The
+  whole Overview disappeared and every handler below it — including **Run
+  discovery** — was never bound, because `innerHTML` was still empty when the
+  bindings ran. The line now reads `s.probe`, and the function audits clean.
+- **The drawer's Discover handler was incompatible with the v2.15 response
+  envelope.** It still did `s.snapshot = <response>`, so a *failure* envelope would
+  have been stored as the server's topology. Both the card and the drawer now go
+  through one shared implementation (`hub/public/discovery-response.js`): a failure
+  verdict never becomes a snapshot, a success adopts `data.snapshot`, and
+  `state.servers` is kept in step.
+- **`gre status --json` exit status was discarded**, so a status command that timed
+  out, crashed or printed nothing still left every marker in place and the outer
+  SSH session exiting 0 — and `classifyProbeResult()` then accepted it as a
+  successful discovery with `roles: []`. That is how a server could show
+  `v2.8.2` + healthy with no topology behind it. The probe now captures the status
+  subcommand's exit code and its stderr into their own markers (stdout and stderr
+  are captured into separate files first, so an interleaved stream cannot corrupt
+  the JSON), sanitises the stderr, and classifies the outcome exactly:
+  `status_rc=124` → `timeout`, non-zero → `remote` with the panel's own reason,
+  empty or unparseable output → `malformed`. **A manager that is installed but
+  whose state cannot be read is now an incomplete discovery that does not overwrite
+  the authoritative snapshot**, rather than an authoritative empty one.
+- **Transport health and discovery health shared one row**, so a lightweight health
+  ping ten seconds after a failed discovery erased the discovery failure and the UI
+  reported `HEALTHY` while topology was still unreadable. They are now separate
+  columns (`health_*` and `discovery_*`) with an additive, non-destructive
+  migration; a pre-split row is carried over into `discovery_*` once.
+- **Health and full discovery could open two SSH sessions to the same server**,
+  because the queue keyed full discovery on the server id and health on
+  `health:<id>`. Both now key on the server id, full discovery takes priority, and a
+  health probe for a server already being discovered is skipped rather than queued
+  behind it.
+
+### Added
+
+- **Version/schema-compatible role extraction.** `gre status --json` has changed
+  shape across the releases in production, so `extractRoles()` detects what is
+  present instead of switching on a version number:
+  `roles: [...]`, `role: "IRAN"|"both"|"dual"`, `mode: "iran"|"foreign"`,
+  `node_role`, `is_iran`/`is_foreign`, and topology evidence (`iran_peers[]`,
+  `nodes[]`, `foreign_ip`, `subnet_base`). The evidence used is recorded on the
+  snapshot as `role_evidence`.
+- `GET /api/servers` and `GET /api/servers/:id` now return the same shape:
+  `snapshot` (last known good) plus `probe: { health: {...}, discovery: {...} }`.
+  The drawer previously used a different shape than the card.
+- The health summary reports topology, transport health and discovery health as
+  three separate counts, so a header can no longer imply that reachable means
+  healthy means correctly configured.
+- `hub/public/discovery-response.js`, loaded before `app.js` and required directly
+  by the tests, so the card and the drawer cannot drift apart again.
+
+### Changed
+
+- Server cards show `SSH HEALTHY` / `SSH UNREACHABLE` and
+  `DISCOVERY OK` / `DISCOVERY FAILED` as two separate badges, plus
+  `NEEDS DISCOVERY` when the transport is fine but no successful discovery has read
+  the roles yet. The health dot now reflects reachability and marks
+  "reachable but topology unread" as attention-needed rather than an outage.
+- A server with no snapshot shows **TOPOLOGY UNKNOWN** with the reason, instead of a
+  bare `UNKNOWN`. `NO MANAGER` is only ever shown when a full discovery genuinely
+  completed and found `gre` absent.
+
+### Tests
+
+- New `scripts/overview-test.js` (20 assertions) which **executes the real
+  `renderOverview()`** against a minimal DOM shim and asserts that the toolbar,
+  the SSH section, the probe banner and the failure reason all render, and that the
+  panel is never left empty. It also covers the discovery response matrix, the
+  `gre status` outcomes, older status schemas, the health/discovery separation, the
+  single-SSH-operation guarantee, and role recovery after a successful
+  rediscovery. The execution check was verified in reverse: reintroducing the
+  original `server.probe` line makes this suite fail with exactly
+  `server is not defined`.
+- `scripts/discovery-semantics-test.js` grew to 22 assertions with the new
+  status-outcome cases.
+- An early attempt at a generic "undefined identifier" audit was **discarded**: it
+  flagged English prose inside rendered HTML ("probe this server.") and missed the
+  real bug because `server` legitimately appears as a parameter name elsewhere in
+  the file. Executing the function is the reliable check.
+
 ## [2.15.0] - 2026-10-03
 
 ### Fixed

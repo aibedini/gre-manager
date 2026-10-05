@@ -41,34 +41,51 @@ function makeStore() {
     db.prepare('INSERT INTO snapshots (server_id,json,taken_at) VALUES (?,?,?) ON CONFLICT(server_id) DO UPDATE SET json=excluded.json, taken_at=excluded.taken_at')
       .run(id, JSON.stringify(snapshot), Date.now());
   };
-  const saveProbe = (id, probe) => {
-    db.prepare(`INSERT INTO server_probe_state (server_id,ok,checked_at,duration_ms,error_class,error_message,kind)
-      VALUES (?,?,?,?,?,?,?) ON CONFLICT(server_id) DO UPDATE SET ok=excluded.ok, checked_at=excluded.checked_at,
-      duration_ms=excluded.duration_ms, error_class=excluded.error_class, error_message=excluded.error_message, kind=excluded.kind`)
-      .run(id, probe.ok ? 1 : 0, probe.checkedAt || Date.now(),
-        probe.durationMs || 0, probe.ok ? null : (probe.errorClass || 'transport'),
-        probe.ok ? null : (probe.detail || null), 'full');
+  // Transport health and discovery health are stored in SEPARATE columns, exactly
+  // as the hub does: a successful health ping must not clear a discovery failure.
+  const saveProbe = (id, probe, kind) => {
+    const ok = probe.ok ? 1 : 0;
+    const at = probe.checkedAt || Date.now();
+    const dur = probe.durationMs || 0;
+    const cls = probe.ok ? null : (probe.errorClass || 'transport');
+    const msg = probe.ok ? null : (probe.detail || null);
+    db.prepare('INSERT INTO server_probe_state (server_id,ok,checked_at,duration_ms,error_class,error_message,kind) VALUES (?,?,?,?,?,?,?) ON CONFLICT(server_id) DO NOTHING')
+      .run(id, ok, at, dur, cls, msg, kind);
+    if (kind === 'health') {
+      db.prepare('UPDATE server_probe_state SET health_ok=?,health_checked_at=?,health_duration_ms=?,health_error_class=?,health_error_message=? WHERE server_id=?')
+        .run(ok, at, dur, cls, msg, id);
+    } else {
+      db.prepare('UPDATE server_probe_state SET discovery_ok=?,discovery_checked_at=?,discovery_duration_ms=?,discovery_error_class=?,discovery_error_message=? WHERE server_id=?')
+        .run(ok, at, dur, cls, msg, id);
+    }
   };
+  const axis = (ok, at, dur, cls, msg) => (at === null || at === undefined
+    ? { ok: null, checked_at: null, error: null, reason: null, error_class: null, stale_for_ms: null }
+    : {
+      ok: !!ok,
+      checked_at: Number(at),
+      duration_ms: dur === null || dur === undefined ? null : Number(dur),
+      error: ok ? null : (msg || null),
+      error_class: ok ? null : (cls || 'transport'),
+      reason: ok ? null : discovery.errorReason(cls),
+      stale_for_ms: Math.max(0, Date.now() - Number(at)),
+    });
   const getProbe = (id) => {
     const row = db.prepare('SELECT * FROM server_probe_state WHERE server_id=?').get(id);
-    if (!row) return { ok: null, checked_at: null, error: null, reason: null, stale_for_ms: null };
+    if (!row) return { health: axis(null), discovery: axis(null) };
     return {
-      ok: !!row.ok,
-      checked_at: row.checked_at,
-      error: row.error_message,
-      error_class: row.error_class,
-      reason: row.ok ? null : discovery.errorReason(row.error_class),
-      stale_for_ms: Math.max(0, Date.now() - Number(row.checked_at || 0)),
+      health: axis(row.health_ok, row.health_checked_at, row.health_duration_ms, row.health_error_class, row.health_error_message),
+      discovery: axis(row.discovery_ok, row.discovery_checked_at, row.discovery_duration_ms, row.discovery_error_class, row.discovery_error_message),
     };
   };
   // Exactly the route's rule: only a successful discovery writes the snapshot.
   const applyOutcome = (id, outcome) => {
     if (outcome.ok) {
       saveSnapshot(id, outcome.snapshot);
-      saveProbe(id, outcome);
+      saveProbe(id, outcome, 'full');
       return { ok: true };
     }
-    saveProbe(id, outcome);
+    saveProbe(id, outcome, 'full');
     return { ok: false, errorClass: outcome.errorClass };
   };
   return {
@@ -105,7 +122,7 @@ async function main() {
       store.applyOutcome(id, goodOutcome(['FOREIGN']));
       assert.deepEqual(store.getSnapshot(id).roles, ['FOREIGN']);
       assert.equal(topology.roleGroup(store.serverView(id, 'Hetz2')), 'foreign');
-      assert.equal(store.getProbe(id).ok, true);
+      assert.equal(store.getProbe(id).discovery.ok, true);
     } finally { store.cleanup(); }
   });
 
@@ -119,8 +136,8 @@ async function main() {
       const view = store.serverView(id, 'Hetz2');
       assert.deepEqual(view.snapshot.roles, ['FOREIGN'], 'the authoritative roles must be untouched');
       assert.equal(topology.roleGroup(view), 'foreign', 'the server must not move to UNCONFIGURED');
-      assert.equal(view.probe.ok, false);
-      assert.equal(view.probe.reason, 'SSH timeout');
+      assert.equal(view.probe.discovery.ok, false);
+      assert.equal(view.probe.discovery.reason, 'SSH timeout');
       assert(!view.snapshot.error, 'a failure must not be written into the snapshot');
     } finally { store.cleanup(); }
   });
@@ -136,7 +153,7 @@ async function main() {
       assert.equal(view.snapshot.manager.installed, false);
       assert.deepEqual(view.snapshot.roles, []);
       assert.equal(topology.roleGroup(view), 'unconfigured', 'a confirmed absence may reclassify');
-      assert.equal(view.probe.ok, true, 'and the probe itself succeeded');
+      assert.equal(view.probe.discovery.ok, true, 'and the discovery itself succeeded');
     } finally { store.cleanup(); }
   });
 
@@ -150,8 +167,8 @@ async function main() {
       const view = store.serverView(id, 'Hetz2');
       assert.deepEqual(view.snapshot.roles, ['IRAN']);
       assert.equal(topology.roleGroup(view), 'iran');
-      assert.equal(view.probe.ok, false);
-      assert.equal(view.probe.error_class, 'hostkey');
+      assert.equal(view.probe.discovery.ok, false);
+      assert.equal(view.probe.discovery.error_class, 'hostkey');
       assert(!discovery.isRetryable('hostkey'), 'a mismatch must not be retried into acceptance');
     } finally { store.cleanup(); }
   });
@@ -194,22 +211,61 @@ async function main() {
   });
 
   console.log('\nTEST 7 — failed probe plus a good snapshot keeps the group:');
-  check('roleGroup stays FOREIGN while probeHealth says failed', () => {
+  check('roleGroup stays FOREIGN while the transport probe says failed', () => {
     const server = {
       snapshot: { roles: ['FOREIGN'], taken_at: new Date().toISOString(), manager: { installed: true } },
-      probe: { ok: false, reason: 'SSH timeout', checked_at: Date.now() },
+      probe: {
+        health: { ok: false, reason: 'SSH timeout', checked_at: Date.now() },
+        discovery: { ok: false, reason: 'SSH timeout', checked_at: Date.now() },
+      },
     };
     assert.equal(topology.roleGroup(server), 'foreign');
-    assert.equal(topology.probeHealth(server), 'failed');
-    assert.equal(topology.probeHealthLabel(server), 'PROBE FAILED');
-    assert.equal(topology.probeReason(server), 'SSH timeout');
+    assert.equal(topology.healthState(server), 'failed');
+    assert.equal(topology.discoveryState(server), 'failed');
+    assert.equal(topology.healthLabel(server), 'SSH UNREACHABLE');
+    assert.equal(topology.discoveryLabel(server), 'DISCOVERY FAILED');
+    assert.equal(topology.probeReason(server, 'health'), 'SSH timeout');
+  });
+
+  check('a healthy SSH session with a failed discovery reports BOTH, separately', () => {
+    const server = {
+      snapshot: { roles: ['FOREIGN'], taken_at: new Date().toISOString(), manager: { installed: true, version: '2.8.2' } },
+      probe: {
+        health: { ok: true, checked_at: Date.now() },
+        discovery: { ok: false, reason: 'gre status timed out', checked_at: Date.now() },
+      },
+    };
+    assert.equal(topology.roleGroup(server), 'foreign', 'a discovery failure must not move the server');
+    assert.equal(topology.healthState(server), 'healthy');
+    assert.equal(topology.discoveryState(server), 'failed');
+    assert.equal(topology.healthLabel(server), 'SSH HEALTHY');
+    assert.equal(topology.discoveryLabel(server), 'DISCOVERY FAILED');
+    assert.equal(topology.probeReason(server, 'discovery'), 'gre status timed out');
   });
 
   console.log('\nTEST 8 — no good snapshot plus a failed probe is UNCONFIGURED:');
   check('a server never successfully discovered is unconfigured, not mislabelled', () => {
-    const server = { snapshot: null, probe: { ok: false, reason: 'SSH timeout' } };
+    const server = {
+      snapshot: null,
+      probe: {
+        health: { ok: false, reason: 'SSH timeout' },
+        discovery: { ok: false, reason: 'SSH timeout' },
+      },
+    };
     assert.equal(topology.roleGroup(server), 'unconfigured');
-    assert.equal(topology.probeHealth(server), 'failed');
+    assert.equal(topology.healthState(server), 'failed');
+    assert.equal(topology.needsDiscovery(server), true);
+  });
+
+  check('reachable but never discovered is TOPOLOGY UNKNOWN, not a bare UNKNOWN', () => {
+    const server = {
+      snapshot: null,
+      probe: { health: { ok: true }, discovery: { ok: null } },
+    };
+    assert.equal(topology.roleGroup(server), 'unconfigured');
+    assert.equal(topology.healthState(server), 'healthy');
+    assert.equal(topology.discoveryState(server), 'unknown');
+    assert.equal(topology.needsDiscovery(server), true, 'the UI must say a discovery is still needed');
   });
 
   console.log('\nTEST 9 — probe errors are redacted before storage:');
@@ -263,16 +319,21 @@ async function main() {
       const views = servers.map((s) => store.serverView(s.id, s.name));
       const groups = views.map((v) => topology.roleGroup(v));
       const counts = groups.reduce((acc, g) => { acc[g] = (acc[g] || 0) + 1; return acc; }, {});
-      const probeFailed = views.filter((v) => topology.probeHealth(v) === 'failed').length;
+      const discoveryFailed = views.filter((v) => topology.discoveryState(v) === 'failed').length;
+      const healthFailed = views.filter((v) => topology.healthState(v) === 'failed').length;
 
       assert.equal(counts.iran, 6, `IRAN must stay 6, got ${JSON.stringify(counts)}`);
       assert.equal(counts.foreign, 21, `FOREIGN must stay 21, got ${JSON.stringify(counts)}`);
       assert.equal(counts.unconfigured || 0, 0,
         `NO server may fall to UNCONFIGURED from a transient failure, got ${JSON.stringify(counts)}`);
-      assert.equal(probeFailed, 17, `probe health must report 17 failures, got ${probeFailed}`);
+      assert.equal(discoveryFailed, 17, `discovery health must report 17 failures, got ${discoveryFailed}`);
+      // The simulation never ran a health probe, so transport health is untouched
+      // by discovery failures. That separation is the whole point.
+      assert.equal(healthFailed, 0, `a discovery failure must not be reported as a transport failure, got ${healthFailed}`);
 
-      console.log(`    grouping: ${JSON.stringify(counts)}`);
-      console.log(`    probe:    ${probeFailed} failed / ${views.length - probeFailed} healthy`);
+      console.log(`    grouping:  ${JSON.stringify(counts)}`);
+      console.log(`    discovery: ${discoveryFailed} failed / ${views.length - discoveryFailed} ok`);
+      console.log(`    transport: ${healthFailed} failed (untouched by discovery failures)`);
     } finally { store.cleanup(); }
   });
 

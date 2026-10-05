@@ -52,25 +52,61 @@
     return ({ iran: 'IRAN', foreign: 'FOREIGN', dual: 'DUAL ROLE', unconfigured: 'UNCONFIGURED' })[key] || 'UNCONFIGURED';
   }
 
-  // Availability, independent of the group above.
-  function probeHealth(server) {
+  // Availability has TWO independent axes, and the UI must not merge them:
+  //   health    — can the hub reach this server over SSH at all
+  //   discovery — did the last full discovery manage to read its topology
+  // A healthy SSH session with a failed discovery is the exact case that used to
+  // display as "HEALTHY" while nothing was actually known about the server.
+  function probeAxis(server, axis) {
     var probe = server && server.probe;
-    if (!probe || probe.ok === null || probe.ok === undefined) return 'unknown';
-    return probe.ok ? 'healthy' : 'failed';
+    if (!probe) return null;
+    // Tolerate the pre-v2.15.1 flat shape so an older hub response still renders.
+    if (probe[axis]) return probe[axis];
+    if (axis === 'discovery' && probe.ok !== undefined) return probe;
+    return null;
   }
 
-  function probeHealthLabel(server) {
-    var health = probeHealth(server);
-    if (health === 'healthy') return 'HEALTHY';
-    if (health === 'failed') return 'PROBE FAILED';
-    return 'PROBE UNKNOWN';
+  function healthState(server) {
+    var axis = probeAxis(server, 'health');
+    if (!axis || axis.ok === null || axis.ok === undefined) return 'unknown';
+    return axis.ok ? 'healthy' : 'failed';
   }
 
-  // Sanitised human reason, supplied by the hub (it never carries secrets).
-  function probeReason(server) {
-    var probe = server && server.probe;
-    if (!probe || probe.ok !== false) return '';
-    return probe.reason || 'Probe failed';
+  function discoveryState(server) {
+    var axis = probeAxis(server, 'discovery');
+    if (!axis || axis.ok === null || axis.ok === undefined) return 'unknown';
+    return axis.ok ? 'ok' : 'failed';
+  }
+
+  function healthLabel(server) {
+    var state = healthState(server);
+    if (state === 'healthy') return 'SSH HEALTHY';
+    if (state === 'failed') return 'SSH UNREACHABLE';
+    return 'SSH UNKNOWN';
+  }
+
+  function discoveryLabel(server) {
+    var state = discoveryState(server);
+    if (state === 'ok') return 'DISCOVERY OK';
+    if (state === 'failed') return 'DISCOVERY FAILED';
+    return 'DISCOVERY UNKNOWN';
+  }
+
+  function probeReason(server, axis) {
+    var which = axis || (discoveryState(server) === 'failed' ? 'discovery' : 'health');
+    var found = probeAxis(server, which);
+    if (!found || found.ok !== false) return '';
+    return found.reason || found.error || 'Probe failed';
+  }
+
+  // Does this server still need a successful discovery before it can be grouped?
+  // True when nothing authoritative has been read AND the transport is reachable,
+  // which is exactly the "SSH fine, topology unknown" state.
+  function needsDiscovery(server) {
+    var snap = server && server.snapshot;
+    if (snap && Array.isArray(snap.roles) && snap.roles.length) return false;
+    if (!snap) return true;
+    return false;
   }
 
   // Freshness of the authoritative snapshot, which is a third axis: a topology can
@@ -91,9 +127,12 @@
     rolesOf: rolesOf,
     roleGroup: roleGroup,
     groupLabel: groupLabel,
-    probeHealth: probeHealth,
-    probeHealthLabel: probeHealthLabel,
+    healthState: healthState,
+    discoveryState: discoveryState,
+    healthLabel: healthLabel,
+    discoveryLabel: discoveryLabel,
     probeReason: probeReason,
+    needsDiscovery: needsDiscovery,
     snapshotFreshness: snapshotFreshness,
   };
 }));

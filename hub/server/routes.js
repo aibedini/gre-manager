@@ -145,53 +145,72 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
   };
 
   // --- probe health -----------------------------------------------------
-  // Availability lives beside the topology, never inside it.
-  const saveProbeState = (id, probe, kind = 'full') => {
+  // Availability lives beside the topology, never inside it — and transport
+  // health and discovery health are written to SEPARATE COLUMNS, because a
+  // successful health ping must never clear a discovery failure.
+  const writeProbeColumn = (id, kind, probe) => {
+    const ok = probe.ok ? 1 : 0;
+    const checkedAt = probe.checkedAt || Date.now();
+    const duration = Number.isFinite(probe.durationMs) ? probe.durationMs : null;
+    const errorClass = probe.ok ? null : (probe.errorClass || 'transport');
+    const errorMessage = probe.ok ? null : (probe.detail || probe.reason || null);
+
     db.prepare(`
       INSERT INTO server_probe_state (server_id, ok, checked_at, duration_ms, error_class, error_message, kind)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(server_id) DO UPDATE SET
-        ok = excluded.ok, checked_at = excluded.checked_at, duration_ms = excluded.duration_ms,
-        error_class = excluded.error_class, error_message = excluded.error_message, kind = excluded.kind
-    `).run(
-      id,
-      probe.ok ? 1 : 0,
-      probe.checkedAt || Date.now(),
-      Number.isFinite(probe.durationMs) ? probe.durationMs : null,
-      probe.ok ? null : (probe.errorClass || 'transport'),
-      probe.ok ? null : (probe.detail || probe.reason || null),
-      kind,
-    );
+      ON CONFLICT(server_id) DO NOTHING
+    `).run(id, ok, checkedAt, duration, errorClass, errorMessage, kind);
+
+    if (kind === 'health') {
+      db.prepare(`UPDATE server_probe_state
+        SET health_ok=?, health_checked_at=?, health_duration_ms=?, health_error_class=?, health_error_message=?, kind=?
+        WHERE server_id=?`)
+        .run(ok, checkedAt, duration, errorClass, errorMessage, kind, id);
+    } else {
+      db.prepare(`UPDATE server_probe_state
+        SET discovery_ok=?, discovery_checked_at=?, discovery_duration_ms=?, discovery_error_class=?, discovery_error_message=?
+        WHERE server_id=?`)
+        .run(ok, checkedAt, duration, errorClass, errorMessage, id);
+      // Mirror into the legacy columns so anything still reading them keeps
+      // working; they now describe the discovery probe, which they always meant.
+      db.prepare('UPDATE server_probe_state SET ok=?, checked_at=?, duration_ms=?, error_class=?, error_message=? WHERE server_id=?')
+        .run(ok, checkedAt, duration, errorClass, errorMessage, id);
+    }
+  };
+
+  const saveProbeState = (id, probe, kind = 'full') => writeProbeColumn(id, kind === 'health' ? 'health' : 'full', probe);
+
+  const emptyProbe = () => ({ ok: null, checked_at: null, reason: null, error: null, error_class: null, stale_for_ms: null });
+
+  const probeView = (ok, checkedAt, durationMs, errorClass, errorMessage) => {
+    if (checkedAt === null || checkedAt === undefined) return emptyProbe();
+    return {
+      ok: !!ok,
+      checked_at: Number(checkedAt),
+      duration_ms: durationMs === null || durationMs === undefined ? null : Number(durationMs),
+      error_class: ok ? null : (errorClass || 'transport'),
+      error: ok ? null : (errorMessage || null),
+      reason: ok ? null : discovery.errorReason(errorClass),
+      stale_for_ms: Math.max(0, Date.now() - Number(checkedAt)),
+    };
   };
 
   const getProbeState = (id) => {
     const row = db.prepare('SELECT * FROM server_probe_state WHERE server_id = ?').get(id);
-    if (!row) return null;
+    if (!row) return { health: emptyProbe(), discovery: emptyProbe() };
     return {
-      ok: !!row.ok,
-      checked_at: row.checked_at,
-      duration_ms: row.duration_ms,
-      error_class: row.error_class,
-      error: row.error_message,
-      reason: row.ok ? null : discovery.errorReason(row.error_class),
-      kind: row.kind,
-      stale_for_ms: Math.max(0, Date.now() - Number(row.checked_at || 0)),
+      health: probeView(row.health_ok, row.health_checked_at, row.health_duration_ms,
+        row.health_error_class, row.health_error_message),
+      discovery: probeView(row.discovery_ok, row.discovery_checked_at, row.discovery_duration_ms,
+        row.discovery_error_class, row.discovery_error_message),
     };
   };
 
-  // The probe projection sent to the client: no secrets, ever.
+  // The projection sent to the client: transport health and discovery health as
+  // two independent facts, never merged, never carrying secrets.
   const publicProbe = (id) => {
-    const probe = getProbeState(id);
-    if (!probe) return { ok: null, checked_at: null, error: null, reason: null, stale_for_ms: null };
-    return {
-      ok: probe.ok,
-      checked_at: probe.checked_at,
-      reason: probe.reason,
-      error: probe.error,
-      error_class: probe.error_class,
-      stale_for_ms: probe.stale_for_ms,
-      kind: probe.kind,
-    };
+    const { health, discovery: disc } = getProbeState(id);
+    return { health, discovery: disc };
   };
 
   // --- discovery orchestration -----------------------------------------
@@ -199,37 +218,47 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
   // session per server at once.
   const discoveryQueue = new DiscoveryQueue();
 
-  // The ONLY place the authoritative snapshot is written. It is reached only when
-  // a discovery genuinely succeeded, which is what makes "a transient probe
-  // failure can never change a server's topology" a structural guarantee rather
-  // than a convention: a failure path below has no way to call saveSnapshot.
+  // ONE SSH operation per server, whatever kind it is.
+  //
+  // The queue's key used to differ between the two probes (the server id for a
+  // full discovery, `health:<id>` for a health check), so the same server could
+  // have two SSH sessions open at once. Keying both on the server id makes that
+  // impossible; a full discovery additionally takes priority, and a health probe
+  // for a server that is already being discovered is dropped rather than queued
+  // behind it, because the discovery supersedes it.
+  const isBusy = (id) => discoveryQueue.has(id);
+
   const runFullDiscovery = (row) => discoveryQueue.run(row.id, async () => {
     const outcome = await discovery.discoverOutcome(row, getSecret(row), sshOptsFor(row));
     if (outcome.errorClass === 'hostkey') {
-      saveProbeState(row.id, outcome);
+      saveProbeState(row.id, outcome, 'full');
       return { ok: false, hostkey_mismatch: true, presented_fp: outcome.presented_fp, probe: publicProbe(row.id) };
     }
     if (outcome.ok) {
       saveSnapshot(row.id, outcome.snapshot);
-      saveProbeState(row.id, outcome);
+      saveProbeState(row.id, outcome, 'full');
       return { ok: true, snapshot: outcome.snapshot, probe: publicProbe(row.id) };
     }
     // FAILURE: the authoritative snapshot is deliberately left alone.
-    saveProbeState(row.id, outcome);
-    return { ok: false, probe: publicProbe(row.id), error: outcome.detail, error_class: outcome.errorClass };
+    saveProbeState(row.id, outcome, 'full');
+    return { ok: false, probe: publicProbe(row.id), error: outcome.detail, error_class: outcome.errorClass, incomplete: !!outcome.incomplete };
   });
 
   // Lightweight: proves reachability without collecting topology, so it can run
   // on a short cadence for every server.
-  const runHealthProbe = (row) => discoveryQueue.run(`health:${row.id}`, async () => {
-    const probe = await discovery.probeHealth(row, getSecret(row), sshOptsFor(row));
-    if (probe.errorClass === 'hostkey') {
+  const runHealthProbe = (row) => {
+    // A full discovery in flight already proves reachability and more.
+    if (isBusy(row.id)) return Promise.resolve({ ok: true, skipped: true, probe: publicProbe(row.id) });
+    return discoveryQueue.run(row.id, async () => {
+      const probe = await discovery.probeHealth(row, getSecret(row), sshOptsFor(row));
+      if (probe.errorClass === 'hostkey') {
+        saveProbeState(row.id, probe, 'health');
+        return { ok: false, hostkey_mismatch: true, presented_fp: probe.presented_fp, probe: publicProbe(row.id) };
+      }
       saveProbeState(row.id, probe, 'health');
-      return { ok: false, hostkey_mismatch: true, presented_fp: probe.presented_fp, probe: publicProbe(row.id) };
-    }
-    saveProbeState(row.id, probe, 'health');
-    return { ok: probe.ok, probe: publicProbe(row.id) };
-  });
+      return { ok: probe.ok, probe: publicProbe(row.id) };
+    });
+  };
 
   const publicServer = (row) => {
     const { secret_enc, password_enc, ...rest } = row;
@@ -421,12 +450,14 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     })));
   });
 
-  // Topology and probe health are counted separately on purpose: a probe failure
-  // is not a change of role, and the header must not conflate them.
+  // Topology, transport health and discovery health are counted as three
+  // separate things. Conflating any two of them is what produced a header that
+  // said "healthy" while discovery was broken.
   authed.get('/servers/health-summary', (req, res) => {
     const rows = db.prepare('SELECT id FROM servers ORDER BY id').all();
     const authoritative = { iran: 0, foreign: 0, dual: 0, unconfigured: 0 };
     const probe = { healthy: 0, failed: 0, unknown: 0 };
+    const discovery = { ok: 0, failed: 0, unknown: 0 };
     let stale = 0;
     const STALE_MS = 24 * 60 * 60 * 1000;
     for (const row of rows) {
@@ -439,17 +470,23 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
       else authoritative.unconfigured += 1;
 
       const state = getProbeState(row.id);
-      if (!state) probe.unknown += 1;
-      else if (state.ok) probe.healthy += 1;
+      if (state.health.ok === null) probe.unknown += 1;
+      else if (state.health.ok) probe.healthy += 1;
       else probe.failed += 1;
-      if (state && state.stale_for_ms > STALE_MS) stale += 1;
+
+      if (state.discovery.ok === null) discovery.unknown += 1;
+      else if (state.discovery.ok) discovery.ok += 1;
+      else discovery.failed += 1;
+
+      if (state.discovery.checked_at && state.discovery.stale_for_ms > STALE_MS) stale += 1;
     }
     res.json({
       total: rows.length,
       authoritative,
       probe,
+      discovery,
       stale_snapshots: stale,
-      discovery: discoveryQueue.snapshot(),
+      discovery_queue: discoveryQueue.snapshot(),
       concurrency: discoveryQueue.concurrency,
     });
   });
@@ -487,10 +524,17 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     })();
   });
 
+  // Same shape as the list endpoint, deliberately: the drawer must not have to
+  // interpret a different API response than the card does.
   authed.get('/servers/:id', (req, res) => {
     const server = getServer(req.params.id);
     if (!server) return res.status(404).json({ error: 'not found' });
-    res.json({ ...publicServer(server), snapshot: getSnapshot(server.id), connectivity: connectivityFor(server.id) });
+    res.json({
+      ...publicServer(server),
+      snapshot: getSnapshot(server.id),
+      probe: publicProbe(server.id),
+      connectivity: connectivityFor(server.id),
+    });
   });
 
   authed.put('/servers/:id', (req, res) => {
@@ -580,7 +624,7 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     const result = await runFullDiscovery(server);
     if (result.hostkey_mismatch) return hostKeyMismatchResponse(res, server, result.presented_fp);
     auditEvent(server.id, server.name, 'discover', null, result.ok ? 0 : 1,
-      result.ok ? 'authoritative snapshot updated' : `probe failed (${result.probe.error_class})`);
+      result.ok ? 'authoritative snapshot updated' : `probe failed (${(result.probe.discovery && result.probe.discovery.error_class) || 'unknown'})`);
     // Still a usable 200 for the frontend: the payload distinguishes success from
     // failure via `ok`/`probe`, and a failure never touched the snapshot.
     if (result.ok) return res.json({ ...result.snapshot, ok: true, snapshot: result.snapshot, probe: result.probe });

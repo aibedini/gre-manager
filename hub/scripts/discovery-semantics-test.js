@@ -13,14 +13,19 @@ const {
 const discovery = require('../server/discovery');
 
 // Build a marker-delimited probe body the way the real script prints it.
-function probeBody({ installed = 1, version = 'gre-manager v2.8.2', roles = null, statusRaw = null } = {}) {
+function probeBody({ installed = 1, version = 'gre-manager v2.8.2', roles = null, statusRaw = null, statusRc = 0, statusErr = '' } = {}) {
   const lines = ['@@BEGIN gre@@', `installed=${installed}`];
   if (installed) {
     lines.push(version);
+    // The real probe always reports the status subcommand's exit code.
+    lines.push(`status_rc=${statusRc}`);
     lines.push('@@BEGIN status_json@@');
     if (statusRaw !== null) lines.push(statusRaw);
     else if (roles) lines.push(JSON.stringify({ roles, tunnels_up: roles.length ? 1 : 0 }));
     lines.push('@@END status_json@@');
+    lines.push('@@BEGIN status_stderr@@');
+    if (statusErr) lines.push(statusErr);
+    lines.push('@@END status_stderr@@');
   }
   lines.push('@@END gre@@');
   lines.push('@@BEGIN tunnels@@', '@@END tunnels@@');
@@ -78,10 +83,75 @@ check('a FOREIGN server yields roles=["FOREIGN"]', () => {
   assert.equal(verdict.snapshot.manager.version, '2.8.2');
 });
 
-check('a status_json parse error is still a successful probe', () => {
+check('gre installed but status output unusable is a FAILURE, not an empty topology', () => {
+  // v2.15.0 and earlier treated this as success, which is how a card could read
+  // "UNKNOWN / v2.8.2 / HEALTHY" with no topology behind it.
   const verdict = discovery.classifyProbeResult({ rc: 0, stdout: probeBody({ statusRaw: '{not json' }), stderr: '' });
-  assert.equal(verdict.ok, true, 'a malformed status body means the manager is present but unhappy, not unreachable');
-  assert.equal(verdict.snapshot.status.parse_error, true);
+  assert.equal(verdict.ok, false, 'malformed status JSON must not produce an authoritative snapshot');
+  assert.equal(verdict.errorClass, 'malformed');
+  assert.equal(verdict.incomplete, true, 'the caller must be able to tell it was incomplete');
+});
+
+check('gre installed but status produced no output is a FAILURE', () => {
+  const verdict = discovery.classifyProbeResult({ rc: 0, stdout: probeBody({ statusRaw: '' }), stderr: '' });
+  assert.equal(verdict.ok, false, 'empty status JSON must not produce an authoritative snapshot');
+  assert.equal(verdict.errorClass, 'malformed');
+});
+
+check('gre status timing out is a FAILURE even though the SSH session succeeded', () => {
+  const stdout = probeBody({ statusRaw: '{partial', statusRc: 124, statusErr: '' });
+  const verdict = discovery.classifyProbeResult({ rc: 0, stdout, stderr: '' });
+  assert.equal(verdict.ok, false);
+  assert.equal(verdict.errorClass, 'timeout');
+  assert(/timed out/i.test(verdict.detail), `detail should name the timeout: ${verdict.detail}`);
+});
+
+check('gre status exiting non-zero is a FAILURE with the remote reason', () => {
+  const stdout = probeBody({ statusRaw: '', statusRc: 2, statusErr: 'unknown argument: status' });
+  const verdict = discovery.classifyProbeResult({ rc: 0, stdout, stderr: '' });
+  assert.equal(verdict.ok, false);
+  assert.equal(verdict.errorClass, 'remote');
+  assert(/unknown argument/.test(verdict.detail), `detail should carry the panel reason: ${verdict.detail}`);
+});
+
+check('a successful gre status IS authoritative, including older schemas', () => {
+  const modern = discovery.classifyProbeResult({ rc: 0, stdout: probeBody({ roles: ['FOREIGN'], statusRc: 0 }), stderr: '' });
+  assert.equal(modern.ok, true);
+  assert.deepEqual(modern.snapshot.roles, ['FOREIGN']);
+
+  // Older builds describe the role differently; the extractor must cope.
+  const legacyMode = discovery.classifyProbeResult({
+    rc: 0, stdout: probeBody({ statusRaw: JSON.stringify({ mode: 'foreign', tunnels_up: 1 }), statusRc: 0 }), stderr: '',
+  });
+  assert.equal(legacyMode.ok, true, 'a legacy "mode" schema is a valid discovery');
+  assert.deepEqual(legacyMode.snapshot.roles, ['FOREIGN']);
+
+  const singular = discovery.classifyProbeResult({
+    rc: 0, stdout: probeBody({ statusRaw: JSON.stringify({ role: 'IRAN' }), statusRc: 0 }), stderr: '',
+  });
+  assert.deepEqual(singular.snapshot.roles, ['IRAN']);
+
+  const both = discovery.classifyProbeResult({
+    rc: 0, stdout: probeBody({ statusRaw: JSON.stringify({ role: 'both' }), statusRc: 0 }), stderr: '',
+  });
+  assert.deepEqual(both.snapshot.roles.sort(), ['FOREIGN', 'IRAN']);
+
+  // No explicit role at all, but topology evidence is present.
+  const evidence = discovery.classifyProbeResult({
+    rc: 0, stdout: probeBody({ statusRaw: JSON.stringify({ iran_peers: [{ name: 'x' }] }), statusRc: 0 }), stderr: '',
+  });
+  assert.deepEqual(evidence.snapshot.roles, ['IRAN'], 'iran_peers is evidence of the IRAN role');
+  assert(evidence.snapshot.role_evidence.length, 'the evidence used must be recorded');
+});
+
+check('a status stderr is sanitised before it reaches the snapshot', () => {
+  const verdict = discovery.classifyProbeResult({
+    rc: 0,
+    stdout: probeBody({ statusRaw: '', statusRc: 1, statusErr: 'auth failed for user:sup3rsecret@host' }),
+    stderr: '',
+  });
+  assert.equal(verdict.ok, false);
+  assert(!String(verdict.detail).includes('sup3rsecret'), `leaked: ${verdict.detail}`);
 });
 
 console.log('\nsecret sanitisation:');
