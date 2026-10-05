@@ -19,7 +19,7 @@
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 
 const { assert, makeHarness, check, checkAsync, report } = require('./_harness');
 const provision = require('../server/provision');
@@ -276,6 +276,47 @@ async function main() {
     const cmd = provision.removeCommand(9);
     assert(/grep -vF 'gre-hub-9'/.test(cmd), 'removal is scoped to our own comment');
     assert(!cmd.includes('sshd_config') && !cmd.includes('passwd'), 'no policy file touched');
+  });
+
+  // The assertions above check the command's TEXT. This one runs it, in a real
+  // shell, against a real authorized_keys file — because "existing keys are
+  // preserved" is a statement about behaviour, not about phrasing.
+  check('the real install and removal commands preserve every other key', () => {
+    const bash = process.env.GRE_BASH || 'C:\\Program Files\\Git\\bin\\bash.exe';
+    if (!fs.existsSync(bash)) {
+      // Do not silently pass: say the check could not run.
+      console.log(`    SKIP  bash not found at ${bash} (set GRE_BASH)`);
+      return;
+    }
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gre-ak-'));
+    const sshDir = path.join(home, '.ssh');
+    fs.mkdirSync(sshDir, { recursive: true });
+    const keys = path.join(sshDir, 'authorized_keys');
+    fs.writeFileSync(keys, [
+      'ssh-ed25519 AAAAOPERATORKEY operator@laptop',
+      'ssh-rsa AAAAVENDORKEY vendor@backup',
+      'ssh-ed25519 AAAASTALEKEY gre-hub-1',
+      '',
+    ].join('\n'));
+    const env = { ...process.env, HOME: home.replace(/\\/g, '/') };
+    try {
+      execFileSync(bash, ['-c', provision.installCommand('ssh-ed25519 AAAANEWHUBKEY gre-hub-1', 1)], { env });
+      const after = fs.readFileSync(keys, 'utf8');
+      assert(after.includes('operator@laptop'), `operator key lost: ${after}`);
+      assert(after.includes('vendor@backup'), `vendor key lost: ${after}`);
+      assert(!after.includes('AAAASTALEKEY'), 'our own stale line should be replaced');
+      assert(after.includes('AAAANEWHUBKEY'), 'the new hub key must be present');
+      assert((after.match(/gre-hub-1/g) || []).length === 1, 'exactly one hub line');
+      assert(after.split('\n').filter(Boolean).length === 3, `unexpected key count: ${after}`);
+
+      execFileSync(bash, ['-c', provision.removeCommand(1)], { env });
+      const afterRemove = fs.readFileSync(keys, 'utf8');
+      assert(!afterRemove.includes('gre-hub-1'), 'removal must take our line');
+      assert(afterRemove.includes('operator@laptop') && afterRemove.includes('vendor@backup'),
+        `removal must keep every other key: ${afterRemove}`);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 
   console.log('\nTEST 3/4 — auth_type flips only after the key is proven:');
