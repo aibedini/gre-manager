@@ -76,6 +76,8 @@ jobs:
           for f in hub/VERSION hub/build-info.json hub/.npmrc hub/package.json hub/package-lock.json \
                    hub/server/index.js hub/server/version.js hub/server/xui.js \
                    hub/server/route-inspection.js hub/server/route-credential-fastpath.js \
+                   hub/server/discovery.js hub/server/discovery-queue.js \
+                   hub/public/server-topology.js \
                    hub/server/route-live-preflight.js \
                    hub/server/route-orchestrator.js hub/server/routes.js hub/server/db.js \
                    hub/public/app.js hub/public/index.html hub/public/style.css; do

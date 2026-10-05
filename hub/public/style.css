@@ -253,6 +253,33 @@ kbd {
   min-height: 20px;
 }
 
+/* Probe availability is rendered apart from the topology badges so an outage can
+   never read as a change of role. */
+.card-probe {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: -6px 0 12px;
+  font-size: 12px;
+}
+
+.card-probe .badge {
+  cursor: help;
+}
+
+.card-probe-reason {
+  flex-basis: 100%;
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.probe-banner {
+  border-left: 3px solid var(--red-fg, #c0392b);
+  padding-left: 10px;
+}
+
 .card-foot {
   display: flex;
   align-items: center;

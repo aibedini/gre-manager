@@ -24,6 +24,7 @@ const state = {
   autoRefreshTimer: null,
   autoRefreshRunning: false,
   lastRefreshAt: null,
+  lastFullDiscoveryAt: null,
   routesPoll: null,   // live provisioning timeline poller
   routesPollGeneration: 0, // invalidates an in-flight poll after the modal closes
 };
@@ -297,10 +298,6 @@ function badgesFor(server) {
     out.push(['gray', 'not discovered']);
     return out;
   }
-  if (snap.error) {
-    out.push(['red', 'probe failed']);
-    return out;
-  }
   if (!snap.manager || !snap.manager.installed) {
     out.push(['yellow', 'no manager']);
   } else {
@@ -322,11 +319,13 @@ function badgesFor(server) {
 
 function healthDot(server) {
   const snap = server.snapshot;
+  // Probe availability drives the dot; topology lives in the group and badges.
+  const health = probeHealth(server);
+  if (health === 'failed') return 'err';
   if ((server.connectivity || []).some((pair) =>
     !pair.iran_to_foreign.reachable || !pair.foreign_to_iran.reachable)) return 'err';
   if (!server.has_secret && !server.key_installed) return 'err';
   if (!snap) return 'unknown';
-  if (snap.error) return 'err';
   if (!snap.manager || !snap.manager.installed) return 'warn';
   const peers = peerList(snap);
   if (peers) {
@@ -365,13 +364,17 @@ function connectivityHtml(server) {
   }).join('')}</div>`;
 }
 
-function roleGroup(server) {
-  const roles = ((server.snapshot && server.snapshot.roles) || []).map((role) => String(role).toUpperCase());
-  if (roles.includes('IRAN') && roles.includes('FOREIGN')) return 'dual';
-  if (roles.includes('IRAN')) return 'iran';
-  if (roles.includes('FOREIGN')) return 'foreign';
-  return 'unconfigured';
-}
+// Topology comes ONLY from the authoritative snapshot — the last discovery that
+// genuinely succeeded. Probe availability is a separate axis and must never be
+// able to move a server between groups: a server whose SSH is temporarily
+// unreachable still IS the FOREIGN node it was ten minutes ago.
+// Grouping and probe-health rules live in /server-topology.js, which is loaded
+// before this file and shared verbatim with the tests. The invariant they encode:
+// topology comes only from the authoritative snapshot, availability only from the
+// latest probe, so a failed probe can never move a server between groups.
+const {
+  roleGroup, probeHealth, probeHealthLabel, probeReason, snapshotFreshness, PROBE_HEALTH_CLASS,
+} = window.ServerTopology;
 
 function renderServers() {
   const grid = $('#servers-grid');
@@ -390,6 +393,18 @@ function renderServers() {
     const peerLine = peers
       ? `<div class="card-peers-title muted">${peers.length} ${snap.status.nodes ? 'iran node' : 'foreign peer'}${peers.length === 1 ? '' : 's'}</div>${peerNamesHtml(snap)}`
       : '';
+    // Probe availability is rendered on its own line, visually distinct from the
+    // topology badges, so a failed probe can never be mistaken for a role change.
+    const health = probeHealth(s);
+    const freshness = snapshotFreshness(s);
+    const reason = probeReason(s);
+    const probeLine = `
+      <div class="card-probe">
+        <span class="badge ${PROBE_HEALTH_CLASS[health]}" ${reason ? `title="${esc(reason)}"` : ''}>${esc(probeHealthLabel(s))}</span>
+        <span class="muted">${esc(freshness.known ? `verified ${timeAgo(snap.taken_at)}` : 'never verified')}</span>
+        ${freshness.stale && freshness.known ? '<span class="badge gray" title="The last successful discovery is old; the topology may no longer be current.">SNAPSHOT STALE</span>' : ''}
+        ${reason ? `<div class="muted card-probe-reason">${esc(reason)}</div>` : ''}
+      </div>`;
     return `
       <div class="card" style="--i:${i}" data-id="${s.id}">
         <div class="card-top">
@@ -400,6 +415,7 @@ function renderServers() {
           <span><span class="dot ${healthDot(s)}"></span></span>
         </div>
         <div class="card-badges">${badges}</div>
+        ${probeLine}
         ${peerLine}
         ${connectivityHtml(s)}
         <div class="card-foot">
@@ -433,9 +449,17 @@ function renderServers() {
       btn.disabled = true;
       btn.textContent = '…';
       try {
-        const snap = await api(`/api/servers/${server.id}/discover`, { method: 'POST' });
-        server.snapshot = snap;
-        toast(`Discovery complete: ${server.name}`);
+        const data = await api(`/api/servers/${server.id}/discover`, { method: 'POST' });
+        // Two response shapes: the new one carries an explicit verdict plus the
+        // authoritative snapshot; the old one was the snapshot itself.
+        const isVerdict = data && (data.probe || data.snapshot !== undefined || data.ok !== undefined);
+        if (isVerdict && data.ok === false) {
+          // The probe failed, so the topology was intentionally left untouched.
+          const why = (data.probe && (data.probe.reason || data.probe.error)) || data.error || 'probe failed';
+          toast(`Discovery failed for ${server.name}: ${why} — last verified topology kept`, true);
+        } else {
+          toast(`Discovery complete: ${server.name}`);
+        }
       } catch (err) {
         if (!handleHostKeyError(server, err)) toast(err.message, true);
       }
@@ -457,24 +481,50 @@ async function loadServers() {
   }
 }
 
+// Auto refresh has two levels now.
+//
+// Before: every 10s a FULL SSH discovery ran against every server at once. With
+// 30 servers that is 30 simultaneous sessions on a 10s cycle — a thundering herd
+// that both overloads the hub and manufactures the transient failures that used
+// to wipe topology.
+//
+// Now: a cheap availability probe on a short cadence, and a full discovery only
+// on a slow cadence (or when the user asks). Both go through the server-side
+// bounded queue, so the hub never opens a session per server at once.
+const HEALTH_REFRESH_MS = 15000;
+const FULL_DISCOVERY_MS = 6 * 60 * 1000;
+
 function updateAutoRefreshStatus() {
   const el = $('#auto-refresh-status');
   if (!el) return;
-  if (state.autoRefreshRunning) el.textContent = 'Auto refresh: refreshing…';
+  const seconds = Math.round(HEALTH_REFRESH_MS / 1000);
+  if (state.autoRefreshRunning) el.textContent = 'Auto refresh: checking…';
   else if (document.hidden) el.textContent = 'Auto refresh: paused';
-  else el.textContent = `Auto refresh: 10s · last ${state.lastRefreshAt ? timeAgo(state.lastRefreshAt) : 'pending'}`;
+  else {
+    const lastFull = state.lastFullDiscoveryAt
+      ? ` · full ${timeAgo(state.lastFullDiscoveryAt)}`
+      : '';
+    el.textContent = `Auto refresh: health ${seconds}s${lastFull} · last ${state.lastRefreshAt ? timeAgo(state.lastRefreshAt) : 'pending'}`;
+  }
 }
 
+// Lightweight availability pass for every server. One trivial command each, and
+// the hub bounds how many run concurrently.
 async function refreshAllServers() {
   if (state.autoRefreshRunning || document.hidden || $('#view-main').classList.contains('hidden')) return;
   state.autoRefreshRunning = true;
   updateAutoRefreshStatus();
   try {
-    await Promise.allSettled(state.servers.map((server) =>
-      api(`/api/servers/${server.id}/discover`, { method: 'POST' })
-    ));
+    await api('/api/servers/health', { method: 'POST' });
     await loadServers();
     state.lastRefreshAt = Date.now();
+    // Full discovery is expensive, so it rides the slow cadence only.
+    const staleEnough = !state.lastFullDiscoveryAt || (Date.now() - state.lastFullDiscoveryAt) >= FULL_DISCOVERY_MS;
+    if (staleEnough) {
+      state.lastFullDiscoveryAt = Date.now();
+      // Queued server-side; deliberately not awaited so the UI stays responsive.
+      api('/api/servers/rediscover-unconfigured', { method: 'POST' }).catch(() => {});
+    }
   } finally {
     state.autoRefreshRunning = false;
     updateAutoRefreshStatus();
@@ -486,7 +536,7 @@ function startAutoRefresh() {
   state.lastRefreshAt = Date.now();
   state.autoRefreshTimer = setInterval(() => {
     updateAutoRefreshStatus();
-    if (!document.hidden && Date.now() - state.lastRefreshAt >= 10000) refreshAllServers();
+    if (!document.hidden && Date.now() - state.lastRefreshAt >= HEALTH_REFRESH_MS) refreshAllServers();
   }, 1000);
   updateAutoRefreshStatus();
 }
@@ -680,14 +730,30 @@ function renderOverview() {
     </div>`;
 
   let body = '';
-  if (!snap) {
+  const drawerProbe = server.probe || null;
+  // A failed probe is reported as a banner above the last known good data, not
+  // instead of it: hiding the topology because SSH is briefly down would lose the
+  // operator the information they opened the drawer for.
+  const probeBanner = drawerProbe && drawerProbe.ok === false
+    ? `<div class="section probe-banner">
+         <h3>Probe failed${drawerProbe.checked_at ? ` <span class="muted">${timeAgo(drawerProbe.checked_at)}</span>` : ''}</h3>
+         <div class="muted">${esc(drawerProbe.reason || 'Probe failed')}${drawerProbe.error ? ` — ${esc(drawerProbe.error)}` : ''}</div>
+         <div class="muted">The topology below is the last verified state and has not been changed by this failure.</div>
+       </div>`
+    : '';
+  if (!snap && drawerProbe && drawerProbe.ok === false) {
+    body = `${probeBanner}<div class="empty">This server has never been discovered successfully, so its role is unknown.</div>`;
+  } else if (!snap) {
     body = '<div class="empty">No discovery data yet. Run discovery to probe this server.</div>';
   } else if (snap.error) {
-    body = `
-      <div class="section"><h3>Probe failed</h3>
+    // Legacy snapshot written by a pre-fix release: a failed probe was stored as
+    // state. Show it honestly and say the role is unknown.
+    body = `${probeBanner}
+      <div class="section"><h3>No authoritative snapshot</h3>
       <div class="output-pane">${esc(snap.error)}</div></div>
       <div class="muted" style="font-size:12px">Last attempt ${timeAgo(snap.taken_at)}</div>`;
   } else {
+    body = probeBanner;
     const st = snap.status || {};
     const svc = st.service || snap.service || {};
     const wd = st.watchdog || snap.watchdog || {};
@@ -715,7 +781,7 @@ function renderOverview() {
         <div>${snap.unmanaged_tunnels.map((t) => `<span class="badge yellow">${esc(t)}</span>`).join(' ')}</div>
       </div>` : '';
 
-    body = `
+    body += `
       <div class="section"><h3>Manager</h3>
         <dl class="kv">
           <dt>Installed</dt><dd>${snap.manager.installed ? 'yes' : 'no'}</dd>
@@ -1046,11 +1112,22 @@ function openActionForm(def) {
     const refreshResources = async () => {
       const server = state.current;
       try {
-        const snapshot = await api(`/api/servers/${server.id}/discover`, { method: 'POST' });
-        if (snapshot.error) throw new Error(snapshot.error);
+        const data = await api(`/api/servers/${server.id}/discover`, { method: 'POST' });
+        // Two response shapes: the new one carries an explicit verdict plus the
+        // authoritative snapshot, the old one was the snapshot itself.
+        const isVerdict = data && (data.probe || data.snapshot !== undefined || data.ok !== undefined);
+        if (isVerdict && data.ok === false) {
+          throw new Error(data.probe && (data.probe.reason || data.probe.error) || data.error || 'Discovery failed');
+        }
+        const snapshot = isVerdict ? data.snapshot : data;
+        if (!snapshot) throw new Error('Discovery produced no snapshot');
         server.snapshot = snapshot;
+        if (isVerdict && data.probe) server.probe = data.probe;
         const listed = state.servers.find((item) => item.id === server.id);
-        if (listed) listed.snapshot = snapshot;
+        if (listed) {
+          listed.snapshot = snapshot;
+          if (isVerdict && data.probe) listed.probe = data.probe;
+        }
         for (const field of resourceFields) {
           const select = $(`#action-form [name="${field.name}"]`);
           const hint = $(`#${def.id}-${field.name}-status`);

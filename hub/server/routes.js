@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const QRCode = require('qrcode');
 const auth = require('./auth');
 const discovery = require('./discovery');
+const { DiscoveryQueue } = require('./discovery-queue');
 const actions = require('./actions');
 const ssh = require('./ssh');
 const totp = require('./totp');
@@ -135,11 +136,100 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     const row = db.prepare('SELECT json, taken_at FROM snapshots WHERE server_id = ?').get(id);
     return row ? JSON.parse(row.json) : null;
   };
+  // Only ever called with a SUCCESSFUL discovery. The authoritative snapshot is
+  // the server's last known good topology; a failed probe must not reach here.
   const saveSnapshot = (id, snapshot) => {
     db.prepare(
       'INSERT INTO snapshots (server_id, json, taken_at) VALUES (?, ?, ?) ON CONFLICT(server_id) DO UPDATE SET json = excluded.json, taken_at = excluded.taken_at'
     ).run(id, JSON.stringify(snapshot), Date.now());
   };
+
+  // --- probe health -----------------------------------------------------
+  // Availability lives beside the topology, never inside it.
+  const saveProbeState = (id, probe, kind = 'full') => {
+    db.prepare(`
+      INSERT INTO server_probe_state (server_id, ok, checked_at, duration_ms, error_class, error_message, kind)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(server_id) DO UPDATE SET
+        ok = excluded.ok, checked_at = excluded.checked_at, duration_ms = excluded.duration_ms,
+        error_class = excluded.error_class, error_message = excluded.error_message, kind = excluded.kind
+    `).run(
+      id,
+      probe.ok ? 1 : 0,
+      probe.checkedAt || Date.now(),
+      Number.isFinite(probe.durationMs) ? probe.durationMs : null,
+      probe.ok ? null : (probe.errorClass || 'transport'),
+      probe.ok ? null : (probe.detail || probe.reason || null),
+      kind,
+    );
+  };
+
+  const getProbeState = (id) => {
+    const row = db.prepare('SELECT * FROM server_probe_state WHERE server_id = ?').get(id);
+    if (!row) return null;
+    return {
+      ok: !!row.ok,
+      checked_at: row.checked_at,
+      duration_ms: row.duration_ms,
+      error_class: row.error_class,
+      error: row.error_message,
+      reason: row.ok ? null : discovery.errorReason(row.error_class),
+      kind: row.kind,
+      stale_for_ms: Math.max(0, Date.now() - Number(row.checked_at || 0)),
+    };
+  };
+
+  // The probe projection sent to the client: no secrets, ever.
+  const publicProbe = (id) => {
+    const probe = getProbeState(id);
+    if (!probe) return { ok: null, checked_at: null, error: null, reason: null, stale_for_ms: null };
+    return {
+      ok: probe.ok,
+      checked_at: probe.checked_at,
+      reason: probe.reason,
+      error: probe.error,
+      error_class: probe.error_class,
+      stale_for_ms: probe.stale_for_ms,
+      kind: probe.kind,
+    };
+  };
+
+  // --- discovery orchestration -----------------------------------------
+  // One bounded queue for every automated probe, so a refresh can never open a
+  // session per server at once.
+  const discoveryQueue = new DiscoveryQueue();
+
+  // The ONLY place the authoritative snapshot is written. It is reached only when
+  // a discovery genuinely succeeded, which is what makes "a transient probe
+  // failure can never change a server's topology" a structural guarantee rather
+  // than a convention: a failure path below has no way to call saveSnapshot.
+  const runFullDiscovery = (row) => discoveryQueue.run(row.id, async () => {
+    const outcome = await discovery.discoverOutcome(row, getSecret(row), sshOptsFor(row));
+    if (outcome.errorClass === 'hostkey') {
+      saveProbeState(row.id, outcome);
+      return { ok: false, hostkey_mismatch: true, presented_fp: outcome.presented_fp, probe: publicProbe(row.id) };
+    }
+    if (outcome.ok) {
+      saveSnapshot(row.id, outcome.snapshot);
+      saveProbeState(row.id, outcome);
+      return { ok: true, snapshot: outcome.snapshot, probe: publicProbe(row.id) };
+    }
+    // FAILURE: the authoritative snapshot is deliberately left alone.
+    saveProbeState(row.id, outcome);
+    return { ok: false, probe: publicProbe(row.id), error: outcome.detail, error_class: outcome.errorClass };
+  });
+
+  // Lightweight: proves reachability without collecting topology, so it can run
+  // on a short cadence for every server.
+  const runHealthProbe = (row) => discoveryQueue.run(`health:${row.id}`, async () => {
+    const probe = await discovery.probeHealth(row, getSecret(row), sshOptsFor(row));
+    if (probe.errorClass === 'hostkey') {
+      saveProbeState(row.id, probe, 'health');
+      return { ok: false, hostkey_mismatch: true, presented_fp: probe.presented_fp, probe: publicProbe(row.id) };
+    }
+    saveProbeState(row.id, probe, 'health');
+    return { ok: probe.ok, probe: publicProbe(row.id) };
+  });
 
   const publicServer = (row) => {
     const { secret_enc, password_enc, ...rest } = row;
@@ -315,9 +405,53 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
   });
 
   // --- Servers CRUD -----------------------------------------------------
+  //
+  // Each server carries two independent facts:
+  //   snapshot — the last AUTHORITATIVE topology from a successful discovery
+  //              (null only if no discovery has ever succeeded)
+  //   probe    — availability of the most recent probe, with a staleness age
+  // A failed probe leaves `snapshot` exactly as it was.
   authed.get('/servers', (req, res) => {
     const rows = db.prepare('SELECT * FROM servers ORDER BY name').all();
-    res.json(rows.map((r) => ({ ...publicServer(r), snapshot: getSnapshot(r.id), connectivity: connectivityFor(r.id) })));
+    res.json(rows.map((r) => ({
+      ...publicServer(r),
+      snapshot: getSnapshot(r.id),
+      probe: publicProbe(r.id),
+      connectivity: connectivityFor(r.id),
+    })));
+  });
+
+  // Topology and probe health are counted separately on purpose: a probe failure
+  // is not a change of role, and the header must not conflate them.
+  authed.get('/servers/health-summary', (req, res) => {
+    const rows = db.prepare('SELECT id FROM servers ORDER BY id').all();
+    const authoritative = { iran: 0, foreign: 0, dual: 0, unconfigured: 0 };
+    const probe = { healthy: 0, failed: 0, unknown: 0 };
+    let stale = 0;
+    const STALE_MS = 24 * 60 * 60 * 1000;
+    for (const row of rows) {
+      const snapshot = getSnapshot(row.id);
+      const roles = ((snapshot && snapshot.roles) || []).map((r) => String(r).toUpperCase());
+      if (!snapshot) authoritative.unconfigured += 1;
+      else if (roles.includes('IRAN') && roles.includes('FOREIGN')) authoritative.dual += 1;
+      else if (roles.includes('IRAN')) authoritative.iran += 1;
+      else if (roles.includes('FOREIGN')) authoritative.foreign += 1;
+      else authoritative.unconfigured += 1;
+
+      const state = getProbeState(row.id);
+      if (!state) probe.unknown += 1;
+      else if (state.ok) probe.healthy += 1;
+      else probe.failed += 1;
+      if (state && state.stale_for_ms > STALE_MS) stale += 1;
+    }
+    res.json({
+      total: rows.length,
+      authoritative,
+      probe,
+      stale_snapshots: stale,
+      discovery: discoveryQueue.snapshot(),
+      concurrency: discoveryQueue.concurrency,
+    });
   });
 
   authed.post('/servers', (req, res) => {
@@ -348,9 +482,8 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
       }
       try {
         const fresh = getServer(server.id);
-        const snap = await discovery.discover(fresh, getSecret(fresh), sshOptsFor(fresh));
-        if (!snap.hostkey_mismatch) saveSnapshot(server.id, snap);
-      } catch { /* discovery is best effort here */ }
+        await runFullDiscovery(fresh);
+      } catch { /* discovery is best effort here; probe state records the outcome */ }
     })();
   });
 
@@ -438,13 +571,76 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     res.json({ ok: result.rc === 0 && result.stdout.includes('hub-ok'), rc: result.rc, stderr: result.stderr });
   }));
 
+  // Full discovery of one server, through the bounded queue so a refresh storm
+  // cannot open a session per server at once. A repeat request for a server that
+  // is already being discovered joins that run instead of starting another.
   authed.post('/servers/:id/discover', wrap(async (req, res) => {
     const server = getServer(req.params.id);
     if (!server) return res.status(404).json({ error: 'not found' });
-    const snapshot = await discovery.discover(server, getSecret(server), sshOptsFor(server));
-    if (snapshot.hostkey_mismatch) return hostKeyMismatchResponse(res, server, snapshot.presented_fp);
-    saveSnapshot(server.id, snapshot);
-    res.json(snapshot);
+    const result = await runFullDiscovery(server);
+    if (result.hostkey_mismatch) return hostKeyMismatchResponse(res, server, result.presented_fp);
+    auditEvent(server.id, server.name, 'discover', null, result.ok ? 0 : 1,
+      result.ok ? 'authoritative snapshot updated' : `probe failed (${result.probe.error_class})`);
+    // Still a usable 200 for the frontend: the payload distinguishes success from
+    // failure via `ok`/`probe`, and a failure never touched the snapshot.
+    if (result.ok) return res.json({ ...result.snapshot, ok: true, snapshot: result.snapshot, probe: result.probe });
+    res.json({
+      ok: false,
+      error: result.error,
+      error_class: result.error_class,
+      probe: result.probe,
+      snapshot: getSnapshot(server.id),
+    });
+  }));
+
+  // Lightweight availability refresh: one trivial command per server, no topology
+  // collection. Safe to run on a short cadence.
+  authed.post('/servers/:id/health', wrap(async (req, res) => {
+    const server = getServer(req.params.id);
+    if (!server) return res.status(404).json({ error: 'not found' });
+    const result = await runHealthProbe(server);
+    if (result.hostkey_mismatch) return hostKeyMismatchResponse(res, server, result.presented_fp);
+    res.json({ ok: result.ok, probe: result.probe, snapshot: getSnapshot(server.id) });
+  }));
+
+  // Refresh every server's availability. Returns immediately with the queue
+  // state; the frontend polls GET /servers for the outcome. This is what keeps
+  // "refresh everything" from becoming a thundering herd.
+  authed.post('/servers/health', wrap(async (req, res) => {
+    const rows = db.prepare('SELECT * FROM servers ORDER BY id').all();
+    const started = [];
+    for (const row of rows) {
+      if (discoveryQueue.has(`health:${row.id}`)) continue;
+      started.push(row.id);
+      runHealthProbe(row).catch(() => { /* per-server failure is recorded in probe state */ });
+    }
+    res.json({ ok: true, started: started.length, servers: rows.length, discovery: discoveryQueue.snapshot() });
+  }));
+
+  // Bounded rediscovery for servers whose authoritative snapshot was lost before
+  // this release (roles came from a failed probe, so the server sits in
+  // UNCONFIGURED without ever having been read successfully). Roles are NEVER
+  // guessed from a name or an IP: only a real successful discovery restores one.
+  authed.post('/servers/rediscover-unconfigured', wrap(async (req, res) => {
+    const rows = db.prepare('SELECT * FROM servers ORDER BY id').all();
+    const stale = rows.filter((row) => {
+      const snapshot = getSnapshot(row.id);
+      const roles = ((snapshot && snapshot.roles) || []);
+      if (roles.length) return false;
+      // Only candidates whose snapshot looks like a failed probe rather than a
+      // confirmed absence of the manager.
+      return !snapshot || snapshot.error || (snapshot.manager && snapshot.manager.installed === false);
+    });
+    for (const row of stale) {
+      runFullDiscovery(row).catch(() => { /* recorded in probe state */ });
+    }
+    res.json({
+      ok: true,
+      candidates: stale.length,
+      total: rows.length,
+      discovery: discoveryQueue.snapshot(),
+      note: 'Roles are never inferred; each candidate must complete a successful discovery.',
+    });
   }));
 
   // --- Actions -------------------------------------------------------------
@@ -492,11 +688,11 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
 
       const result = await actions.runAction(db, server, getSecret(server), action, params || {}, sshOptsFor(server), command);
       if (result.hostkey_mismatch) return hostKeyMismatchResponse(res, server, result.presented_fp);
-      // Refresh the snapshot after state-changing actions (best effort).
+      // Refresh the snapshot after state-changing actions (best effort), through
+      // the same queue and with the same rule: only a successful discovery may
+      // replace the authoritative snapshot.
       if (!['doctor'].includes(action)) {
-        discovery.discover(server, getSecret(server), sshOptsFor(server))
-          .then((snap) => { if (!snap.hostkey_mismatch) saveSnapshot(server.id, snap); })
-          .catch(() => {});
+        runFullDiscovery(server).catch(() => { /* recorded in probe state */ });
       }
       // gre prints "Unknown argument" when the CLI is older than the action
       // requires (e.g. foreign-setup needs >= 2.6.0) — surface a clear hint.

@@ -153,6 +153,21 @@ function openDb(dataDir) {
     CREATE INDEX IF NOT EXISTS idx_routes_pair ON gre_routes(iran_server_id, foreign_server_id);
     CREATE INDEX IF NOT EXISTS idx_ports_status ON port_allocations(status);
     CREATE INDEX IF NOT EXISTS idx_route_events_route ON route_events(route_id, id);
+    -- Probe health is deliberately SEPARATE from the authoritative snapshot row.
+    -- A failed probe is an availability fact about the hub's ability to reach the
+    -- server; it says nothing about the server's topology. Keeping them apart is
+    -- what stops a transient SSH failure from erasing a valid role.
+    -- This table is additive: existing rows and the snapshot blob are untouched.
+    CREATE TABLE IF NOT EXISTS server_probe_state (
+      server_id     INTEGER PRIMARY KEY REFERENCES servers(id) ON DELETE CASCADE,
+      ok            INTEGER NOT NULL,
+      checked_at    INTEGER NOT NULL,
+      duration_ms   INTEGER,
+      error_class   TEXT,
+      error_message TEXT,
+      kind          TEXT NOT NULL DEFAULT 'full'
+    );
+    CREATE INDEX IF NOT EXISTS idx_probe_checked ON server_probe_state(checked_at DESC);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_ports_live_iran
       ON port_allocations(iran_server_id, port) WHERE status != 'RELEASED';
     CREATE UNIQUE INDEX IF NOT EXISTS idx_ports_live_foreign

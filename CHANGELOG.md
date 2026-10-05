@@ -4,6 +4,100 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.15.0] - 2026-10-03
+
+### Fixed
+
+- **A transient SSH/probe failure could erase a server's topology and drop it into
+  UNCONFIGURED.** Production showed many servers suddenly leaving the IRAN/FOREIGN
+  groups while `PROBE FAILED` badges appeared, with auto refresh running every 10
+  seconds. The chain was: `discovery.discover()` returned an error-shaped snapshot
+  with `roles: []`, `POST /api/servers/:id/discover` called `saveSnapshot()`
+  unconditionally, and the frontend's `roleGroup()` derived UNCONFIGURED from the
+  now-empty roles. A hub that could not reach a server concluded that the server
+  had no role — an availability failure silently became a topology fact.
+
+  Availability and topology are now separate axes, and only the second can change a
+  server's group:
+  - A new `server_probe_state` table records probe health (`ok`, `checked_at`,
+    `duration_ms`, `error_class`, `error_message`, `kind`). It is additive: the
+    existing `snapshots` blob is never rewritten by a failure, and no existing row
+    is touched.
+  - `discovery.classifyProbeResult()` classifies an outcome as SUCCESS or as one of
+    `timeout`, `auth`, `refused`, `hostkey`, `transport`, `malformed`, `remote`,
+    `nocreds`. Only SUCCESS may replace the authoritative snapshot, and
+    `runFullDiscovery()` is the single call site that writes it — a failure path has
+    no way to reach it.
+  - **A completed probe that finds no manager is still a SUCCESS**, and may
+    legitimately produce empty roles. "The manager is not installed" and "the hub
+    could not reach the server" are now different answers.
+  - A truncated probe (a timeout mid-script that emitted one section) is classified
+    `malformed` instead of being parsed into an empty-role state.
+  - `GET /api/servers` returns `snapshot` (last known good, or null only if no
+    discovery ever succeeded) alongside `probe { ok, checked_at, reason, error,
+    error_class, stale_for_ms, kind }`.
+  - Probe error messages are sanitised before storage or display: passwords,
+    `user:pass@host` forms, tokens, bearer headers, share links and PEM blocks are
+    redacted.
+
+### Added
+
+- **Bounded discovery concurrency with per-server coalescing**
+  (`hub/server/discovery-queue.js`). Every automated probe now goes through one
+  queue with `HUB_DISCOVERY_CONCURRENCY` (default 4, clamped to 32), and a second
+  request for a server already being discovered joins that run instead of opening
+  another SSH session. Previously auto refresh fired a full discovery at every
+  server at once, so 30 servers meant 30 concurrent sessions every 10 seconds — a
+  thundering herd that manufactured the very transient failures that wiped topology.
+- **Two-level auto refresh.** A lightweight availability probe
+  (`POST /api/servers/:id/health`, and `POST /api/servers/health` for all of them)
+  runs on a 15s cadence; full discovery is reserved for the Discover button,
+  post-action refreshes, a 6-minute cadence, and the recovery path. The lightweight
+  probe runs `echo hub-health-ok` and collects no topology, so it is cheap enough to
+  run often.
+- **`GET /api/servers/health-summary`** reporting topology and probe health
+  separately, plus staleness and live queue state:
+  `{ total, authoritative: { iran, foreign, dual, unconfigured }, probe: { healthy,
+  failed, unknown }, stale_snapshots, discovery: { in_flight, queued, concurrency,
+  peak }, concurrency }`. No secrets.
+- **`POST /api/servers/rediscover-unconfigured`**: a bounded recovery path for the
+  servers already stuck at UNCONFIGURED. It re-probes only candidates whose
+  snapshot looks like a failed probe or a confirmed absence, through the same
+  bounded queue, and never infers a role from a name or an IP — only a real
+  successful discovery restores one.
+- **`hub/public/server-topology.js`**, loaded before `app.js` and required directly
+  by the tests, so the rule that decides a server's group has exactly one
+  implementation rather than two copies that can drift apart again.
+
+### Changed
+
+- Server cards show topology and probe health separately: the group badges come from
+  the authoritative snapshot while a distinct line shows `HEALTHY` / `PROBE FAILED`
+  / `PROBE UNKNOWN`, when the snapshot was last verified, a `SNAPSHOT STALE` marker
+  once it is older than 6 hours, and the sanitised failure reason as a tooltip.
+  The health dot follows probe availability.
+- The server drawer shows a probe-failure banner **above** the last known good
+  data instead of replacing it, and says explicitly that the topology below is the
+  last verified state. A server that has never been discovered successfully is
+  reported as having an unknown role.
+- Auto-refresh status now reads `health 15s · full <age>` so the two cadences are
+  visible.
+
+### Tests
+
+- New `scripts/discovery-semantics-test.js` (17 assertions): every failure class is
+  a failure and never a state; a truncated or empty probe is `malformed` rather than
+  "no manager"; a completed probe with no manager is still a SUCCESS; a
+  `status_json` parse error keeps the probe successful; error sanitisation;
+  retryability policy per class (a pinned host key is never retried into
+  acceptance); and the legacy `discover()` snapshot shape is preserved.
+- New `scripts/topology-test.js` (12 assertions) covering the ten required cases
+  plus the acceptance simulation: **27 servers, round 1 all healthy (6 IRAN /
+  21 FOREIGN), round 2 with 17 transient SSH failures, final grouping stays 6 IRAN
+  / 21 FOREIGN with 17 failed probes and zero UNCONFIGURED**; concurrency never
+  exceeds the bound; a repeated request opens one session; stale-but-good snapshots
+  keep their role; and `HUB_DISCOVERY_CONCURRENCY` parsing and clamping.
+
 ## [2.14.0] - 2026-10-03
 
 Three production issues solved together, plus the client picker rework that was
