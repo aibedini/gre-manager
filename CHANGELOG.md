@@ -4,6 +4,110 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.15.3] - 2026-10-05
+
+### Fixed
+
+- **Installing the Hub SSH key could destroy a server's existing password access.**
+  Provisioning flipped the row to `auth_type = 'key'` and then cleared
+  `servers.password_enc` unless the operator ticked **Keep password as fallback
+  after key install** — a checkbox that defaulted to **unchecked**. After a routine
+  key install the Hub therefore held exactly one credential, and nothing ever
+  checked whether the server's own password path had survived. This release makes
+  the design rule explicit and enforced:
+
+  > Installing the Hub key must never break, remove or replace a server's existing
+  > SSH access. The Hub key is an ADDITIONAL authentication method.
+
+  The practical consequence: if a server was reachable with root/password before
+  provisioning, the same password works afterwards — for the Hub and for PuTTY or
+  MobaXterm sessions that have nothing to do with this Hub.
+- **Provisioning never clears the password any more.** The checkbox is gone; the
+  password is stored as an encrypted fallback when the server is added and kept
+  through provisioning. Only an explicit, confirm-gated operator action removes it.
+- **Four-stage verification replaces the single key check.** The claim "both paths
+  still work" is now measured rather than assumed:
+  - **STAGE A** — password-only auth with the current credential. If the password
+    does not already work, provisioning is refused rather than built on sand.
+  - **STAGE B** — append the public key.
+  - **STAGE C** — KEY-ONLY auth with the new private key, fallback disabled.
+  - **STAGE D** — PASSWORD-ONLY auth again with the original password, key auth
+    unused. This is the stage whose absence allowed a key install to quietly become
+    the only access method.
+- **`NEEDS_REVIEW` when the password path breaks after install.** If A and C pass but
+  D fails, provisioning is **not** reported as success: it returns
+  `status: NEEDS_REVIEW` with *"Key installed successfully, but the original
+  password path no longer verified."*, the key stays (it does work), and the stored
+  password is kept. Nothing remote is rolled back and the Hub never "fixes" the
+  server's password.
+- **`key_verified_at` was never written.** The column existed but no code set it, so
+  a verified key was indistinguishable from an unverified one.
+- **Key removal could remove the last verified access method.** `removeKey()` now
+  proves the fallback password over a password-only connection first and refuses
+  with **"Cannot remove the last verified SSH access method."** (HTTP 409) when
+  doing so would leave the server with no verified way in. The remote key line is
+  left in place on refusal.
+
+### Added
+
+- **`ssh.exec` takes an explicit `authMode`** (`key` / `password` / `auto`) and
+  refuses to fall back to the other method when a mode is forced. Without this the
+  verification stages would be decorative: "the password works" would be satisfied
+  by the key succeeding underneath.
+- **Fallback is attempted only on a genuine authentication failure.**
+  `classifyConnectionError()` distinguishes `auth` from `transport` and `hostkey`,
+  so a host key mismatch, network timeout, connection refused, routing failure or
+  command timeout never triggers a password retry. This also closes a real hole:
+  retrying with the password after a host key mismatch would have been a way around
+  host key pinning.
+- **`PUT /api/servers/:id/fallback-password`** verifies the password over a
+  password-only connection before storing it and sets `password_verified_at`; an
+  invalid password is rejected with 400 and stores nothing.
+- **`DELETE /api/servers/:id/fallback-password`** removes only the Hub's stored
+  copy. It never touches the remote password, and its response says so explicitly.
+- **Edit Server on a key-authenticated server** now verifies the entered password
+  password-only before storing it into `password_enc`. It no longer blindly
+  overwrites `secret_enc`, so the primary private key stays byte-identical.
+- **`ssh_auth` in the server API and the Overview drawer**: primary method, key
+  `verified`/`unverified`/`not_installed`, `password_fallback`
+  `stored`/`not_stored`, `password_verified_at`, `key_verified_at`,
+  `fallback_last_used_at`. A card also flags **no password fallback** when a key
+  server has no stored password, and the drawer warns when the Hub key failed and
+  the fallback carried the operation.
+- **Audit events**: `ssh_password_precheck_pass`/`_fail`, `ssh_key_installed`,
+  `ssh_key_verify_pass`/`_fail`, `ssh_password_postcheck_pass`/`_fail`,
+  `ssh_fallback_used`, `key_delete_blocked`, `ssh_password_fallback_saved`/`_removed`.
+  No password or private key is ever written to the audit.
+- New columns `password_verified_at`, `key_verified_at`, `fallback_last_used_at`
+  (additive `ensureColumn`, no existing row touched). A stored credential is no
+  longer conflated with a verified one.
+
+### Security
+
+- Provisioning writes **only** `~/.ssh` and `~/.ssh/authorized_keys`. It never edits
+  `/etc/ssh/sshd_config` or `sshd_config.d/*`, never touches
+  `PasswordAuthentication`, `PermitRootLogin`, `AuthenticationMethods`,
+  `KbdInteractiveAuthentication` or `UsePAM`, and never runs `passwd`, `usermod -p`
+  or `chpasswd`. The Hub manages the credentials it owns; it does not manage the
+  server's login policy. The install is strictly additive: the only line ever
+  removed is a previous line carrying our own `gre-hub-<id>` comment, so the
+  operator's own keys survive byte-for-byte. The old removal used `sed -i` with an
+  unanchored pattern; it is now a scoped `grep -vF` on our own comment.
+- **A configured test-transport override that cannot be loaded is now a hard
+  error.** It previously fell back to the real SSH transport silently, which made a
+  test pass against a live network instead of the scripted one.
+
+### Tests
+
+- New `scripts/provision-safety-test.js` (19 assertions) and
+  `scripts/_fake-ssh.js`, covering all 17 specified cases at the module level and
+  over real HTTP through the hub's `HUB_TEST_SSH_MODULE` hook: password retained
+  through provisioning; existing `authorized_keys` preserved; `auth_type` flips only
+  after the key is proven; the post-check failure path; fallback policy per error
+  class; key removal blocked and allowed; a repo-wide scan proving no source file
+  can run `passwd`/`usermod`/`chpasswd` or edit `sshd_config`; and no secret in any
+  response.
+
 ## [2.15.2] - 2026-10-05
 
 ### Fixed

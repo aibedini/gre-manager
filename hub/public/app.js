@@ -294,6 +294,14 @@ function badgesFor(server) {
   const out = [];
   if (server.key_installed) out.push(['green', 'ssh key']);
   else out.push(['gray', server.has_secret ? 'password' : 'password required']);
+  // Only one verified access method left is a real risk: if that one stops working
+  // there is no way back in, and the operator should see it on the card.
+  if (server.ssh_auth && server.key_installed && server.ssh_auth.password_fallback === 'not_stored') {
+    out.push(['red', 'no password fallback']);
+  } else if (server.ssh_auth && server.key_installed && server.ssh_auth.password_fallback === 'stored'
+    && !server.ssh_auth.password_verified_at) {
+    out.push(['yellow', 'fallback unverified']);
+  }
   if (!snap) {
     out.push(['gray', 'not discovered']);
     return out;
@@ -594,14 +602,10 @@ function serverFormHtml(server) {
       <div class="field">
         <label>${server ? (isKey ? 'Fallback password (optional)' : 'Password') : 'SSH password'}</label>
         <input name="secret" type="password" ${!server && !isKey ? 'required' : ''}
-          placeholder="${server ? 'Leave empty to keep current' : 'Used once to install the hub key'}" />
-        ${isKey ? '<div class="hint">This server authenticates with the hub SSH key; a password here is stored only as a fallback.</div>' : ''}
+          placeholder="${server ? 'Leave empty to keep current' : 'Verified, then kept as an encrypted fallback'}" />
+        ${isKey ? '<div class="hint">This server authenticates with the hub SSH key. A password here is verified and stored only as a fallback; the key is never replaced.</div>'
+    : (!server ? '<div class="hint">The password is verified first, then the hub key is installed in addition to it. Your password login keeps working afterwards.</div>' : '')}
       </div>
-      ${!server ? `
-      <div class="field" style="display:flex; gap:8px; align-items:center">
-        <input type="checkbox" id="keep-fallback" name="keep_fallback" style="width:auto" />
-        <label for="keep-fallback" style="margin:0; color:var(--text)">Keep password as fallback after key install</label>
-      </div>` : ''}
       <div class="form-error" id="server-form-error"></div>
       <div class="foot">
         ${server ? '<button type="button" class="btn btn-danger" id="btn-delete-server">Delete</button>' : ''}
@@ -640,8 +644,10 @@ function openServerForm(server) {
     if (server) {
       if (form.secret.value) body.secret = form.secret.value;
     } else {
+      // No keep_fallback flag any more: the password is always retained as the
+      // encrypted fallback, because installing a key must never be the moment the
+      // Hub loses its only other way back in.
       body.password = form.secret.value;
-      body.keep_fallback = form.keep_fallback.checked;
     }
     try {
       if (server) {
@@ -732,18 +738,55 @@ function renderOverview() {
       <button class="btn btn-ghost btn-sm" id="ov-edit">Edit server</button>
     </div>`;
 
+  // SSH authentication state. The Hub's key and the server's own password are two
+  // independent access methods, and the operator needs to see which ones are
+  // actually VERIFIED — not merely stored — because a server with only one left is
+  // one mistake away from being unreachable.
+  const sshAuth = s.ssh_auth || {
+    primary: s.key_installed ? 'key' : 'password',
+    key: s.key_installed ? 'unknown' : 'not_installed',
+    password_fallback: s.has_fallback_password ? 'stored' : 'not_stored',
+  };
+  const keyBadge = sshAuth.key === 'verified'
+    ? '<span class="badge green">VERIFIED</span>'
+    : sshAuth.key === 'not_installed'
+      ? '<span class="badge gray">NOT INSTALLED</span>'
+      : '<span class="badge yellow">UNVERIFIED</span>';
+  const fallbackBadge = sshAuth.password_fallback === 'stored'
+    ? (sshAuth.password_verified_at
+      ? '<span class="badge green">VERIFIED</span>'
+      : '<span class="badge yellow">STORED, NOT VERIFIED</span>')
+    : '<span class="badge red">NOT STORED</span>';
+  const fallbackUsed = sshAuth.fallback_last_used_at
+    ? `<div class="ssh-auth-warning" style="margin-top:12px">
+         <strong>Hub key authentication failed.</strong> The encrypted fallback password was used successfully
+         ${timeAgo(sshAuth.fallback_last_used_at)}. Reinstall the hub key when you can.
+       </div>`
+    : '';
+  const onlyOneMethod = sshAuth.key !== 'verified' || sshAuth.password_fallback === 'not_stored';
   const sshSection = `
     <div class="section"><h3>SSH access</h3>
       <dl class="kv">
-        <dt>Auth</dt><dd>${s.key_installed ? 'hub ed25519 key' : 'password'}</dd>
-        <dt>Hub key</dt><dd>${s.key_installed ? `installed (gre-hub-${s.id})` : (s.has_secret ? 'not installed' : 'not installed — password required')}</dd>
-        <dt>Fallback password</dt><dd>${s.has_fallback_password ? 'stored (encrypted)' : 'none'}</dd>
+        <dt>Primary</dt><dd>${sshAuth.primary === 'key' ? 'Hub key' : 'Password'}</dd>
+        <dt>Hub key</dt><dd>${keyBadge} ${s.key_installed ? `<span class="muted">gre-hub-${s.id}</span>` : ''}</dd>
+        <dt>Password fallback</dt><dd>${fallbackBadge}</dd>
+        <dt>Last key check</dt><dd>${sshAuth.key_verified_at ? timeAgo(sshAuth.key_verified_at) : 'never'}</dd>
+        <dt>Last password check</dt><dd>${sshAuth.password_verified_at ? timeAgo(sshAuth.password_verified_at) : 'never'}</dd>
         <dt>Host key</dt><dd>${s.host_key_fp ? esc(s.host_key_fp) : 'not pinned yet (TOFU on first connect)'}</dd>
       </dl>
+      ${onlyOneMethod ? `<div class="muted" style="margin-top:10px; font-size:12px">
+        ${sshAuth.password_fallback === 'not_stored'
+    ? 'Only the hub key can reach this server. Add a fallback password so a key problem cannot lock you out.'
+    : 'The hub key is not currently verified.'}
+      </div>` : ''}
+      ${fallbackUsed}
       <div style="display:flex; gap:8px; margin-top:14px; flex-wrap:wrap">
         ${s.key_installed
-          ? '<button class="btn btn-ghost btn-sm" id="ov-key-reinstall">Reinstall key</button><button class="btn btn-danger btn-sm" id="ov-key-delete">Remove hub key</button>'
-          : '<button class="btn btn-ghost btn-sm" id="ov-key-reinstall">Install hub key</button>'}
+    ? '<button class="btn btn-ghost btn-sm" id="ov-key-reinstall">Reinstall key</button><button class="btn btn-danger btn-sm" id="ov-key-delete">Remove hub key</button>'
+    : '<button class="btn btn-ghost btn-sm" id="ov-key-reinstall">Install hub key</button>'}
+        ${sshAuth.password_fallback === 'stored'
+    ? '<button class="btn btn-danger btn-sm" id="ov-fallback-remove">Remove stored fallback password</button>'
+    : '<button class="btn btn-ghost btn-sm" id="ov-fallback-add">Add fallback password</button>'}
       </div>
     </div>`;
 
@@ -892,9 +935,19 @@ function renderOverview() {
       reinstallBtn.disabled = true;
       reinstallBtn.textContent = 'Working…';
       try {
-        await api(`/api/servers/${s.id}/key/reinstall`, { method: 'POST' });
-        toast('SSH key installed and verified');
+        const r = await api(`/api/servers/${s.id}/key/reinstall`, { method: 'POST' });
+        if (r && r.needs_review) {
+          // The key works, but the original password path could not be re-verified.
+          // Saying "installed and verified" here would hide exactly the condition
+          // this flow exists to detect.
+          toast(`Key installed, but ${r.detail} Check the password before relying on it.`, true);
+        } else {
+          toast(r && r.password_retained
+            ? 'SSH key installed and verified; your password fallback was kept'
+            : 'SSH key installed and verified');
+        }
         loadServers();
+        renderOverview();
       } catch (err) {
         if (!handleHostKeyError(s, err)) toast(err.message, true);
       }
@@ -902,18 +955,90 @@ function renderOverview() {
       reinstallBtn.textContent = s.key_installed ? 'Reinstall key' : 'Install hub key';
     });
   }
+  const addFallbackBtn = $('#ov-fallback-add');
+  if (addFallbackBtn) {
+    addFallbackBtn.addEventListener('click', () => openFallbackPasswordModal(s));
+  }
+  const removeFallbackBtn = $('#ov-fallback-remove');
+  if (removeFallbackBtn) {
+    removeFallbackBtn.addEventListener('click', async () => {
+      if (!confirm(`Delete the stored fallback password for ${s.name}?\n\nThis removes only the copy the Hub holds. The password on the server itself is NOT changed, and your own SSH clients keep working.`)) return;
+      removeFallbackBtn.disabled = true;
+      try {
+        const r = await api(`/api/servers/${s.id}/fallback-password`, { method: 'DELETE' });
+        toast(r.note || 'Stored fallback password deleted');
+        await loadServers();
+        renderOverview();
+      } catch (err) {
+        toast(err.message, true);
+      }
+      removeFallbackBtn.disabled = false;
+    });
+  }
   const deleteKeyBtn = $('#ov-key-delete');
   if (deleteKeyBtn) {
     deleteKeyBtn.addEventListener('click', async () => {
+      const hasVerifiedPassword = !!(s.ssh_auth && s.ssh_auth.password_verified_at);
+      if (!hasVerifiedPassword) {
+        // Say it BEFORE the confirmations: this is the case where removing the key
+        // could leave the operator with no verified way back in.
+        toast(s.has_fallback_password
+          ? 'Removing the hub key needs a verified password first — the stored one could not be confirmed. Test it under Add fallback password.'
+          : 'Add a fallback password first. The hub key is currently the only way in to this server.', true);
+      }
       if (!confirm(`Remove the hub SSH key from ${s.name}?\n\nThe gre-hub-${s.id} line is deleted from authorized_keys and the local key is destroyed.`)) return;
       if (!confirm('Second confirmation: the hub will need a password to connect afterwards. Continue?')) return;
       try {
         const r = await api(`/api/servers/${s.id}/key/delete`, { method: 'POST' });
-        toast(r.password_required ? 'Key removed — password required on next connect' : 'Key removed — fallback password restored');
-        loadServers();
-      } catch (err) { toast(err.message, true); }
+        toast(r.password_required ? 'Key removed — password required on next connect' : 'Key removed — the verified password is now primary');
+        await loadServers();
+        renderOverview();
+      } catch (err) {
+        // 409 means the Hub refused because no verified access method would remain.
+        toast(err.message, true);
+      }
     });
   }
+}
+
+// Add a fallback password to a key-authenticated server. The password is verified
+// a password-only SSH connection before it is stored, so this cannot leave the Hub
+// believing it has a second way in when it does not.
+function openFallbackPasswordModal(server) {
+  openModal(`
+    <h2>Add fallback password</h2>
+    <p class="sub">${esc(server.name)} — the hub will verify this password over a password-only SSH connection before storing it. The password on the server itself is never changed.</p>
+    <form id="fallback-form">
+      <div class="field">
+        <label>Current SSH password</label>
+        <input name="password" type="password" required autocomplete="off" />
+        <div class="hint">This is the password you use to log in to ${esc(server.host)} as ${esc(server.username)}.</div>
+      </div>
+      <div class="form-error" id="fallback-error"></div>
+      <div class="foot">
+        <button type="button" class="btn btn-ghost modal-cancel">Cancel</button>
+        <button class="btn">Verify and store</button>
+      </div>
+    </form>`);
+  $('#fallback-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    const err = $('#fallback-error');
+    err.textContent = '';
+    try {
+      const r = await api(`/api/servers/${server.id}/fallback-password`, {
+        method: 'PUT', body: { password: form.password.value },
+      });
+      toast(r.server && r.server.ssh_auth && r.server.ssh_auth.password_verified_at
+        ? 'Fallback password verified and stored'
+        : 'Fallback password stored');
+      closeModal();
+      await loadServers();
+      renderOverview();
+    } catch (e2) {
+      err.textContent = e2.message;
+    }
+  });
 }
 
 // ---------- actions tab ---------------------------------------------------

@@ -82,6 +82,7 @@ jobs:
                    hub/server/route-orchestrator.js hub/server/routes.js hub/server/db.js \
                    hub/scripts/discovery-semantics-test.js hub/scripts/topology-test.js \
                    hub/scripts/overview-test.js hub/scripts/api-shape-test.js \
+                   hub/scripts/provision-safety-test.js hub/scripts/_fake-ssh.js \
                    hub/public/app.js hub/public/index.html hub/public/style.css; do
             [ -f "$TMP/$f" ] || { echo "::error::gre-hub.tar.gz is missing $f"; exit 1; }
           done

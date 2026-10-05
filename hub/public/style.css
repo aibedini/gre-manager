@@ -280,6 +280,17 @@ kbd {
   padding-left: 10px;
 }
 
+/* Shown when the Hub key failed and the stored password carried the operation.
+   Worth noticing, not worth alarming: access still worked. */
+.ssh-auth-warning {
+  border-left: 3px solid var(--yellow-fg, #b7791f);
+  background: rgba(183, 121, 31, 0.08);
+  padding: 8px 10px;
+  border-radius: 4px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
 .card-foot {
   display: flex;
   align-items: center;

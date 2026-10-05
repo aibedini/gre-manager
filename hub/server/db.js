@@ -176,6 +176,12 @@ function openDb(dataDir) {
   // Migrations for v1 databases.
   ensureColumn(db, 'servers', 'password_enc', 'password_enc TEXT');
   ensureColumn(db, 'servers', 'key_installed', 'key_installed INTEGER NOT NULL DEFAULT 0');
+  // SSH access verification state. A credential being STORED is not the same as it
+  // being VERIFIED, and the last-access-method rule depends on the difference:
+  // "no verified password" is what blocks removing the Hub key.
+  ensureColumn(db, 'servers', 'password_verified_at', 'password_verified_at INTEGER');
+  ensureColumn(db, 'servers', 'key_verified_at', 'key_verified_at INTEGER');
+  ensureColumn(db, 'servers', 'fallback_last_used_at', 'fallback_last_used_at INTEGER');
   ensureColumn(db, 'servers', 'host_key_fp', 'host_key_fp TEXT');
   ensureColumn(db, 'sessions', 'csrf', "csrf TEXT NOT NULL DEFAULT ''");
   ensureColumn(db, 'sessions', 'last_seen', 'last_seen INTEGER NOT NULL DEFAULT 0');

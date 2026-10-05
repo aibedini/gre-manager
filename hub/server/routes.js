@@ -42,8 +42,8 @@ function consumeTicket(ticket) {
 
 // ssh options factory shared by HTTP routes and the WS terminal: host-key
 // TOFU pinning (auto-pins on first connect, audits it) + fallback password.
-function makeSshOpts(db, cryptKey) {
-  return (server) => ({
+function makeSshOpts(db, cryptKey, auditFn) {
+  const build = (server) => ({
     hostKey: {
       expected: server.host_key_fp || null,
       onNew: (fp) => {
@@ -62,8 +62,27 @@ function makeSshOpts(db, cryptKey) {
         } catch { /* server row deleted mid-connect */ }
       },
     },
+    // Only supplied for an 'auto' call. ssh.js refuses to use it unless the
+    // failure is a genuine authentication failure, so this can never rescue a
+    // host key mismatch or a network timeout.
     fallbackPassword: server.password_enc ? decrypt(cryptKey, server.password_enc) : null,
+    // Recorded when the fallback actually carried an operation, so a decaying Hub
+    // key shows up in the audit trail instead of failing silently.
+    onFallbackUsed: () => {
+      try {
+        db.prepare('UPDATE servers SET fallback_last_used_at = ? WHERE id = ?').run(Date.now(), server.id);
+      } catch { /* server row deleted mid-connect */ }
+      if (typeof auditFn === 'function') {
+        auditFn(server.id, server.name, 'ssh_fallback_used', null, 0,
+          'hub key authentication failed; the encrypted fallback password succeeded');
+      }
+    },
   });
+
+  // `sshImpl` is the seam the tests drive the four provisioning stages through.
+  // It is passed to provision() explicitly, never derived from HTTP input.
+  build.withSshImpl = (sshImpl) => (server) => ({ ...build(server), sshImpl });
+  return build;
 }
 
 function createRouter(db, cryptKey, dataDir, transport = {}) {
@@ -104,8 +123,17 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
   const getServer = (id) => db.prepare('SELECT * FROM servers WHERE id = ?').get(id);
   const getSecret = (server) => (server.secret_enc ? decrypt(cryptKey, server.secret_enc) : '');
 
-  // ssh options: host-key TOFU pinning + optional fallback password.
-  const sshOptsFor = makeSshOpts(db, cryptKey);
+  // The SSH transport used by provisioning and by the verification stages.
+  //
+  // This is the same override the route orchestrator already honours
+  // (HUB_TEST_SSH_MODULE); routing provisioning through it too means the
+  // four-stage verification can be exercised over the real HTTP surface, instead
+  // of being untestable. It is only ever set by the hub's own test suite.
+  const sshImpl = transport.sshExec || ssh;
+
+  // ssh options: host-key TOFU pinning + optional fallback password, and the
+  // fallback-used audit hook so a decaying Hub key is visible.
+  const sshOptsFor = makeSshOpts(db, cryptKey, auditEvent);
   const routeOrchestrator = new RouteOrchestrator({
     db,
     cryptKey,
@@ -278,6 +306,22 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
       has_secret: !!secret_enc,
       has_fallback_password: !!password_enc,
       host_key_pinned: !!row.host_key_fp,
+      // SSH authentication state, without any credential material.
+      //
+      // A stored credential is not a verified one, and the UI needs to tell them
+      // apart: "NOT STORED" means the Hub key is the only way in, which is the
+      // state that must never be reached by accident.
+      ssh_auth: {
+        primary: row.key_installed ? 'key' : 'password',
+        key: row.key_installed
+          ? (row.key_verified_at ? 'verified' : 'unknown')
+          : 'not_installed',
+        key_comment: row.key_installed ? `gre-hub-${row.id}` : null,
+        key_verified_at: row.key_verified_at || null,
+        password_fallback: password_enc ? 'stored' : 'not_stored',
+        password_verified_at: row.password_verified_at || null,
+        fallback_last_used_at: row.fallback_last_used_at || null,
+      },
     };
   };
 
@@ -503,9 +547,9 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
   });
 
   authed.post('/servers', (req, res) => {
-    const { name, host, ssh_port = 22, username = 'root', password, keep_fallback } = req.body || {};
+    const { name, host, ssh_port = 22, username = 'root', password } = req.body || {};
     if (!name || !host || !password) {
-      return res.status(400).json({ error: 'name, host and password are required (the password is used once to install a dedicated SSH key)' });
+      return res.status(400).json({ error: 'name, host and password are required (the password is verified, then used to install a dedicated SSH key)' });
     }
     let server;
     try {
@@ -517,14 +561,20 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
       if (String(err.message).includes('UNIQUE')) return res.status(409).json({ error: 'a server with this name already exists' });
       throw err;
     }
-    res.status(201).json(publicServer(server));
+    // The password is stored as the fallback BEFORE provisioning, so it survives
+    // even if provisioning fails halfway through. Provisioning itself never clears
+    // it — that is the whole point of this design.
+    db.prepare('UPDATE servers SET password_enc = ? WHERE id = ?').run(encrypt(cryptKey, password), server.id);
+    res.status(201).json(publicServer(getServer(server.id)));
 
     // Auto-provision the SSH key, then run discovery (best effort, async).
     (async () => {
       try {
-        const result = await provision.provision(db, dataDir, cryptKey, server, sshOptsFor, auditEvent);
+        const result = await provision.provision(db, dataDir, cryptKey, getServer(server.id), sshOptsFor, auditEvent, sshImpl);
         if (result.hostkey_mismatch) return; // stays on password auth until the key is accepted
-        provision.handlePasswordAfterProvision(db, cryptKey, server.id, password, !!keep_fallback);
+        if (result.needs_review) {
+          auditEvent(server.id, server.name, 'key_provision', null, 1, result.detail);
+        }
       } catch (err) {
         auditEvent(server.id, server.name, 'key_provision', null, 1, err.message);
       }
@@ -548,7 +598,7 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     });
   });
 
-  authed.put('/servers/:id', (req, res) => {
+  authed.put('/servers/:id', wrap(async (req, res) => {
     const server = getServer(req.params.id);
     if (!server) return res.status(404).json({ error: 'not found' });
     const { name, host, ssh_port, username, secret } = req.body || {};
@@ -561,13 +611,33 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     try {
       db.prepare('UPDATE servers SET name = ?, host = ?, ssh_port = ?, username = ? WHERE id = ?')
         .run(next.name, next.host, next.ssh_port, next.username, server.id);
+
       if (secret) {
-        // On key-auth servers a provided secret becomes the fallback password;
-        // on password servers it is the primary credential.
         if (server.key_installed) {
-          db.prepare('UPDATE servers SET password_enc = ? WHERE id = ?').run(encrypt(cryptKey, secret), server.id);
+          // A key-authenticated server: the entered password is a FALLBACK.
+          //
+          // It is verified password-only before being stored, so the UI never
+          // claims a working fallback it does not have, and the primary private
+          // key in secret_enc is left completely untouched.
+          const check = await provision.verifyPasswordStage(
+            getServer(server.id), secret, sshOptsFor, sshImpl, provision.PRE_MARKER,
+          );
+          if (check.hostkey_mismatch) return hostKeyMismatchResponse(res, getServer(server.id), check.presented_fp);
+          if (!check.ok) {
+            auditEvent(server.id, server.name, 'ssh_password_precheck_fail', null, 1,
+              'the password entered for the fallback did not authenticate');
+            return res.status(400).json({
+              error: 'that password did not authenticate on this server, so it was not stored as the fallback',
+              detail: check.detail,
+            });
+          }
+          db.prepare('UPDATE servers SET password_enc = ?, password_verified_at = ? WHERE id = ?')
+            .run(encrypt(cryptKey, secret), Date.now(), server.id);
+          auditEvent(server.id, server.name, 'ssh_password_fallback_saved', null, 0,
+            'fallback password verified and stored; the hub key was not changed');
         } else {
-          db.prepare("UPDATE servers SET auth_type = 'password', secret_enc = ? WHERE id = ?").run(encrypt(cryptKey, secret), server.id);
+          db.prepare("UPDATE servers SET auth_type = 'password', secret_enc = ? WHERE id = ?")
+            .run(encrypt(cryptKey, secret), server.id);
         }
       }
       res.json(publicServer(getServer(server.id)));
@@ -575,7 +645,7 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
       if (String(err.message).includes('UNIQUE')) return res.status(409).json({ error: 'a server with this name already exists' });
       throw err;
     }
-  });
+  }));
 
   authed.delete('/servers/:id', (req, res) => {
     const info = db.prepare('DELETE FROM servers WHERE id = ?').run(req.params.id);
@@ -583,13 +653,61 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     res.json({ ok: true });
   });
 
+  // --- explicit fallback password management ------------------------------
+  //
+  // These two are the ONLY operations that add or drop the stored fallback
+  // password. Provisioning never does either on its own.
+
+  // Add (or replace) the fallback password. Verified PASSWORD-ONLY first, so a
+  // typo cannot leave the Hub believing it has a working second way in.
+  authed.put('/servers/:id/fallback-password', wrap(async (req, res) => {
+    const server = getServer(req.params.id);
+    if (!server) return res.status(404).json({ error: 'not found' });
+    const { password } = req.body || {};
+    if (typeof password !== 'string' || !password) {
+      return res.status(400).json({ error: 'password is required' });
+    }
+    const check = await provision.verifyPasswordStage(server, password, sshOptsFor, sshImpl, provision.PRE_MARKER);
+    if (check.hostkey_mismatch) return hostKeyMismatchResponse(res, server, check.presented_fp);
+    if (!check.ok) {
+      auditEvent(server.id, server.name, 'ssh_password_precheck_fail', null, 1,
+        'the fallback password offered did not authenticate and was not stored');
+      return res.status(400).json({
+        error: 'that password did not authenticate on this server, so it was not stored',
+        detail: check.detail,
+      });
+    }
+    db.prepare('UPDATE servers SET password_enc = ?, password_verified_at = ? WHERE id = ?')
+      .run(encrypt(cryptKey, password), Date.now(), server.id);
+    auditEvent(server.id, server.name, 'ssh_password_fallback_saved', null, 0,
+      'fallback password verified and stored');
+    res.json({ ok: true, server: publicServer(getServer(server.id)) });
+  }));
+
+  // Drop the stored fallback password. This touches the Hub's OWN credential store
+  // and nothing else — the password on the server is untouched.
+  authed.delete('/servers/:id/fallback-password', (req, res) => {
+    const server = getServer(req.params.id);
+    if (!server) return res.status(404).json({ error: 'not found' });
+    provision.removeFallbackPassword(db, server.id);
+    auditEvent(server.id, server.name, 'ssh_password_fallback_removed', null, 0,
+      'stored fallback password deleted; the server login policy was not changed');
+    res.json({
+      ok: true,
+      note: 'The stored fallback password was deleted from the Hub. The password on the server itself is unchanged.',
+      server: publicServer(getServer(server.id)),
+    });
+  });
+
   // --- SSH key provisioning ----------------------------------------------
   authed.post('/servers/:id/key/reinstall', wrap(async (req, res) => {
     const server = getServer(req.params.id);
     if (!server) return res.status(404).json({ error: 'not found' });
     try {
-      const result = await provision.provision(db, dataDir, cryptKey, server, sshOptsFor, auditEvent);
+      const result = await provision.provision(db, dataDir, cryptKey, server, sshOptsFor, auditEvent, sshImpl);
       if (result.hostkey_mismatch) return hostKeyMismatchResponse(res, server, result.presented_fp);
+      // needs_review is not an HTTP error: the key IS installed, it is the original
+      // password path that could not be re-verified. The caller must see that.
       res.json(result);
     } catch (err) {
       auditEvent(server.id, server.name, 'key_reinstall', null, 1, err.message);
@@ -600,7 +718,11 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
   authed.post('/servers/:id/key/delete', wrap(async (req, res) => {
     const server = getServer(req.params.id);
     if (!server) return res.status(404).json({ error: 'not found' });
-    const result = await provision.removeKey(db, dataDir, cryptKey, server, sshOptsFor, auditEvent);
+    const result = await provision.removeKey(db, dataDir, cryptKey, server, sshOptsFor, auditEvent, sshImpl);
+    if (result.hostkey_mismatch) return hostKeyMismatchResponse(res, server, result.presented_fp);
+    // 409 when the last verified access method would be removed. The Hub refuses
+    // rather than locking the operator out of their own server.
+    if (result.status === 'BLOCKED') return res.status(409).json(result);
     res.json(result);
   }));
 

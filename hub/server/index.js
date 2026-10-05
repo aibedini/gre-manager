@@ -6,7 +6,7 @@ const http = require('http');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 
-const { openDb } = require('./db');
+const { openDb, audit } = require('./db');
 const cryptoUtil = require('./crypto');
 const ssh = require('./ssh');
 const { RouteOrchestrator } = require('./route-orchestrator');
@@ -66,19 +66,36 @@ app.use((req, res, next) => {
 // Optional transport overrides. Only the hub's own test suite sets these: they
 // let the real HTTP surface, router and orchestrator run against a scripted
 // SSH transport and a fake 3x-ui panel, with no production behaviour change.
-function loadTransportOverride(envName) {
+//
+// A configured override that cannot be used is a HARD error. Silently falling back
+// to the real transport would make a test pass against a live network instead of
+// the scripted one, which is worse than failing: it reports success for something
+// that was never exercised.
+function loadTransportOverride(envName, expect) {
   const target = process.env[envName];
   if (!target) return null;
+  const resolved = path.resolve(target);
   // eslint-disable-next-line global-require, import/no-dynamic-require
-  const loaded = require(path.resolve(target));
-  return typeof loaded === 'function' ? loaded : (loaded && loaded.default) || null;
+  const loaded = require(resolved);
+  // Two shapes are in use: the module itself IS the function (the thin entry
+  // points), or it exports an object carrying it.
+  if (expect === 'exec') {
+    if (typeof loaded === 'function') return loaded;
+    if (loaded && typeof loaded.exec === 'function') return loaded;
+  }
+  if (expect === 'fetch') {
+    if (typeof loaded === 'function') return loaded;
+    if (loaded && typeof loaded.fetch === 'function') return loaded.fetch;
+  }
+  throw new Error(`${envName} (${resolved}) does not export a usable ${expect} — refusing to fall back to the real transport`);
 }
 
 const transport = {};
-const testFetch = loadTransportOverride('HUB_TEST_FETCH_MODULE');
-const testSsh = loadTransportOverride('HUB_TEST_SSH_MODULE');
+const testFetch = loadTransportOverride('HUB_TEST_FETCH_MODULE', 'fetch');
+const testSsh = loadTransportOverride('HUB_TEST_SSH_MODULE', 'exec');
 if (testFetch) transport.fetchImpl = testFetch;
 if (testSsh) transport.sshExec = testSsh;
+if (testSsh) console.log('gre-hub using a test SSH transport override');
 
 app.use('/api', createRouter(db, cryptKey, DATA_DIR, transport));
 
@@ -103,7 +120,14 @@ const server = http.createServer(app);
 
 // --- WebSocket SSH terminal --------------------------------------------
 const wss = new WebSocketServer({ noServer: true });
-const sshOptsFor = makeSshOpts(db, cryptKey);
+// The interactive terminal uses the same ssh options as everything else, so an
+// operator whose Hub key has stopped working still gets in via the fallback — and
+// that is recorded rather than silent.
+const sshOptsFor = makeSshOpts(db, cryptKey, (serverId, serverName, action, params, rc, output) => {
+  try {
+    audit(db, { kind: 'auth', serverId, serverName, action, params, rc, output });
+  } catch { /* server row deleted mid-connect */ }
+});
 
 server.on('upgrade', (req, socket, head) => {
   let url;
