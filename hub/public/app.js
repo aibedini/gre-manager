@@ -27,6 +27,9 @@ const state = {
   lastFullDiscoveryAt: null,
   routesPoll: null,   // live provisioning timeline poller
   routesPollGeneration: 0, // invalidates an in-flight poll after the modal closes
+  connections: [],
+  connectionsError: null,
+  connFilter: '',
 };
 
 async function api(path, { method = 'GET', body, ok = null, signal = null } = {}) {
@@ -210,10 +213,12 @@ $$('.nav button[data-page]').forEach((btn) => {
     btn.classList.add('active');
     const page = btn.dataset.page;
     $('#page-servers').classList.toggle('hidden', page !== 'servers');
+    $('#page-connections').classList.toggle('hidden', page !== 'connections');
     $('#page-routes').classList.toggle('hidden', page !== 'routes');
     $('#page-log').classList.toggle('hidden', page !== 'log');
     $('#page-settings').classList.toggle('hidden', page !== 'settings');
     if (page === 'log') loadLog();
+    if (page === 'connections' && window.ConnectionsUI) window.ConnectionsUI.load();
     if (page === 'routes') loadRoutes();
     if (page === 'settings') renderSettings();
   });
@@ -2500,6 +2505,22 @@ async function loadLog() {
 }
 
 $('#btn-refresh-log').addEventListener('click', loadLog);
+
+// ---------- connections page -----------------------------------------------
+// The rendering lives in connections-ui.js and is reached through its own
+// namespace. A bare `loadConnections` reference would be a hard ReferenceError the
+// moment this file is evaluated without that script present, which is exactly how
+// a missing script silently blanks a page.
+
+const connBtn = $('#btn-refresh-connections');
+if (connBtn) connBtn.addEventListener('click', () => window.ConnectionsUI && window.ConnectionsUI.load());
+const connFilter = $('#conn-filter');
+if (connFilter) {
+  connFilter.addEventListener('input', (e) => {
+    state.connFilter = e.target.value;
+    if (window.ConnectionsUI) window.ConnectionsUI.render();
+  });
+}
 
 // ---------- settings page --------------------------------------------------
 

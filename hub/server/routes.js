@@ -1414,6 +1414,301 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     res.status(result.ok ? 200 : 409).json(result);
   }));
 
+  // ================================================================ connections
+  //
+  // A GRE Connection is a projection of a gre_routes row plus its stable uuid, its
+  // journal and its locks. It is exposed under its own path because the Edit
+  // Connection flow needs a two-sided model, not a single provisioning attempt.
+  //
+  // Every mutation here is a `gre iran peer edit` / `gre node edit` on the relevant
+  // server, orchestrated by connections.js. The Hub does not reimplement tunnel or
+  // iptables handling, which is what makes its rollback the CLI's real rollback.
+
+  const connections = require('./connections');
+
+  // Only these fields may be edited. Anything else in the body is dropped rather
+  // than passed through, so a client cannot smuggle an unexpected key into the
+  // planner or into a remote command. No field here is a credential.
+  const EDITABLE_FIELDS = [
+    'name', 'iran_server_id', 'foreign_server_id', 'iran_ip', 'foreign_ip',
+    'subnet_base', 'idx', 'key', 'tcp_ports', 'udp_ports', 'mss_clamp',
+  ];
+
+  function sanitizeEditRequest(body) {
+    const out = {};
+    for (const field of EDITABLE_FIELDS) {
+      if (!Object.prototype.hasOwnProperty.call(body, field)) continue;
+      const value = body[field];
+      if (value === undefined || value === null) continue;
+      if (field === 'iran_server_id' || field === 'foreign_server_id' || field === 'idx' || field === 'key') {
+        const n = Number(value);
+        if (!Number.isFinite(n)) continue;
+        out[field] = n;
+      } else {
+        out[field] = String(value).trim();
+      }
+    }
+    return out;
+  }
+
+  // Do the two sides of this connection still describe the same pairing?
+  //
+  // The Hub compares what it last committed against what the route row currently
+  // records. A mismatch means one side was changed outside the Hub (or a previous
+  // operation half-completed), and editing on top of that would silently pick a
+  // winner. Reported, never auto-corrected.
+  function detectDrift(row) {
+    const endpoint = connections.parseEndpoint(row.iran_endpoint);
+    const mismatches = [];
+    if (endpoint.subnet_base && row.host_group_id && endpoint.subnet_base !== row.host_group_id) {
+      mismatches.push(`subnet base: recorded ${row.host_group_id}, endpoint says ${endpoint.subnet_base}`);
+    }
+    if (endpoint.foreign_ip && row.foreign_ip && endpoint.foreign_ip !== row.foreign_ip) {
+      mismatches.push(`foreign IP: recorded ${row.foreign_ip}, endpoint says ${endpoint.foreign_ip}`);
+    }
+    if (endpoint.iran_ip && row.iran_ip && endpoint.iran_ip !== row.iran_ip) {
+      mismatches.push(`Iran IP: recorded ${row.iran_ip}, endpoint says ${endpoint.iran_ip}`);
+    }
+    if (row.last_verified_at && (row.connection_state === 'DRIFTED' || row.connection_state === 'IRAN_ONLY' || row.connection_state === 'FOREIGN_ONLY')) {
+      mismatches.push(`the last verification left this connection as ${row.connection_state}`);
+    }
+    return mismatches.length ? mismatches : null;
+  }
+
+  // The remote runner the orchestrator already uses, so host-key pinning, the
+  // fallback password and the audit trail stay in one place.
+  //
+  // The full (server, command, timeoutMs) signature matters: connections.js calls
+  // it that way, and a curried wrapper here silently handed it a function instead
+  // of a result.
+  const remoteFor = (server, command, timeoutMs) => routeOrchestrator.remote(server, command, timeoutMs);
+
+  const connectionRow = (id) => {
+    const row = connections.getRoute(db, Number(id));
+    if (!row) return null;
+    // Assign the stable identity on first look, so an installation created before
+    // this release gains one without any migration step.
+    connections.ensureUuid(db, row);
+    return connections.getRoute(db, Number(id));
+  };
+
+  const emitEvent = (routeId) => (stage, status, detail) => {
+    try {
+      routeOrchestrator.event(routeId, stage, status, detail || '');
+    } catch { /* the journal is the durable record; an event write must not abort */ }
+  };
+
+  authed.get('/gre-connections', (req, res) => {
+    const rows = db.prepare('SELECT * FROM gre_routes WHERE deleted_at IS NULL ORDER BY name').all();
+    for (const row of rows) connections.ensureUuid(db, row);
+    const fresh = db.prepare('SELECT * FROM gre_routes WHERE deleted_at IS NULL ORDER BY name').all();
+    const locks = connections.activeLocks();
+    res.json(fresh.map((row) => {
+      const view = connections.project(db, row);
+      const busy = locks.find((l) => l.key === `connection:${row.connection_uuid}`);
+      return { ...view, busy: !!busy, busy_since: busy ? busy.since : null };
+    }));
+  });
+
+  authed.get('/gre-connections/:id', (req, res) => {
+    const row = connectionRow(req.params.id);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    const ops = connections.journalForConnection(db, row.connection_uuid, 5);
+    res.json({
+      ...connections.project(db, row),
+      current: connections.currentState(db, row),
+      recent_operations: ops.map((o) => ({
+        operation_id: o.operation_id, kind: o.kind, status: o.status,
+        current_stage: o.current_stage, rollback_state: o.rollback_state,
+        created_at: o.created_at, completed_at: o.completed_at,
+      })),
+    });
+  });
+
+  // Read-only. Creates no operation, opens no lock, and never writes: this is what
+  // makes it safe for the wizard to call while the operator is still typing.
+  authed.post('/gre-connections/:id/plan-edit', wrap(async (req, res) => {
+    const row = connectionRow(req.params.id);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    const requested = sanitizeEditRequest(req.body || {});
+    const thePlan = connections.plan(db, row, requested);
+
+    // A migration additionally needs to know the targets are actually usable.
+    if (thePlan.class === 'C') {
+      for (const [label, id] of [['iran_server_id', requested.iran_server_id], ['foreign_server_id', requested.foreign_server_id]]) {
+        if (id === undefined) continue;
+        const srv = getServer(id);
+        if (!srv) {
+          thePlan.preflight.push({ name: `${label} exists`, ok: false, detail: `no server #${id}` });
+          thePlan.can_apply = false;
+          thePlan.blocked_reason = `no server #${id}`;
+          continue;
+        }
+        try {
+          const probe = await routeOrchestrator.remote(srv, actions.buildAction('status_json', {}), 30000);
+          thePlan.preflight.push({
+            name: `${srv.name} responds to gre status`,
+            ok: probe.rc === 0,
+            detail: probe.rc === 0 ? 'reachable' : (probe.stderr || probe.stdout || `rc=${probe.rc}`),
+          });
+          if (probe.rc !== 0) {
+            thePlan.can_apply = false;
+            thePlan.blocked_reason = `${srv.name} failed preflight`;
+          }
+        } catch (err) {
+          if (err.hostkey_mismatch) return hostKeyMismatchResponse(res, srv, err.presented_fp);
+          thePlan.preflight.push({ name: `${srv.name} responds to gre status`, ok: false, detail: err.message });
+          thePlan.can_apply = false;
+          thePlan.blocked_reason = `${srv.name} is unreachable: ${err.message}`;
+        }
+      }
+    }
+    res.json(thePlan);
+  }));
+
+  // Apply. Class C becomes a make-before-break migration; A and B are in-place
+  // edits. Both are transactional and both roll back on failure.
+  authed.put('/gre-connections/:id', wrap(async (req, res) => {
+    const row = connectionRow(req.params.id);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    if (routeOrchestrator.running && routeOrchestrator.running.has(row.id)) {
+      return res.status(409).json({ error: 'this connection is provisioning right now' });
+    }
+
+    const requested = sanitizeEditRequest(req.body || {});
+    // Drift must block a direct edit: silently overwriting one side would pick a
+    // winner without the operator knowing which side was authoritative.
+    const drift = detectDrift(row);
+    if (drift && req.body && req.body.force_side !== 'iran' && req.body.force_side !== 'foreign') {
+      return res.status(409).json({
+        error: 'Connection drift detected',
+        detail: drift,
+        options: ['reconcile first', 'retry with force_side set to the authoritative side'],
+      });
+    }
+
+    const thePlan = connections.plan(db, row, requested, { drift });
+    if (!thePlan.class) return res.status(400).json({ error: 'no changes requested', plan: thePlan });
+    if (thePlan.validation_errors.length) {
+      return res.status(400).json({ error: thePlan.validation_errors[0], plan: thePlan });
+    }
+    if (!thePlan.preflight.every((c) => c.ok)) {
+      return res.status(409).json({ error: thePlan.blocked_reason || 'preflight failed', plan: thePlan });
+    }
+
+    const iran = getServer(row.iran_server_id);
+    const foreign = getServer(row.foreign_server_id);
+    try {
+      const runner = thePlan.class === 'C' ? connections.migrate : connections.apply;
+      const result = await runner({
+        db, row, requested, emit: emitEvent(row.id), remote: remoteFor,
+        resolveServer: (id) => getServer(id),
+      });
+      auditEvent(row.iran_server_id, iran ? iran.name : 'hub', `gre_connection_${thePlan.class === 'C' ? 'migrate' : 'edit'}`,
+        { connection_id: row.connection_uuid, name: row.name, class: thePlan.class, changes: thePlan.changes }, 0,
+        thePlan.class === 'C'
+          ? `migrated to ${getServer(req.body.foreign_server_id || row.foreign_server_id).name}`
+          : `applied: ${thePlan.changes.map((c) => c.field).join(', ')}`);
+      res.json({ ...result, connection: connections.project(db, connections.getRoute(db, row.id)) });
+    } catch (err) {
+      if (err.hostkey_mismatch) return hostKeyMismatchResponse(res, row.iran_server_id, err.presented_fp);
+      auditEvent(row.iran_server_id, iran ? iran.name : 'hub', `gre_connection_${thePlan.class === 'C' ? 'migrate' : 'edit'}_failed`,
+        { connection_id: row.connection_uuid, name: row.name, operation_id: err.operation_id }, 1, err.message);
+      const status = err.status || 500;
+      res.status(status).json({
+        error: err.message,
+        operation_id: err.operation_id || null,
+        rollback: err.rollback || null,
+        manual_recovery: err.manual_recovery || null,
+        plan: thePlan,
+      });
+    }
+  }));
+
+  // The persistent timeline for one connection: the orchestrator's stages plus the
+  // journal's own record, so a migration or an edit has one readable history.
+  authed.get('/gre-connections/:id/events', wrap(async (req, res) => {
+    const row = connectionRow(req.params.id);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    const afterId = req.query.after_id;
+    if (req.query.wait === '1' && afterId !== undefined) {
+      return res.json(await routeOrchestrator.waitForEvent(row.id, afterId));
+    }
+    res.json(routeOrchestrator.events(row.id, afterId));
+  }));
+
+  // Roll back one operation by re-applying the state it started from. This goes
+  // through the same transactional path as an edit, so a rollback is verified the
+  // same way the original change was.
+  authed.post('/gre-connections/:id/rollback', wrap(async (req, res) => {
+    const row = connectionRow(req.params.id);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    const operationId = (req.body || {}).operation_id;
+    if (!operationId) return res.status(400).json({ error: 'operation_id is required' });
+    const op = connections.journalGet(db, operationId);
+    if (!op || op.connection_uuid !== row.connection_uuid) {
+      return res.status(404).json({ error: 'that operation does not belong to this connection' });
+    }
+    if (op.status === 'RUNNING') {
+      // Rolling back a running operation would fight the lock it still holds.
+      return res.status(409).json({ error: 'that operation is still running' });
+    }
+    let oldState;
+    try { oldState = JSON.parse(op.old_state_json || '{}'); } catch { oldState = null; }
+    if (!oldState || !oldState.name) return res.status(409).json({ error: 'that operation has no recorded previous state' });
+
+    const requested = {
+      name: oldState.name,
+      iran_ip: oldState.iran_ip,
+      foreign_ip: oldState.foreign_ip,
+      subnet_base: oldState.subnet_base,
+      idx: oldState.idx,
+      key: oldState.key,
+      tcp_ports: oldState.tcp_ports,
+      udp_ports: oldState.udp_ports,
+      mss_clamp: Number(oldState.mss_clamp) === 1 ? 'on' : 'off',
+      iran_server_id: op.kind === 'MIGRATION' ? undefined : undefined,
+    };
+    try {
+      const result = await connections.apply({
+        db, row, requested, emit: emitEvent(row.id), remote: remoteFor,
+        resolveServer: (id) => getServer(id),
+      });
+      auditEvent(row.iran_server_id, row.name, 'gre_connection_rollback', { connection_id: row.connection_uuid, operation_id: operationId }, 0, 'rolled back to the recorded previous state');
+      res.json({ ...result, connection: connections.project(db, connections.getRoute(db, row.id)) });
+    } catch (err) {
+      auditEvent(row.iran_server_id, row.name, 'gre_connection_rollback_failed', { connection_id: row.connection_uuid, operation_id: operationId }, 1, err.message);
+      res.status(err.status || 500).json({
+        error: err.message, operation_id: err.operation_id || null,
+        rollback: err.rollback || null, manual_recovery: err.manual_recovery || null,
+      });
+    }
+  }));
+
+  // Test-only: the scripted SSH transport's own state, so a test can assert on
+  // what actually happened on the fake servers.
+  //
+  // This exists because the fake lives INSIDE the hub process: a test that required
+  // the module itself would read a different instance and would silently assert
+  // against empty state. It is reachable only when a transport override is loaded,
+  // which production never does.
+  if (transport.sshExec && typeof transport.sshExec.state !== 'undefined') {
+    authed.get('/test/transport-state', (req, res) => {
+      const out = {};
+      for (const [host, value] of transport.sshExec.state.entries()) out[host] = value;
+      res.json(out);
+    });
+    // Hold the lock for a moment so a test can prove a second caller is refused.
+    authed.post('/test/hold-lock', wrap(async (req, res) => {
+      const key = String((req.body || {}).key || 'test');
+      const got = connections.acquireLock([{ kind: 'connection', id: key }], 'test');
+      if (!got.ok) return res.status(409).json({ ok: false, held: got.held });
+      await new Promise((r) => setTimeout(r, Number((req.body || {}).hold_ms) || 400));
+      connections.releaseLock(got);
+      res.json({ ok: true });
+    }));
+  }
+
   // --- Terminal ticket -----------------------------------------------------
   authed.post('/servers/:id/terminal-ticket', (req, res) => {
     const server = getServer(req.params.id);

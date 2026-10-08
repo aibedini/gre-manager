@@ -139,6 +139,53 @@ const BUILDERS = {
     if (!NAME_RE.test(String(p.name))) throw new Error('name must be 1-11 letters, digits, _ or -, starting with a letter or digit');
     return `gre iran peer apply --name ${q(p.name)}`;
   },
+  // Edit verbs. These are the v2.16.0 in-place primitives: the Hub decides WHICH
+  // side to run them on and in what order, and owns the two-sided orchestration,
+  // but it deliberately does not reimplement tunnel or iptables handling. Every
+  // mutation goes through the planner, transaction and rollback the CLI already has.
+  peer_edit: (p) => {
+    if (!p.name) throw new Error('peer_edit requires name');
+    if (!NAME_RE.test(String(p.name))) throw new Error('name must be 1-11 letters, digits, _ or -, starting with a letter or digit');
+    if (p.new_name !== undefined && !NAME_RE.test(String(p.new_name))) {
+      throw new Error('new_name must be 1-11 letters, digits, _ or -, starting with a letter or digit');
+    }
+    return (
+      `gre iran peer edit --name ${q(p.name)}` +
+      optStr('--new-name', p.new_name) +
+      optStr('--foreign-ip', p.foreign_ip) +
+      optStr('--iran-ip', p.iran_ip) +
+      optStr('--subnet-base', p.subnet_base) +
+      optInt('--idx', p.idx) +
+      optStr('--key', p.key) +
+      optStr('--wan', p.wan_if) +
+      optStr('--tcp-ports', p.tcp_ports) +
+      optStr('--udp-ports', p.udp_ports) +
+      optEnum('--mss-clamp', p.mss_clamp, ['on', 'off']) +
+      ' --yes'
+    );
+  },
+  node_edit: (p) => {
+    if (!p.name) throw new Error('node_edit requires name');
+    if (!NAME_RE.test(String(p.name))) throw new Error('name must be 1-11 letters, digits, _ or -, starting with a letter or digit');
+    if (p.new_name !== undefined && !NAME_RE.test(String(p.new_name))) {
+      throw new Error('new_name must be 1-11 letters, digits, _ or -, starting with a letter or digit');
+    }
+    return (
+      `gre node edit --name ${q(p.name)}` +
+      optStr('--new-name', p.new_name) +
+      optStr('--ip', p.iran_ip) +
+      optStr('--foreign-ip', p.foreign_ip) +
+      optStr('--subnet-base', p.subnet_base) +
+      optInt('--idx', p.idx) +
+      optStr('--key', p.key) +
+      ' --yes'
+    );
+  },
+  // Read-only verification used by the migration flow's post-apply checks.
+  peer_list_json: () => 'gre iran peer list --json',
+  node_list_json: () => 'gre node list --json',
+  status_json: () => 'gre status --json',
+  doctor: () => 'gre doctor',
   export: (p) => `gre export${p.path ? ` ${q(p.path)}` : ''} --yes`,
   purge: (p) => {
     if (p.confirm !== 'PURGE') throw new Error('purge requires confirm: "PURGE"');

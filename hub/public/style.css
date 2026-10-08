@@ -291,6 +291,138 @@ kbd {
   line-height: 1.45;
 }
 
+/* ---------- connections page ------------------------------------------- */
+
+.conn-filter {
+  background: var(--bg-input, #14171c);
+  border: 1px solid var(--border, #2a2f38);
+  border-radius: 6px;
+  color: var(--text, #e6e8ec);
+  padding: 6px 10px;
+  font-size: 13px;
+  min-width: 220px;
+}
+
+.conn-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border, #2a2f38);
+  border-radius: 8px;
+}
+
+.conn-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.conn-table th,
+.conn-table td {
+  padding: 9px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--border, #2a2f38);
+  vertical-align: top;
+}
+
+.conn-table th {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted, #8b93a1);
+  font-weight: 600;
+}
+
+.conn-table tbody tr:last-child td { border-bottom: none; }
+.conn-table tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
+
+/* A connection with an operation in flight is visibly locked, so a second click
+   reads as "already busy" rather than as a silent no-op. */
+.conn-row.busy { background: rgba(183, 121, 31, 0.08); }
+.conn-name { font-weight: 600; }
+.conn-actions { display: flex; gap: 6px; }
+
+/* ---------- edit review ------------------------------------------------ */
+
+.review-grid { overflow-x: auto; }
+
+.review-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.review-table th,
+.review-table td {
+  padding: 8px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--border, #2a2f38);
+}
+
+.review-table th {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted, #8b93a1);
+}
+
+/* Only the fields that actually change are highlighted: the point of the review
+   screen is that an untouched prefilled field is visibly NOT part of the change. */
+.review-table tr.changed { background: rgba(56, 132, 255, 0.10); }
+.review-table tr.changed td:nth-child(3) { font-weight: 600; }
+
+.impact-list,
+.preflight-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.preflight-list .ok { color: var(--green-fg, #2f9e5f); }
+.preflight-list .bad { color: var(--red-fg, #c0392b); }
+
+/* ---------- operation timeline ---------------------------------------- */
+
+.timeline {
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid var(--border, #2a2f38);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.timeline-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 4px;
+  font-size: 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.timeline-row:last-child { border-bottom: none; }
+.timeline-stage { min-width: 180px; font-weight: 600; }
+.timeline-time { margin-left: auto; }
+
+.op-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12px;
+}
+
+.recovery-steps {
+  background: var(--bg-input, #14171c);
+  border: 1px solid var(--border, #2a2f38);
+  border-radius: 6px;
+  padding: 12px;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-x: auto;
+  white-space: pre;
+}
+
 .card-foot {
   display: flex;
   align-items: center;

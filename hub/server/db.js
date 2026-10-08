@@ -226,6 +226,56 @@ function openDb(dataDir) {
   ensureColumn(db, 'gre_routes', 'iran_endpoint', 'iran_endpoint TEXT');
   ensureColumn(db, 'route_events', 'attempt_no', 'attempt_no INTEGER NOT NULL DEFAULT 1');
 
+  // ---------------------------------------------------------------- connections
+  //
+  // A GRE connection already IS a gre_routes row: it carries both server ids, the
+  // peer name, the tunnel parameters and the port pair. Rather than introduce a
+  // second model that would drift from that one, the connection view is a
+  // projection of these rows and the extra state lives in the columns below.
+  //
+  // connection_uuid is the STABLE identity: it survives a rename and a server
+  // migration, which the name-derived pair fingerprint cannot. It is assigned on
+  // first look (see connections.js) so an existing installation needs no migration.
+  ensureColumn(db, 'gre_routes', 'connection_uuid', 'connection_uuid TEXT');
+  ensureColumn(db, 'gre_routes', 'connection_state', 'connection_state TEXT');
+  ensureColumn(db, 'gre_routes', 'last_verified_at', 'last_verified_at INTEGER');
+  ensureColumn(db, 'gre_routes', 'tcp_ports', 'tcp_ports TEXT');
+  ensureColumn(db, 'gre_routes', 'udp_ports', 'udp_ports TEXT');
+  ensureColumn(db, 'gre_routes', 'mss_clamp', 'mss_clamp INTEGER');
+  ensureColumn(db, 'gre_routes', 'iran_ip', 'iran_ip TEXT');
+  ensureColumn(db, 'gre_routes', 'foreign_ip', 'foreign_ip TEXT');
+
+  try {
+    db.prepare('CREATE UNIQUE INDEX IF NOT EXISTS idx_gre_routes_uuid ON gre_routes(connection_uuid) WHERE connection_uuid IS NOT NULL').run();
+  } catch { /* already present */ }
+
+  // The transaction journal. It records what an edit WOULD change and what it did
+  // change, so a failed or interrupted migration can be explained and recovered.
+  // No credential material ever goes in here: the requested state holds addresses,
+  // ports and tunnel parameters only.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS edit_operations (
+        operation_id      TEXT PRIMARY KEY,
+        connection_uuid   TEXT NOT NULL,
+        route_id          INTEGER,
+        kind              TEXT NOT NULL,
+        old_state_json    TEXT,
+        requested_state_json TEXT,
+        plan_json         TEXT,
+        status            TEXT NOT NULL,
+        current_stage     TEXT,
+        rollback_state    TEXT,
+        detail            TEXT,
+        created_at        INTEGER NOT NULL,
+        started_at        INTEGER,
+        completed_at      INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_edit_ops_conn ON edit_operations(connection_uuid, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_edit_ops_status ON edit_operations(status);
+    `);
+  } catch { /* already present */ }
+
   // Split transport health from discovery health on the probe table. Additive:
   // the legacy ok/checked_at/error_* columns are kept and are migrated into the
   // `discovery_*` set once, so an existing row is not lost.

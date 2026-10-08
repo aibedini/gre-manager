@@ -4,6 +4,110 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.17.0] - 2026-10-08
+
+### Added
+
+- **Edit a GRE connection from the Hub, including changing which servers it runs
+  between.** Phase 1 (v2.16.0) added in-place editing to the CLI. This adds the
+  Hub-side model, the web wizard and, the substantial part, **transactional server
+  migration**: `IRAN-A ⇄ FOREIGN-A` can become `IRAN-A ⇄ FOREIGN-B` (or move the Iran
+  side) without hand-running a command on the other end.
+- **A first-class Connection.** A connection is a projection of a `gre_routes` row —
+  it already holds both server ids, the peer name, the tunnel parameters and the port
+  pair — plus the state that was missing: a stable `connection_uuid`, its journal and
+  its locks. A second parallel model would have drifted from the orchestrator's
+  ownership metadata, so the projection is deliberate.
+- **`connection_uuid` is the stable identity**, surviving a rename and a server
+  migration. It is assigned on first look, so an installation created before this
+  release gains one with no migration step. `/etc/multi-gre` remains the source of
+  truth for the tunnel itself: the Hub stores discovery, correlation, transaction
+  metadata and history, and never becomes the place a tunnel is configured.
+- **A single planner for the Hub** (`connection-planner.js`), mirroring the CLI's
+  `PLAN_*` semantics rather than inventing a second set of rules:
+  - **Class A** — ports or MSS only: a rule-only update, the tunnel is not rebuilt.
+  - **Class B** — IP, subnet, index, key or name: a transactional recreate.
+  - **Class C** — the Iran or Foreign server changed: a server migration.
+  A server change always outranks the rest, so "migrate and also change the ports"
+  is one migration rather than two conflicting operations. It is pure — no database,
+  no SSH — which is what makes `plan-edit` safe to call on production.
+- **`POST /api/gre-connections/:id/plan-edit`** returns the class, the field-by-field
+  changes, an impact list, preflight results and a disruption estimate, and mutates
+  nothing. Collision and port ownership checks reuse the add-time validators, and the
+  connection being edited never counts as a collision with itself (during a rename
+  both of its names are excluded).
+- **Make-before-break migration.** The new side is built and verified, then the
+  surviving side is pointed at it, then the new path is verified on both ends *and*
+  confirmed bidirectionally before the old side is removed:
+  `CURRENT_CAPTURED → PLAN_CREATED → PREFLIGHT → COLLISION_CHECK → BACKUP →
+  TARGET_PREPARED → SOURCE_PREPARED → SOURCE_UPDATED / TARGET_UPDATED →
+  RUNTIME_VERIFY → VERIFY_BIDIRECTIONAL → DOCTOR → CUTOVER → OLD_PATH_REMOVED →
+  VERIFY_OLD_REMOVED → COMMIT`. The old host's configuration is untouched until the
+  new path is proven, so a failure at any point leaves the original connection in
+  place.
+- **Real rollback, not a database flag.** Every operation restores the previous state
+  by *applying* it — `gre iran peer edit` / `gre node edit` back to the old values —
+  and then verifies it, on both sides. Because the Hub orchestrates the CLI's own
+  transactional path rather than reimplementing tunnel or iptables handling, its
+  rollback is the CLI's rollback. Timelines record
+  `FAILED → ROLLBACK_STARTED → ROLLBACK_SOURCE/TARGET → ROLLBACK_VERIFY →
+  ROLLBACK_COMPLETE`, and a rollback that cannot verify is reported as
+  `ROLLBACK_FAILED` together with **the exact commands a human would need**, instead
+  of leaving the operator guessing.
+- **`edit_operations` journal**: the previous state, the requested state, the plan,
+  the current stage, the rollback state and timestamps, so a failed or interrupted
+  migration can be explained. It stores no credential material. An operation left
+  `RUNNING` by a restart is reported as `INTERRUPTED` with an honestly `UNKNOWN`
+  rollback state rather than being quietly treated as successful.
+- **Per-connection and per-server locks.** One mutation per connection, and one per
+  server, so two migrations cannot rewrite the same host's configuration at once and
+  a double-click cannot race itself. A blocked caller is told why.
+- **Drift handling.** If the recorded pairing and the persisted endpoint disagree,
+  a direct edit is refused with **"Connection drift detected"** and a pointer to
+  reconcile, rather than silently picking a winner.
+- **Connections page and prefilled edit wizard.** A table with both endpoints always
+  visible (name, both servers, both IPs, tunnel, subnet, key, TCP, UDP, both states,
+  last verified) with a filter, plus a wizard whose every field is prefilled from the
+  current state. An untouched field is never sent, so "leave it alone" is the default
+  rather than something the operator has to express. A review screen shows CURRENT vs
+  NEW with the changed rows highlighted, the impact list and the preflight results,
+  and a live-updating timeline shows the stages as they happen.
+- **`gre peer_edit` / `node_edit` / list / status / doctor` actions** are exposed
+  through the existing `actions.js` registry, so the Hub drives the CLI's own
+  primitives and a remote command is built in exactly one place.
+
+### APIs
+
+- `GET /api/gre-connections`, `GET /api/gre-connections/:id`,
+  `POST /api/gre-connections/:id/plan-edit`, `PUT /api/gre-connections/:id`,
+  `GET /api/gre-connections/:id/events`, `POST /api/gre-connections/:id/rollback`.
+  All are behind the existing session auth and CSRF checks, are audited, expose no
+  credential material, and accept only an allowlist of editable fields — anything
+  else in the request body is dropped rather than passed through.
+
+### Tests
+
+- New `scripts/connections-test.js` (93 assertions) plus
+  `scripts/_fake-gre-ssh.js`, a **stateful** fake of the gre CLI: a `peer_edit` on one
+  server is visible to the next verification read, which is what makes the
+  make-before-break and rollback assertions mean something. Coverage includes the
+  three classes and that `plan-edit` mutates nothing, collision and port refusals
+  leaving everything untouched, rollback on a failure injected at the target-prepare,
+  source-update, runtime-verify and doctor stages, Foreign and Iran migration
+  (including that the old path survives until the new one is healthy and only then is
+  removed), `connection_uuid` surviving a rename and both migration directions, drift
+  blocking an edit, the locks, the timeline stages, an operation interrupted by a
+  restart, secret redaction, auth/CSRF, and the `rollback` endpoint's error cases.
+- Two test-gated endpoints (`/test/transport-state`, `/test/hold-lock`) exist only
+  when a transport override is loaded, which production never does.
+
+### Notes
+
+- **Real acceptance on live servers could not be performed**, and this release does
+  not claim it. The migration flow is verified against a stateful simulator; steps
+  26 A–D of the phase specification require a real IRAN/FOREIGN pair. See the report
+  accompanying this release for exactly what remains unverified.
+
 ## [2.16.0] - 2026-10-05
 
 ### Added

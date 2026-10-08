@@ -42,6 +42,7 @@
         <div class="brand">gre<span>-hub</span><em id="brand-version" title="running build">…</em></div>
         <nav class="nav">
           <button data-page="servers" class="active">Servers</button>
+          <button data-page="connections">Connections</button>
           <button data-page="routes">Auto routes</button>
           <button data-page="log">Action log</button>
           <button data-page="settings">Settings</button>
@@ -74,6 +75,20 @@
             </div>
           </div>
           <div id="routes-body"></div>
+        </section>
+
+        <section id="page-connections" class="page hidden">
+          <div class="page-head">
+            <div>
+              <h2>Connections</h2>
+              <div class="sub">Every GRE connection as a pair: both endpoints, the tunnel, and what each side reports.</div>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center">
+              <input id="conn-filter" class="conn-filter" placeholder="Filter by name, IP or server" />
+              <button class="btn btn-ghost btn-sm" id="btn-refresh-connections">Refresh</button>
+            </div>
+          </div>
+          <div id="connections-body"></div>
         </section>
 
         <section id="page-log" class="page hidden">
@@ -159,5 +174,6 @@
   <script src="/server-topology.js"></script>
   <script src="/discovery-response.js"></script>
   <script src="/app.js"></script>
+  <script src="/connections-ui.js"></script>
 </body>
 </html>
