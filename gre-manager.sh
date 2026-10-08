@@ -741,17 +741,14 @@ iran_side_ip() { # iran_side_ip IRAN_IP FOREIGN_IP -> whichever is ours
 #   PLAN_CLASS        "A" | "B" | "NONE"
 #   PLAN_FIELDS       space-separated changed field names
 #   PLAN_TUNNEL       1 when the tunnel interface must be rebuilt
-#   PLAN_MIGRATION    1 only for class C
 declare -a PLAN_FIELDS=()
 PLAN_CLASS="NONE"
 PLAN_TUNNEL=0
-PLAN_MIGRATION=0
 
 plan_reset() {
     PLAN_FIELDS=()
     PLAN_CLASS="NONE"
     PLAN_TUNNEL=0
-    PLAN_MIGRATION=0
 }
 
 plan_field_changed() { # plan_field_changed NAME
@@ -1002,11 +999,9 @@ port_available_for_edit() { # port_available_for_edit PROTO PORTS EXCLUDE_NAME
 # rules and the tunnel, because restoring the file alone would leave a half-applied
 # rule set behind.
 EDIT_TXN_DIR=""
-EDIT_TXN_ACTIVE=0
 
 edit_txn_begin() { # edit_txn_begin
     EDIT_TXN_DIR="$(mktemp -d)"
-    EDIT_TXN_ACTIVE=1
     mkdir -p "$EDIT_TXN_DIR"
 }
 
@@ -1032,13 +1027,8 @@ edit_txn_restore_file() { # edit_txn_restore_file LABEL FILE
 }
 
 edit_txn_commit() {
-    EDIT_TXN_ACTIVE=0
     [[ -n "$EDIT_TXN_DIR" && -d "$EDIT_TXN_DIR" ]] && rm -rf "$EDIT_TXN_DIR"
     EDIT_TXN_DIR=""
-}
-
-edit_txn_abort_keep() { # keep the directory for debugging
-    EDIT_TXN_ACTIVE=0
 }
 
 # =================================================== transactional connection edit
@@ -4324,10 +4314,10 @@ render_connection_list() { # render_connection_list SIDE
     else
         local row
         for row in "${rows[@]}"; do
-            local -a c=()
-            IFS=$'\t' read -r -a c <<< "$row"
-            print_connection_compact "${c[0]}" "${c[1]}" "${c[2]}" "${c[3]}" \
-                "${c[4]}" "${c[5]}" "${c[6]}" "${c[7]}" "${c[8]}"
+            local -a rowcols=()
+            IFS=$'\t' read -r -a rowcols <<< "$row"
+            print_connection_compact "${rowcols[0]}" "${rowcols[1]}" "${rowcols[2]}" "${rowcols[3]}" \
+                "${rowcols[4]}" "${rowcols[5]}" "${rowcols[6]}" "${rowcols[7]}" "${rowcols[8]}"
         done
     fi
     return 0
