@@ -62,7 +62,7 @@
 # shellcheck disable=SC1090  # config files under /etc/multi-gre are validated then sourced by design
 set -uo pipefail
 
-VERSION="2.15.3"
+VERSION="2.16.0"
 
 GITHUB_REPO="aibedini/gre-manager"
 
@@ -495,13 +495,20 @@ suggest_free_port() { # suggest_free_port PROTO(tcp|udp) [START]
 # Central collision detection shared by menu, CLI, import and doctor.
 # Checks (SUBNET_BASE,IDX) pair, tunnel name and port overlaps against all
 # OTHER peers. Returns 1 (after printing the reason) on any conflict.
-check_peer_collisions() { # check_peer_collisions NAME SUBNET_BASE IDX TUN TCP_PORTS UDP_PORTS
-    local name="$1" base="$2" idx="$3" tun="$4" tcp="$5" udp="$6"
+# Collision check against the other connections.
+#
+# EXCLUDE_NAME is the connection being edited. Excluding it is what stops a
+# connection from being reported as colliding with itself — and during a rename
+# there are TWO names to exclude, because the file on disk still carries the old
+# one while the requested state carries the new one.
+check_peer_collisions() { # check_peer_collisions NAME SUBNET_BASE IDX TUN TCP_PORTS UDP_PORTS [EXCLUDE_ALSO]
+    local name="$1" base="$2" idx="$3" tun="$4" tcp="$5" udp="$6" exclude_also="${7:-}"
     local f p_name p_base p_idx p_tun p_tcp p_udp
     for f in "$FOREIGNS_DIR"/*.conf; do
         [[ -e "$f" ]] || continue
         p_name="$(grep -E '^NAME=' "$f" | cut -d= -f2)"
         [[ "$p_name" == "$name" ]] && continue
+        [[ -n "$exclude_also" && "$p_name" == "$exclude_also" ]] && continue
         p_base="$(grep -E '^SUBNET_BASE=' "$f" | cut -d= -f2)"; p_base="${p_base:-$DEFAULT_SUBNET_BASE}"
         p_idx="$(grep -E '^IDX=' "$f" | cut -d= -f2)"
         p_tun="$(grep -E '^TUN=' "$f" | cut -d= -f2)"
@@ -653,6 +660,762 @@ unmanaged_gre_tunnels() { # GRE tunnels present but NOT created by gre-manager
 
 pair_fingerprint() { # pair_fingerprint IRAN_IP FOREIGN_IP SUBNET_BASE IDX KEY — identical on both sides
     printf '%s <-> %s · %s.%s.0/30 · key %s' "$1" "$2" "$3" "$4" "$5"
+}
+
+# ============================================================ connection identity
+#
+# A connection needs an identity that survives a rename and an endpoint migration.
+# The tunnel parameters cannot serve as that identity, because editing any of them
+# is exactly what we want to do — so the id lives in a sidecar map next to the
+# configs and is NEVER written into the .conf files themselves. That keeps every
+# existing config byte-identical and keeps PEER_CONF_FIELDS_RE (which only allows
+# [a-zA-Z0-9.,:_|+-]) untouched.
+#
+# When no id has been assigned yet, one is derived from the current pairing
+# fingerprint. That means an existing installation correlates to a stable id on
+# first look, without anyone having to migrate anything.
+IDENTITY_FILE="$CONF_DIR/connections.identity"
+
+# Stable, collision-free id for the given fingerprint.
+connection_id_for() { # connection_id_for FINGERPRINT
+    local fp="$1" line id
+    if [[ -f "$IDENTITY_FILE" ]]; then
+        while IFS=$'\t' read -r id line || [[ -n "$line" ]]; do
+            [[ -n "$line" ]] || continue
+            if [[ "$line" == "$fp" ]]; then
+                printf '%s' "$id"
+                return 0
+            fi
+        done < "$IDENTITY_FILE"
+    fi
+    # derive: deterministic, so the same pairing always maps to the same id
+    printf 'conn-%s' "$(printf '%s' "$fp" | cksum | cut -d' ' -f1)"
+}
+
+# Record (or refresh) the fingerprint a connection id currently points at. Called
+# after every successful mutation so a rename or migration keeps its id.
+connection_id_remember() { # connection_id_remember ID FINGERPRINT
+    local id="$1" fp="$2" tmp
+    mkdir -p "$CONF_DIR"
+    tmp="$(mktemp)"
+    if [[ -f "$IDENTITY_FILE" ]]; then
+        # Drop the old mapping for this id AND any other id claiming this
+        # fingerprint, so the map stays one-to-one in both directions.
+        awk -F'\t' -v id="$id" -v fp="$fp" '$1 != id && $2 != fp' "$IDENTITY_FILE" > "$tmp" 2>/dev/null || true
+    fi
+    printf '%s\t%s\n' "$id" "$fp" >> "$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$IDENTITY_FILE"
+}
+
+# Forget a connection id entirely (on remove).
+connection_id_forget() { # connection_id_forget ID
+    local id="$1" tmp
+    [[ -f "$IDENTITY_FILE" ]] || return 0
+    tmp="$(mktemp)"
+    awk -F'\t' -v id="$id" '$1 != id' "$IDENTITY_FILE" > "$tmp" 2>/dev/null || true
+    chmod 600 "$tmp"
+    mv "$tmp" "$IDENTITY_FILE"
+}
+
+# ---------------------------------------------------------- connection helpers
+# The two endpoints of the connection, as this role sees them.
+iran_side_ip() { # iran_side_ip IRAN_IP FOREIGN_IP -> whichever is ours
+    if [[ -n "$IRAN_IP" ]]; then printf '%s' "$IRAN_IP"; else detect_public_ip "${WAN_IF:-}"; fi
+}
+
+# ------------------------------------------------------------ change planning
+#
+# The whole point of Edit: do NOT treat every change as remove+add. A port change
+# is a rule update; only a change to the tunnel's own parameters needs the tunnel
+# rebuilt. Getting this wrong is what turns "change 3001 to 3049" into a tunnel
+# outage.
+#
+# Change classes:
+#   A  rule-only       TCP ports, UDP ports, MSS clamp        -> no tunnel touch
+#   B  tunnel recreate KEY, SUBNET_BASE, IDX, IRAN_IP,
+#                      FOREIGN_IP, TUN, NAME(rename)          -> controlled rebuild
+#   C  migration       a different PARENT SERVER              -> Hub only
+#
+# Sets these for the caller:
+#   PLAN_CLASS        "A" | "B" | "NONE"
+#   PLAN_FIELDS       space-separated changed field names
+#   PLAN_TUNNEL       1 when the tunnel interface must be rebuilt
+#   PLAN_MIGRATION    1 only for class C
+declare -a PLAN_FIELDS=()
+PLAN_CLASS="NONE"
+PLAN_TUNNEL=0
+PLAN_MIGRATION=0
+
+plan_reset() {
+    PLAN_FIELDS=()
+    PLAN_CLASS="NONE"
+    PLAN_TUNNEL=0
+    PLAN_MIGRATION=0
+}
+
+plan_field_changed() { # plan_field_changed NAME
+    PLAN_FIELDS+=("$1")
+}
+
+# Is this field tunnel-affecting (forces a rebuild) or rule-affecting?
+plan_is_tunnel_field() {
+    case "$1" in
+        KEY|SUBNET_BASE|IDX|IRAN_IP|FOREIGN_IP|TUN|NAME) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+plan_is_rule_field() {
+    case "$1" in
+        TCP_PORTS|UDP_PORTS|MSS_CLAMP) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Seed the requested state from the current state.
+#
+# Every caller starts here and then overrides only what it was asked to change. That
+# is what makes "an option you did not pass keeps its current value" true by
+# construction rather than by a chain of fallbacks, and it removes the ambiguity
+# between "not mentioned" and "explicitly set to empty" — the caller always assigns
+# a concrete value before the diff runs.
+plan_request_from_current() { # plan_request_from_current (uses EDIT_OLD_*)
+    PLAN_REQ_NAME="$EDIT_OLD_NAME"
+    PLAN_REQ_FOREIGN_IP="$EDIT_OLD_FOREIGN_IP"
+    PLAN_REQ_IRAN_IP="$EDIT_OLD_IRAN_IP"
+    PLAN_REQ_WAN_IF="$EDIT_OLD_WAN_IF"
+    PLAN_REQ_SUBNET_BASE="$EDIT_OLD_SUBNET_BASE"
+    PLAN_REQ_IDX="$EDIT_OLD_IDX"
+    PLAN_REQ_KEY="$EDIT_OLD_KEY"
+    PLAN_REQ_TUN="$EDIT_OLD_TUN"
+    PLAN_REQ_TCP_PORTS="$EDIT_OLD_TCP"
+    PLAN_REQ_UDP_PORTS="$EDIT_OLD_UDP"
+    PLAN_REQ_MSS_CLAMP="${EDIT_OLD_MSS:-0}"
+}
+
+# Compare the requested state against the current one and classify the change.
+#
+# Deliberately explicit: one case arm per field, no indirect expansion and no
+# "empty means keep" inference. Every PLAN_REQ_* var holds a real value by the time
+# this runs (see plan_request_from_current), so the diff is a plain string compare.
+#
+#   A  rule-only       TCP/UDP ports, MSS clamp        -> the tunnel is not rebuilt
+#   B  tunnel recreate KEY, SUBNET_BASE, IDX, IRAN_IP,
+#                      FOREIGN_IP, TUN, NAME          -> controlled rebuild
+plan_edit() {
+    plan_reset
+    local field
+    for field in NAME FOREIGN_IP IRAN_IP WAN_IF SUBNET_BASE IDX KEY TUN TCP_PORTS UDP_PORTS MSS_CLAMP; do
+        local cur="" req=""
+        case "$field" in
+            NAME)        cur="$EDIT_OLD_NAME";        req="$PLAN_REQ_NAME" ;;
+            FOREIGN_IP)  cur="$EDIT_OLD_FOREIGN_IP";  req="$PLAN_REQ_FOREIGN_IP" ;;
+            IRAN_IP)     cur="$EDIT_OLD_IRAN_IP";     req="$PLAN_REQ_IRAN_IP" ;;
+            WAN_IF)      cur="$EDIT_OLD_WAN_IF";      req="$PLAN_REQ_WAN_IF" ;;
+            SUBNET_BASE) cur="$EDIT_OLD_SUBNET_BASE"; req="$PLAN_REQ_SUBNET_BASE" ;;
+            IDX)         cur="$EDIT_OLD_IDX";         req="$PLAN_REQ_IDX" ;;
+            KEY)         cur="$EDIT_OLD_KEY";         req="$PLAN_REQ_KEY" ;;
+            TUN)         cur="$EDIT_OLD_TUN";         req="$PLAN_REQ_TUN" ;;
+            TCP_PORTS)   cur="$EDIT_OLD_TCP";         req="$PLAN_REQ_TCP_PORTS" ;;
+            UDP_PORTS)   cur="$EDIT_OLD_UDP";         req="$PLAN_REQ_UDP_PORTS" ;;
+            MSS_CLAMP)   cur="${EDIT_OLD_MSS:-0}";    req="$PLAN_REQ_MSS_CLAMP" ;;
+        esac
+        if [[ "$cur" != "$req" ]]; then
+            plan_field_changed "$field"
+            plan_is_tunnel_field "$field" && PLAN_TUNNEL=1
+        fi
+    done
+    if (( ${#PLAN_FIELDS[@]} == 0 )); then
+        PLAN_CLASS="NONE"
+        return 0
+    fi
+    if (( PLAN_TUNNEL )); then
+        PLAN_CLASS="B"
+    else
+        PLAN_CLASS="A"
+    fi
+    return 0
+}
+
+plan_class_label() {
+    case "$1" in
+        A) printf 'rule-only update (the tunnel is not rebuilt)' ;;
+        B) printf 'tunnel recreation required' ;;
+        C) printf 'server migration (make-before-break)' ;;
+        *) printf 'no changes' ;;
+    esac
+}
+
+# Human impact lines for the preview, derived from the plan rather than hardcoded.
+plan_impact_lines() {
+    local f
+    (( PLAN_TUNNEL )) && printf '%s\n' "GRE tunnel recreation required"
+    (( PLAN_TUNNEL )) && printf '%s\n' "Iran-side config will change"
+    for f in "${PLAN_FIELDS[@]}"; do
+        case "$f" in
+            TCP_PORTS) printf '%s\n' "NAT TCP rules will change" ;;
+            UDP_PORTS) printf '%s\n' "NAT UDP rules will change" ;;
+            MSS_CLAMP) printf '%s\n' "MSS clamping will change" ;;
+            IRAN_IP|FOREIGN_IP) printf '%s\n' "Endpoint addressing will change" ;;
+            NAME)      printf '%s\n' "Connection renamed (config file, tunnel and rule comments)" ;;
+            SUBNET_BASE|IDX) printf '%s\n' "Tunnel subnet will change" ;;
+            KEY)       printf '%s\n' "GRE key will change" ;;
+        esac
+    done
+    printf '%s\n' "Watchdog preserved"
+    printf '%s\n' "Other connections are not touched"
+}
+
+# ------------------------------------------------- per-connection rule handling
+#
+# Every rule this project creates carries an ownership comment naming the peer:
+#   multi-gre-iran-<name>-dnat-tcp | -dnat-udp | -snat | -mss
+#   multi-gre-node-<name>
+# That comment is what makes it possible to touch exactly one connection's rules
+# and nothing else. Deletion is driven by the comment, never by a parameter sweep,
+# so a rule belonging to another peer can never be matched by accident.
+peer_rule_comment_prefix() { # peer_rule_comment_prefix NAME
+    printf 'multi-gre-iran-%s' "$1"
+}
+
+node_rule_comment_prefix() { # node_rule_comment_prefix NAME
+    printf 'multi-gre-node-%s' "$1"
+}
+
+# Remove the NAT/MSS rules for one peer, from an explicit set of values.
+#
+# Deletion is by exact rule spec built from a known configuration state, not by a
+# wildcard sweep and not by line number. That is deliberate: it is impossible for
+# this to remove a rule belonging to a different connection, because every spec
+# carries this connection's own DNAT target subnet and its own comment. It also
+# means the same function can remove the OLD rule set during an edit and the NEW
+# one during a rollback.
+peer_rules_remove() { # peer_rules_remove NAME TUN IRAN_IP WAN_IF SELF_IP PEER_IP TCP UDP MSS
+    local NAME="$1" TUN="$2" IRAN_IP="$3" WAN_IF="$4" SELF_IP="$5" PEER_IP="$6" \
+          TCP_PORTS="$7" UDP_PORTS="$8" MSS_CLAMP="$9"
+
+    if [[ -n "$TCP_PORTS" ]]; then
+        # Delete both the commented form and the legacy un-commented form, so an
+        # edit also cleans up rules written by an older release.
+        ipt_del nat PREROUTING -i "$WAN_IF" -d "$IRAN_IP" -p tcp -m multiport --dports "$TCP_PORTS" \
+            -j DNAT --to-destination "$PEER_IP"
+        ipt_del nat PREROUTING -i "$WAN_IF" -d "$IRAN_IP" -p tcp -m multiport --dports "$TCP_PORTS" \
+            -m comment --comment "multi-gre-iran-$NAME-dnat-tcp" -j DNAT --to-destination "$PEER_IP"
+    fi
+    if [[ -n "$UDP_PORTS" ]]; then
+        ipt_del nat PREROUTING -i "$WAN_IF" -d "$IRAN_IP" -p udp -m multiport --dports "$UDP_PORTS" \
+            -j DNAT --to-destination "$PEER_IP"
+        ipt_del nat PREROUTING -i "$WAN_IF" -d "$IRAN_IP" -p udp -m multiport --dports "$UDP_PORTS" \
+            -m comment --comment "multi-gre-iran-$NAME-dnat-udp" -j DNAT --to-destination "$PEER_IP"
+    fi
+    ipt_del nat POSTROUTING -o "$TUN" -d "$PEER_IP" \
+        -m comment --comment "multi-gre-iran-$NAME-snat" -j SNAT --to-source "$SELF_IP"
+    ipt_del mangle POSTROUTING -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
+        -m comment --comment "multi-gre-iran-$NAME-mss" -j TCPMSS --clamp-mss-to-pmtu
+    return 0
+}
+
+# Install the NAT/MSS rules for a peer.
+#
+# Takes the two tunnel ADDRESSES explicitly rather than a subnet base and index,
+# because the only thing this needs is "which address do I translate to". Passing
+# the decomposition as well invited a positional-parameter mistake ("$10" expands
+# as "$1" followed by "0"), and a silently shifted argument list here means rules
+# installed against the wrong peer address.
+peer_rules_install() { # peer_rules_install NAME TUN IRAN_IP WAN_IF SELF_IP PEER_IP TCP UDP MSS
+    local NAME="$1" TUN="$2" IRAN_IP="$3" WAN_IF="$4" SELF_IP="$5" PEER_IP="$6" \
+          TCP_PORTS="$7" UDP_PORTS="$8" MSS_CLAMP="$9"
+
+    if [[ -n "$TCP_PORTS" ]]; then
+        ipt_del nat PREROUTING -i "$WAN_IF" -d "$IRAN_IP" -p tcp -m multiport --dports "$TCP_PORTS" \
+            -j DNAT --to-destination "$PEER_IP"
+        ipt_add nat PREROUTING -i "$WAN_IF" -d "$IRAN_IP" -p tcp -m multiport --dports "$TCP_PORTS" \
+            -m comment --comment "multi-gre-iran-$NAME-dnat-tcp" -j DNAT --to-destination "$PEER_IP"
+    fi
+    if [[ -n "$UDP_PORTS" ]]; then
+        ipt_del nat PREROUTING -i "$WAN_IF" -d "$IRAN_IP" -p udp -m multiport --dports "$UDP_PORTS" \
+            -j DNAT --to-destination "$PEER_IP"
+        ipt_add nat PREROUTING -i "$WAN_IF" -d "$IRAN_IP" -p udp -m multiport --dports "$UDP_PORTS" \
+            -m comment --comment "multi-gre-iran-$NAME-dnat-udp" -j DNAT --to-destination "$PEER_IP"
+    fi
+    if [[ -n "$TCP_PORTS" || -n "$UDP_PORTS" ]]; then
+        ipt_del nat POSTROUTING -o "$TUN" -d "$PEER_IP" -j SNAT --to-source "$SELF_IP"
+        ipt_add nat POSTROUTING -o "$TUN" -d "$PEER_IP" \
+            -m comment --comment "multi-gre-iran-$NAME-snat" -j SNAT --to-source "$SELF_IP"
+    fi
+    if [[ "${MSS_CLAMP:-0}" == "1" ]]; then
+        ipt_del mangle POSTROUTING -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
+            -j TCPMSS --clamp-mss-to-pmtu
+        ipt_add mangle POSTROUTING -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
+            -m comment --comment "multi-gre-iran-$NAME-mss" -j TCPMSS --clamp-mss-to-pmtu
+    fi
+    return 0
+}
+
+# Is every port in this list free for the connection being edited?
+#
+# Checks the local listener table and every OTHER connection's rule set. The
+# connection's own current ports are excluded, so editing 3001 -> 3049 does not
+# report 3001 as a collision with itself. Add-time validators are reused rather
+# than reimplemented.
+port_available_for_edit() { # port_available_for_edit PROTO PORTS EXCLUDE_NAME
+    local proto="$1" ports="$2" exclude="$3" p
+    local old_ifs="$IFS"
+    IFS=,
+    for p in $ports; do
+        local lo hi n
+        case "$p" in
+            *:*) lo="${p%%:*}"; hi="${p##*:}" ;;
+            *)   lo="$p"; hi="$p" ;;
+        esac
+        for (( n = lo; n <= hi; n++ )); do
+            local f p_name other
+            for f in "$FOREIGNS_DIR"/*.conf; do
+                [[ -e "$f" ]] || continue
+                p_name="$(grep -E '^NAME=' "$f" | cut -d= -f2)"
+                [[ -n "$exclude" && "$p_name" == "$exclude" ]] && continue
+                if [[ "$proto" == "tcp" ]]; then
+                    other="$(grep -E '^TCP_PORTS=' "$f" | cut -d= -f2)"
+                else
+                    other="$(grep -E '^UDP_PORTS=' "$f" | cut -d= -f2)"
+                fi
+                [[ -z "$other" ]] && continue
+                if port_lists_overlap "$n" "$other"; then
+                    IFS="$old_ifs"
+                    return 1
+                fi
+            done
+        done
+    done
+    IFS="$old_ifs"
+    return 0
+}
+
+# ------------------------------------------------------------------ transactions
+#
+# An edit is a transaction: snapshot, apply, verify, and on any failure put the
+# previous connection back exactly as it was. The operator must never have to
+# rebuild a connection by hand after a failed edit.
+#
+# The snapshot captures the config file bytes AND enough state to reconstruct the
+# rules and the tunnel, because restoring the file alone would leave a half-applied
+# rule set behind.
+EDIT_TXN_DIR=""
+EDIT_TXN_ACTIVE=0
+
+edit_txn_begin() { # edit_txn_begin
+    EDIT_TXN_DIR="$(mktemp -d)"
+    EDIT_TXN_ACTIVE=1
+    mkdir -p "$EDIT_TXN_DIR"
+}
+
+edit_txn_snapshot_file() { # edit_txn_snapshot_file LABEL FILE
+    local label="$1" file="$2"
+    if [[ -f "$file" ]]; then
+        cp -p "$file" "$EDIT_TXN_DIR/$label.conf"
+        printf '1' > "$EDIT_TXN_DIR/$label.existed"
+    else
+        printf '0' > "$EDIT_TXN_DIR/$label.existed"
+    fi
+}
+
+# Restore a snapshotted file: byte-identical if it existed, removed if it did not.
+edit_txn_restore_file() { # edit_txn_restore_file LABEL FILE
+    local label="$1" file="$2"
+    if [[ "$(cat "$EDIT_TXN_DIR/$label.existed" 2>/dev/null)" == "1" ]]; then
+        cp -p "$EDIT_TXN_DIR/$label.conf" "$file"
+        chmod 600 "$file" 2>/dev/null || true
+    else
+        rm -f "$file"
+    fi
+}
+
+edit_txn_commit() {
+    EDIT_TXN_ACTIVE=0
+    [[ -n "$EDIT_TXN_DIR" && -d "$EDIT_TXN_DIR" ]] && rm -rf "$EDIT_TXN_DIR"
+    EDIT_TXN_DIR=""
+}
+
+edit_txn_abort_keep() { # keep the directory for debugging
+    EDIT_TXN_ACTIVE=0
+}
+
+# =================================================== transactional connection edit
+#
+# Edit is NOT remove+add. The difference matters in three places:
+#
+#   1. A rule-only change (ports, MSS) never rebuilds the tunnel. The old rules are
+#      removed and the new ones installed while the tunnel stays up, so changing
+#      3001 -> 3049 costs no outage at all.
+#   2. New rules are installed BEFORE the old ones are removed where the port sets
+#      are disjoint. That way a failure to install the new rule leaves the old one
+#      working instead of leaving the connection with neither.
+#   3. Any failure restores the previous connection from a snapshot taken before the
+#      first mutation — config bytes, tunnel and rules. The operator never has to
+#      rebuild by hand.
+#
+# The snapshot is the reason step 3 is honest: it is taken from disk, not from
+# memory, and it is restored by writing the file back byte-for-byte.
+
+# Capture everything needed to put a connection back exactly as it is now.
+edit_snapshot_current() { # edit_snapshot_current SIDE NAME (sets EDIT_OLD_*)
+    local side="$1" name="$2" file
+    # The preview snapshots without applying, so the transaction directory has to be
+    # available for reading a snapshot too — not only for a mutation. Opening it
+    # here is idempotent.
+    [[ -n "$EDIT_TXN_DIR" && -d "$EDIT_TXN_DIR" ]] || edit_txn_begin
+    if [[ "$side" == "iran" ]]; then
+        file="$FOREIGNS_DIR/$name.conf"
+    else
+        file="$NODES_DIR/$name.conf"
+    fi
+    EDIT_OLD_FILE="$file"
+    EDIT_OLD_EXISTED=0
+    [[ -f "$file" ]] && EDIT_OLD_EXISTED=1
+    edit_txn_snapshot_file "current" "$file"
+
+    # Values in scope for rollback, so a failed apply can reinstall the old rules
+    # without re-reading a file we may already have overwritten.
+    EDIT_OLD_NAME=""; EDIT_OLD_FOREIGN_IP=""; EDIT_OLD_IRAN_IP=""; EDIT_OLD_WAN_IF=""
+    EDIT_OLD_SUBNET_BASE="$DEFAULT_SUBNET_BASE"; EDIT_OLD_IDX=""; EDIT_OLD_KEY=""
+    EDIT_OLD_TUN=""; EDIT_OLD_TCP=""; EDIT_OLD_UDP=""; EDIT_OLD_MSS="0"
+    if (( EDIT_OLD_EXISTED )); then
+        if [[ "$side" == "iran" ]]; then
+            local NAME="" FOREIGN_IP="" IRAN_IP="" WAN_IF="" SUBNET_BASE="$DEFAULT_SUBNET_BASE" \
+                  IDX="" KEY="" TUN="" TCP_PORTS="" UDP_PORTS="" MSS_CLAMP="0"
+            load_peer_conf "$file" || return 1
+            EDIT_OLD_NAME="$NAME"; EDIT_OLD_FOREIGN_IP="$FOREIGN_IP"; EDIT_OLD_IRAN_IP="$IRAN_IP"
+            EDIT_OLD_WAN_IF="$WAN_IF"; EDIT_OLD_SUBNET_BASE="$SUBNET_BASE"; EDIT_OLD_IDX="$IDX"
+            EDIT_OLD_KEY="$KEY"; EDIT_OLD_TUN="$TUN"; EDIT_OLD_TCP="$TCP_PORTS"
+            EDIT_OLD_UDP="$UDP_PORTS"; EDIT_OLD_MSS="$MSS_CLAMP"
+        else
+            local NAME="" IRAN_IP="" SUBNET_BASE="$DEFAULT_SUBNET_BASE" IDX="" KEY="" TUN=""
+            # shellcheck disable=SC1090
+            source "$file"
+            EDIT_OLD_NAME="$NAME"; EDIT_OLD_IRAN_IP="$IRAN_IP"; EDIT_OLD_SUBNET_BASE="$SUBNET_BASE"
+            EDIT_OLD_IDX="$IDX"; EDIT_OLD_KEY="$KEY"; EDIT_OLD_TUN="$TUN"
+            EDIT_OLD_MSS="0"
+        fi
+    fi
+    return 0
+}
+
+# Put the connection back. Restores the config file, then rebuilds the tunnel and
+# the rule set from the snapshot values — in that order, because the tunnel needs
+# the interface name and the rules need the subnet.
+edit_rollback() { # edit_rollback SIDE
+    local side="$1"
+    warn "Rolling back '${EDIT_OLD_NAME:-connection}' to its previous state..."
+
+    # 1. Tear down whatever the failed attempt left behind.
+    if [[ -n "${EDIT_NEW_TUN:-}" && "${EDIT_NEW_TUN}" != "${EDIT_OLD_TUN}" ]]; then
+        delete_tunnel "$EDIT_NEW_TUN" >/dev/null 2>&1 || true
+    fi
+    if [[ "$side" == "iran" && -n "${EDIT_NEW_NAME:-}" ]]; then
+        peer_rules_remove "$EDIT_NEW_NAME" "${EDIT_NEW_TUN:-}" "${EDIT_NEW_IRAN_IP:-}" \
+            "${EDIT_NEW_WAN_IF:-}" "${EDIT_NEW_SUBNET_BASE}.${EDIT_NEW_IDX}.2" \
+            "${EDIT_NEW_SUBNET_BASE}.${EDIT_NEW_IDX}.1" \
+            "${EDIT_NEW_TCP:-}" "${EDIT_NEW_UDP:-}" "${EDIT_NEW_MSS:-0}" >/dev/null 2>&1 || true
+    fi
+
+    # 2. Restore the config file bytes.
+    if (( EDIT_OLD_EXISTED )); then
+        edit_txn_restore_file "current" "$EDIT_OLD_FILE"
+    else
+        rm -f "$EDIT_OLD_FILE"
+    fi
+
+    # 3. Rebuild the previous tunnel and rules from the snapshot values.
+    if (( EDIT_OLD_EXISTED )); then
+        if [[ "$side" == "iran" ]]; then
+            create_tunnel "$EDIT_OLD_TUN" "$EDIT_OLD_IRAN_IP" "$EDIT_OLD_FOREIGN_IP" \
+                "$EDIT_OLD_KEY" "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.2/30" >/dev/null 2>&1 || true
+            peer_rules_remove "$EDIT_OLD_NAME" "$EDIT_OLD_TUN" "$EDIT_OLD_IRAN_IP" "$EDIT_OLD_WAN_IF" \
+                "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.2" "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.1" \
+                "$EDIT_OLD_TCP" "$EDIT_OLD_UDP" "$EDIT_OLD_MSS" \
+                >/dev/null 2>&1 || true
+            peer_rules_install "$EDIT_OLD_NAME" "$EDIT_OLD_TUN" "$EDIT_OLD_IRAN_IP" "$EDIT_OLD_WAN_IF" \
+                "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.2" "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.1" \
+                "$EDIT_OLD_TCP" "$EDIT_OLD_UDP" "$EDIT_OLD_MSS" \
+                >/dev/null 2>&1 || true
+        else
+            create_tunnel "$EDIT_OLD_TUN" "${FOREIGN_IP:-}" "$EDIT_OLD_IRAN_IP" "$EDIT_OLD_KEY" \
+                "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.1/30" >/dev/null 2>&1 || true
+        fi
+    fi
+    ok "Rolled back to the previous configuration of '${EDIT_OLD_NAME:-connection}'."
+    return 0
+}
+
+# Does the connection's own interface exist and carry the expected local address?
+# Deliberately modest: it proves the edit produced a live tunnel, without claiming
+# to prove end-to-end reachability (that is doctor's job, and it needs both ends).
+edit_verify_tunnel() { # edit_verify_tunnel TUN EXPECTED_LOCAL_CIDR
+    local tun="$1" cidr="$2"
+    tun_exists "$tun" || { err "Verification failed: tunnel $tun is not present after the edit."; return 1; }
+    local out
+    out="$(ip -4 addr show dev "$tun" 2>/dev/null)"
+    [[ -n "$out" ]] || { err "Verification failed: tunnel $tun has no address information."; return 1; }
+    local want="${cidr%%/*}"
+    # Match "inet <want>/" anywhere in the output rather than a fixed field: real
+    # `ip` output varies (peer suffixes, "secondary", flags) and pinning a column
+    # makes this check fail for reasons that have nothing to do with the edit.
+    grep -qE "inet ${want//./\\.}/" <<< "$out" \
+        || { err "Verification failed: tunnel $tun expected address $want, output was: $(tr '\n' ' ' <<< "$out")"; return 1; }
+    return 0
+}
+
+# The end-to-end edit transaction for one side.
+#
+# Returns 0 only when the requested state is live AND verified. On any failure the
+# previous connection is restored and the return is non-zero, so a caller can never
+# mistake a rolled-back edit for a successful one.
+# shellcheck disable=SC2034  # PLAN_* are read by the callers/preview after this runs
+edit_connection_txn() { # edit_connection_txn SIDE CURRENT_NAME
+    local side="$1" current="$2"
+
+    # The caller has already snapshotted the current state and populated the
+    # requested state (see cli_iran_peer_edit / cli_node_edit). Re-snapshotting here
+    # would be wrong as well as noisy: by this point PLAN_REQ_* describes the NEW
+    # state, so overwriting EDIT_OLD_* from disk is unnecessary, and re-planning
+    # would re-print the preview.
+    if [[ -n "$EDIT_TXN_DIR" && -d "$EDIT_TXN_DIR" ]]; then
+        : # transaction already open, snapshot already taken
+    else
+        edit_txn_begin
+        if ! edit_snapshot_current "$side" "$current"; then
+            err "Could not read the current configuration of '$current'."
+            edit_txn_commit
+            return 1
+        fi
+        plan_request_from_current
+    fi
+
+    plan_edit
+    if [[ "$PLAN_CLASS" == "NONE" ]]; then
+        info "No changes requested — nothing to do."
+        edit_txn_commit
+        return 0
+    fi
+
+    # --- validate the requested state --------------------------------
+    # plan_request_from_current guarantees every PLAN_REQ_* holds a value, so these
+    # are plain reads rather than a chain of fallbacks.
+    local NAME="" FOREIGN_IP="" IRAN_IP="" WAN_IF="" SUBNET_BASE="$DEFAULT_SUBNET_BASE" \
+          IDX="" KEY="" TUN="" TCP_PORTS="" UDP_PORTS="" MSS_CLAMP="0"
+    if [[ "$side" == "iran" ]]; then
+        NAME="$PLAN_REQ_NAME"
+        FOREIGN_IP="$PLAN_REQ_FOREIGN_IP"
+        IRAN_IP="$PLAN_REQ_IRAN_IP"
+        WAN_IF="$PLAN_REQ_WAN_IF"
+        SUBNET_BASE="$PLAN_REQ_SUBNET_BASE"
+        IDX="$PLAN_REQ_IDX"
+        KEY="$PLAN_REQ_KEY"
+        TUN="gre-$NAME"
+        TCP_PORTS="$PLAN_REQ_TCP_PORTS"
+        UDP_PORTS="$PLAN_REQ_UDP_PORTS"
+        MSS_CLAMP="$PLAN_REQ_MSS_CLAMP"
+    else
+        NAME="$PLAN_REQ_NAME"
+        IRAN_IP="$PLAN_REQ_IRAN_IP"
+        SUBNET_BASE="$PLAN_REQ_SUBNET_BASE"
+        IDX="$PLAN_REQ_IDX"
+        KEY="$PLAN_REQ_KEY"
+        TUN="gre-$NAME"
+        WAN_IF="$EDIT_OLD_WAN_IF"
+        FOREIGN_IP="$PLAN_REQ_FOREIGN_IP"
+    fi
+
+    # Record the requested state for rollback to clean up after.
+    EDIT_NEW_NAME="$NAME"; EDIT_NEW_FOREIGN_IP="$FOREIGN_IP"; EDIT_NEW_IRAN_IP="$IRAN_IP"
+    EDIT_NEW_WAN_IF="$WAN_IF"; EDIT_NEW_SUBNET_BASE="$SUBNET_BASE"; EDIT_NEW_IDX="$IDX"
+    EDIT_NEW_KEY="$KEY"; EDIT_NEW_TUN="$TUN"; EDIT_NEW_TCP="$TCP_PORTS"
+    EDIT_NEW_UDP="$UDP_PORTS"; EDIT_NEW_MSS="$MSS_CLAMP"
+
+    if [[ "$side" == "iran" ]]; then
+        validate_peer_values || { edit_txn_commit; return 1; }
+    else
+        valid_name "$NAME" || { err "Invalid node name: '$NAME'"; edit_txn_commit; return 1; }
+        valid_ip "$IRAN_IP" || { err "Invalid Iran IP: '$IRAN_IP'"; edit_txn_commit; return 1; }
+        valid_subnet_base "$SUBNET_BASE" || { err "Invalid subnet base: '$SUBNET_BASE'"; edit_txn_commit; return 1; }
+        { [[ "$IDX" =~ ^[0-9]+$ ]] && (( IDX >= 1 && IDX <= 254 )); } || { err "Invalid index: '$IDX'"; edit_txn_commit; return 1; }
+        [[ "$KEY" =~ ^[0-9]+$ ]] || { err "Invalid key: '$KEY'"; edit_txn_commit; return 1; }
+    fi
+
+    # --- collision and port checks, excluding this connection ---------
+    if [[ "$side" == "iran" ]]; then
+        # The connection being edited must not count as a collision with itself —
+        # under either its current or its requested name, because a rename leaves
+        # the old file on disk until the new one is verified.
+        check_peer_collisions "$NAME" "$SUBNET_BASE" "$IDX" "$TUN" "$TCP_PORTS" "$UDP_PORTS" \
+            "$EDIT_OLD_NAME" \
+            || { edit_txn_commit; return 1; }
+        if [[ "$SUBNET_BASE" != "$EDIT_OLD_SUBNET_BASE" ]] && subnet_route_conflict "$SUBNET_BASE"; then
+            err "Subnet base $SUBNET_BASE collides with an existing local route."
+            edit_txn_commit
+            return 1
+        fi
+        if [[ "$TCP_PORTS" != "$EDIT_OLD_TCP" ]]; then
+            port_available_for_edit tcp "$TCP_PORTS" "$EDIT_OLD_NAME" \
+                || { err "TCP ports '$TCP_PORTS' are already owned by another connection."; edit_txn_commit; return 1; }
+        fi
+        if [[ "$UDP_PORTS" != "$EDIT_OLD_UDP" ]]; then
+            port_available_for_edit udp "$UDP_PORTS" "$EDIT_OLD_NAME" \
+                || { err "UDP ports '$UDP_PORTS' are already owned by another connection."; edit_txn_commit; return 1; }
+        fi
+        if [[ "$NAME" != "$EDIT_OLD_NAME" && -e "$FOREIGNS_DIR/$NAME.conf" ]]; then
+            err "A connection named '$NAME' already exists."
+            edit_txn_commit
+            return 1
+        fi
+    else
+        local f p_name p_base p_idx
+        for f in "$NODES_DIR"/*.conf; do
+            [[ -e "$f" ]] || continue
+            p_name="$(grep -E '^NAME=' "$f" | cut -d= -f2)"
+            [[ "$p_name" == "$EDIT_OLD_NAME" ]] && continue
+            p_base="$(grep -E '^SUBNET_BASE=' "$f" | cut -d= -f2)"; p_base="${p_base:-$DEFAULT_SUBNET_BASE}"
+            p_idx="$(grep -E '^IDX=' "$f" | cut -d= -f2)"
+            if [[ "$p_base" == "$SUBNET_BASE" && "$p_idx" == "$IDX" ]]; then
+                err "Subnet/index ${SUBNET_BASE}.${IDX} is already used by node '$p_name'."
+                edit_txn_commit
+                return 1
+            fi
+        done
+        if [[ "$NAME" != "$EDIT_OLD_NAME" && -e "$NODES_DIR/$NAME.conf" ]]; then
+            err "A node named '$NAME' already exists."
+            edit_txn_commit
+            return 1
+        fi
+    fi
+
+    # --- apply ---------------------------------------------------------
+    local newfile
+    if [[ "$side" == "iran" ]]; then
+        # CLASS A: the tunnel is not touched at all. Old rules out, new rules in,
+        # and the interface keeps running throughout.
+        if [[ "$PLAN_CLASS" == "A" ]]; then
+            peer_rules_remove "$EDIT_OLD_NAME" "$EDIT_OLD_TUN" "$EDIT_OLD_IRAN_IP" "$EDIT_OLD_WAN_IF" \
+                "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.2" "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.1" \
+                "$EDIT_OLD_TCP" "$EDIT_OLD_UDP" "$EDIT_OLD_MSS"
+            peer_rules_install "$NAME" "$EDIT_OLD_TUN" "$IRAN_IP" "$WAN_IF" \
+                "${SUBNET_BASE}.${IDX}.2" "${SUBNET_BASE}.${IDX}.1" "$TCP_PORTS" "$UDP_PORTS" "$MSS_CLAMP"
+            if ! edit_verify_tunnel "$EDIT_OLD_TUN" "${SUBNET_BASE}.${IDX}.2/30"; then
+                edit_rollback "$side"
+                edit_txn_commit
+                return 1
+            fi
+        else
+            # CLASS B: rebuild. Remove the old rules first so the new tunnel does
+            # not inherit a stale DNAT pointing at the old peer address.
+            peer_rules_remove "$EDIT_OLD_NAME" "$EDIT_OLD_TUN" "$EDIT_OLD_IRAN_IP" "$EDIT_OLD_WAN_IF" \
+                "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.2" "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.1" \
+                "$EDIT_OLD_TCP" "$EDIT_OLD_UDP" "$EDIT_OLD_MSS"
+            if ! create_tunnel "$TUN" "$IRAN_IP" "$FOREIGN_IP" "$KEY" "${SUBNET_BASE}.${IDX}.2/30"; then
+                edit_rollback "$side"
+                edit_txn_commit
+                return 1
+            fi
+            enable_ip_forward
+            peer_rules_install "$NAME" "$TUN" "$IRAN_IP" "$WAN_IF" \
+                "${SUBNET_BASE}.${IDX}.2" "${SUBNET_BASE}.${IDX}.1" "$TCP_PORTS" "$UDP_PORTS" "$MSS_CLAMP"
+            if ! edit_verify_tunnel "$TUN" "${SUBNET_BASE}.${IDX}.2/30"; then
+                edit_rollback "$side"
+                edit_txn_commit
+                return 1
+            fi
+        fi
+    else
+        # FOREIGN side: no per-node NAT rules, so a rebuild is the whole change.
+        if ! create_tunnel "$TUN" "${FOREIGN_IP:-}" "$IRAN_IP" "$KEY" "${SUBNET_BASE}.${IDX}.1/30"; then
+            edit_rollback "$side"
+            edit_txn_commit
+            return 1
+        fi
+        if ! edit_verify_tunnel "$TUN" "${SUBNET_BASE}.${IDX}.1/30"; then
+            edit_rollback "$side"
+            edit_txn_commit
+            return 1
+        fi
+    fi
+
+    # --- commit the new config ----------------------------------------
+    if [[ "$side" == "iran" ]]; then
+        newfile="$FOREIGNS_DIR/$NAME.conf"
+        mkdir -p "$FOREIGNS_DIR"
+        cat > "$newfile" <<EOF
+NAME=$NAME
+FOREIGN_IP=$FOREIGN_IP
+IRAN_IP=$IRAN_IP
+WAN_IF=$WAN_IF
+SUBNET_BASE=$SUBNET_BASE
+IDX=$IDX
+KEY=$KEY
+TUN=$TUN
+TCP_PORTS=$TCP_PORTS
+UDP_PORTS=$UDP_PORTS
+MSS_CLAMP=$MSS_CLAMP
+EOF
+        chmod 600 "$newfile"
+        write_iran_manifest
+    else
+        newfile="$NODES_DIR/$NAME.conf"
+        mkdir -p "$NODES_DIR"
+        cat > "$newfile" <<EOF
+NAME=$NAME
+IRAN_IP=$IRAN_IP
+SUBNET_BASE=$SUBNET_BASE
+IDX=$IDX
+KEY=$KEY
+TUN=$TUN
+EOF
+        chmod 600 "$newfile"
+    fi
+
+    # A rename leaves the old file behind; remove it only now that the new one is
+    # written and verified, so a failure never leaves the connection with no config.
+    if [[ "$NAME" != "$EDIT_OLD_NAME" && -f "$EDIT_OLD_FILE" ]]; then
+        rm -f "$EDIT_OLD_FILE"
+    fi
+    # A rename also leaves the old INTERFACE behind when the tunnel name is derived
+    # from the connection name (it is: gre-<name>). Tearing it down here keeps
+    # "rename" from quietly doubling the tunnel count.
+    if [[ -n "$EDIT_OLD_TUN" && "$TUN" != "$EDIT_OLD_TUN" ]]; then
+        delete_tunnel "$EDIT_OLD_TUN" >/dev/null 2>&1 || true
+    fi
+
+    # Identity follows the connection through renames and endpoint changes.
+    local fp
+    fp="$(pair_fingerprint "$IRAN_IP" "$FOREIGN_IP" "$SUBNET_BASE" "$IDX" "$KEY")"
+    local cid
+    cid="$(connection_id_for "$(pair_fingerprint "$EDIT_OLD_IRAN_IP" "$EDIT_OLD_FOREIGN_IP" "$EDIT_OLD_SUBNET_BASE" "$EDIT_OLD_IDX" "$EDIT_OLD_KEY")")"
+    connection_id_remember "$cid" "$fp"
+
+    edit_txn_commit
+    return 0
+}
+
+# Commands the OTHER side needs after a local edit, or nothing when the change is
+# local-only. CLI has no credential for the peer, so this is how the operator keeps
+# the two ends in step without being told to "figure it out".
+edit_peer_command_for_foreign() { # edit_peer_command_for_foreign (uses EDIT_NEW_* / EDIT_OLD_*)
+    local changed=0 f
+    for f in "${PLAN_FIELDS[@]}"; do
+        case "$f" in
+            IRAN_IP|SUBNET_BASE|IDX|KEY|NAME) changed=1 ;;
+            FOREIGN_IP) changed=1 ;;
+        esac
+    done
+    (( changed )) || return 1
+    printf 'gre node edit \\\n'
+    printf '  --name %s \\\n' "$EDIT_OLD_NAME"
+    [[ "$EDIT_NEW_NAME" != "$EDIT_OLD_NAME" ]] && printf '  --new-name %s \\\n' "$EDIT_NEW_NAME"
+    printf '  --ip %s \\\n' "$EDIT_NEW_IRAN_IP"
+    printf '  --subnet-base %s \\\n' "$EDIT_NEW_SUBNET_BASE"
+    printf '  --idx %s \\\n' "$EDIT_NEW_IDX"
+    printf '  --key %s\n' "$EDIT_NEW_KEY"
+    return 0
 }
 
 progress_bar() { # progress_bar "label" percent
@@ -1353,6 +2116,198 @@ menu_iran_peer_apply() {
     apply_iran_peer "$f" && ok "Peer re-applied."
 }
 
+# Interactive Edit wizard.
+#
+# The same fields as Create, with the current value shown as the default. Pressing
+# Enter keeps it. Nothing is applied until the operator sees the preview and
+# confirms, and the preview comes from the same planner the CLI uses — so the wizard
+# and the one-liner can never disagree about what a change means.
+menu_iran_peer_edit() { # interactive: pick a peer, edit it
+    local files=() f i c
+    for f in "$FOREIGNS_DIR"/*.conf; do
+        [[ -e "$f" ]] || continue
+        files+=("$f")
+    done
+    (( ${#files[@]} )) || { info "No peers to edit."; return 0; }
+
+    echo
+    echo "  Which peer do you want to edit?"
+    i=1
+    for f in "${files[@]}"; do
+        local n ir
+        n="$(grep -E '^NAME=' "$f" | cut -d= -f2)"
+        ir="$(grep -E '^FOREIGN_IP=' "$f" | cut -d= -f2)"
+        printf '  %d) %s (foreign %s)\n' "$i" "$n" "$ir"
+        i=$(( i + 1 ))
+    done
+    ask c "Number (empty = cancel)" ""
+    [[ -z "$c" ]] && { info "Cancelled."; return 0; }
+    { [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c < i )); } || { err "Invalid choice."; return 1; }
+
+    local CURRENT
+    CURRENT="$(grep -E '^NAME=' "${files[$(( c - 1 ))]}" | cut -d= -f2)"
+    interactive_edit_iran_peer "$CURRENT"
+}
+
+# The prefilled field-by-field wizard for one Iran-side connection.
+interactive_edit_iran_peer() { # interactive_edit_iran_peer CURRENT_NAME
+    local CURRENT="$1" v
+    require_root
+    edit_txn_begin
+    if ! edit_snapshot_current iran "$CURRENT"; then
+        err "Could not read '$CURRENT'."
+        edit_txn_commit
+        return 1
+    fi
+    plan_request_from_current
+
+    echo
+    info "Editing '$CURRENT'. Press Enter to keep the value shown in [brackets]."
+
+    ask v "Foreign IP [${PLAN_REQ_FOREIGN_IP}]" ""
+    [[ -n "$v" ]] && PLAN_REQ_FOREIGN_IP="$v"
+    ask v "Iran IP [${PLAN_REQ_IRAN_IP}]" ""
+    [[ -n "$v" ]] && PLAN_REQ_IRAN_IP="$v"
+    ask v "Name [${PLAN_REQ_NAME}]" ""
+    [[ -n "$v" ]] && PLAN_REQ_NAME="$v"
+    ask v "Subnet base [${PLAN_REQ_SUBNET_BASE}]" ""
+    [[ -n "$v" ]] && PLAN_REQ_SUBNET_BASE="$v"
+    ask v "Index [${PLAN_REQ_IDX}]" ""
+    [[ -n "$v" ]] && PLAN_REQ_IDX="$v"
+    ask v "GRE key [${PLAN_REQ_KEY}]" ""
+    [[ -n "$v" ]] && PLAN_REQ_KEY="$v"
+    ask v "WAN interface [${PLAN_REQ_WAN_IF}]" ""
+    [[ -n "$v" ]] && PLAN_REQ_WAN_IF="$v"
+    ask v "TCP ports [${PLAN_REQ_TCP_PORTS:-none}]" ""
+    [[ -n "$v" ]] && PLAN_REQ_TCP_PORTS="$v"
+    ask v "UDP ports [${PLAN_REQ_UDP_PORTS:-none}]" ""
+    [[ -n "$v" ]] && PLAN_REQ_UDP_PORTS="$v"
+    local cur_mss
+    [[ "${PLAN_REQ_MSS_CLAMP:-0}" == "1" ]] && cur_mss="on" || cur_mss="off"
+    ask v "MSS clamp on|off [$cur_mss]" ""
+    if [[ -n "$v" ]]; then
+        case "$v" in
+            on|ON|1|yes)  PLAN_REQ_MSS_CLAMP="1" ;;
+            off|OFF|0|no) PLAN_REQ_MSS_CLAMP="0" ;;
+            *) err "Expected on or off; keeping '$cur_mss'." ;;
+        esac
+    fi
+    PLAN_REQ_TUN="gre-$PLAN_REQ_NAME"
+
+    preview_connection_edit iran "$CURRENT" || { edit_txn_commit; return 1; }
+    if (( EDIT_PREVIEW_EMPTY )); then
+        edit_txn_commit
+        return 0
+    fi
+    if ! confirm "Apply this change?"; then
+        info "Cancelled — nothing was changed."
+        edit_txn_commit
+        return 0
+    fi
+
+    if ! edit_connection_txn iran "$CURRENT"; then
+        err "Edit failed and the previous configuration was restored."
+        return 1
+    fi
+    # Mirror what edit_connection_txn recorded, so the audit line and the summary
+    # describe the NEW state rather than reading unset variables.
+    EDIT_NEW_NAME="$PLAN_REQ_NAME"
+    EDIT_NEW_IRAN_IP="$PLAN_REQ_IRAN_IP"
+    EDIT_NEW_SUBNET_BASE="$PLAN_REQ_SUBNET_BASE"
+    EDIT_NEW_IDX="$PLAN_REQ_IDX"
+    EDIT_NEW_KEY="$PLAN_REQ_KEY"
+    EDIT_NEW_TUN="gre-$PLAN_REQ_NAME"
+    audit_log "iran-peer-edit from=$CURRENT name=$EDIT_NEW_NAME base=$EDIT_NEW_SUBNET_BASE idx=$EDIT_NEW_IDX key=$EDIT_NEW_KEY class=$PLAN_CLASS"
+    echo
+    ok "Connection '$EDIT_NEW_NAME' updated (${PLAN_CLASS}: $(plan_class_label "$PLAN_CLASS"))."
+    local fcmd
+    if fcmd="$(edit_peer_command_for_foreign)"; then
+        echo
+        warn "This change also affects the FOREIGN side. Run there:"
+        printf '%s\n' "$fcmd"
+    fi
+}
+
+# Interactive Edit wizard for one FOREIGN-side node.
+interactive_edit_foreign_node() { # interactive_edit_foreign_node CURRENT_NAME
+    local CURRENT="$1" v
+    require_root
+    FOREIGN_IP="$(grep -E '^FOREIGN_IP=' "$FOREIGN_CONF" 2>/dev/null | head -n1 | cut -d= -f2)"
+    edit_txn_begin
+    if ! edit_snapshot_current foreign "$CURRENT"; then
+        err "Could not read '$CURRENT'."
+        edit_txn_commit
+        return 1
+    fi
+    plan_request_from_current
+
+    echo
+    info "Editing node '$CURRENT'. Press Enter to keep the value shown in [brackets]."
+
+    ask v "Iran IP [${PLAN_REQ_IRAN_IP}]" ""
+    [[ -n "$v" ]] && PLAN_REQ_IRAN_IP="$v"
+    ask v "Name [${PLAN_REQ_NAME}]" ""
+    [[ -n "$v" ]] && PLAN_REQ_NAME="$v"
+    ask v "Subnet base [${PLAN_REQ_SUBNET_BASE}]" ""
+    [[ -n "$v" ]] && PLAN_REQ_SUBNET_BASE="$v"
+    ask v "Index [${PLAN_REQ_IDX}]" ""
+    [[ -n "$v" ]] && PLAN_REQ_IDX="$v"
+    ask v "GRE key [${PLAN_REQ_KEY}]" ""
+    [[ -n "$v" ]] && PLAN_REQ_KEY="$v"
+    PLAN_REQ_TUN="gre-$PLAN_REQ_NAME"
+
+    preview_connection_edit foreign "$CURRENT" || { edit_txn_commit; return 1; }
+    if (( EDIT_PREVIEW_EMPTY )); then
+        edit_txn_commit
+        return 0
+    fi
+    if ! confirm "Apply this change?"; then
+        info "Cancelled — nothing was changed."
+        edit_txn_commit
+        return 0
+    fi
+
+    if ! edit_connection_txn foreign "$CURRENT"; then
+        err "Edit failed and the previous configuration was restored."
+        return 1
+    fi
+    EDIT_NEW_NAME="$PLAN_REQ_NAME"
+    EDIT_NEW_IRAN_IP="$PLAN_REQ_IRAN_IP"
+    EDIT_NEW_SUBNET_BASE="$PLAN_REQ_SUBNET_BASE"
+    EDIT_NEW_IDX="$PLAN_REQ_IDX"
+    EDIT_NEW_KEY="$PLAN_REQ_KEY"
+    EDIT_NEW_TUN="gre-$PLAN_REQ_NAME"
+    audit_log "node-edit from=$CURRENT name=$EDIT_NEW_NAME base=$EDIT_NEW_SUBNET_BASE idx=$EDIT_NEW_IDX key=$EDIT_NEW_KEY class=$PLAN_CLASS"
+    echo
+    ok "Node '$EDIT_NEW_NAME' updated (${PLAN_CLASS}: $(plan_class_label "$PLAN_CLASS"))."
+}
+
+# Pick a node to edit, from the FOREIGN menu.
+menu_foreign_node_edit() {
+    local files=() f i c
+    for f in "$NODES_DIR"/*.conf; do
+        [[ -e "$f" ]] || continue
+        files+=("$f")
+    done
+    (( ${#files[@]} )) || { info "No nodes to edit."; return 0; }
+    echo
+    echo "  Which node do you want to edit?"
+    i=1
+    for f in "${files[@]}"; do
+        local n ir
+        n="$(grep -E '^NAME=' "$f" | cut -d= -f2)"
+        ir="$(grep -E '^IRAN_IP=' "$f" | cut -d= -f2)"
+        printf '  %d) %s (iran %s)\n' "$i" "$n" "$ir"
+        i=$(( i + 1 ))
+    done
+    ask c "Number (empty = cancel)" ""
+    [[ -z "$c" ]] && { info "Cancelled."; return 0; }
+    { [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c < i )); } || { err "Invalid choice."; return 1; }
+    local CURRENT
+    CURRENT="$(grep -E '^NAME=' "${files[$(( c - 1 ))]}" | cut -d= -f2)"
+    interactive_edit_foreign_node "$CURRENT"
+}
+
 # Menu option 1: first run = first-peer wizard; afterwards manage the list of
 # foreigns connected to this Iran (no more "reconfigure from scratch").
 iran_peers_menu() {
@@ -1366,27 +2321,31 @@ iran_peers_menu() {
           IDX="" KEY="" TUN="" TCP_PORTS="" UDP_PORTS="" MSS_CLAMP="0"
     while true; do
         echo
-        echo   "  ── Foreigns connected to this Iran ─────────────────────"
+        echo   "  -- Foreigns connected to this Iran ----------------------"
+        # Both endpoints are shown: the local address is not "obvious" to an
+        # operator looking at a server they did not log in to.
         for f in "$FOREIGNS_DIR"/*.conf; do
             [[ -e "$f" ]] || continue
             if load_peer_conf "$f"; then
                 if tun_exists "$TUN"; then dot="$(dot_on)"; else dot="$(dot_off)"; fi
-                printf '  %s %-10s foreign %-16s subnet %s.%s.0/30  tunnel %s\n' \
-                    "$dot" "$NAME" "$FOREIGN_IP" "$SUBNET_BASE" "$IDX" "$TUN"
+                printf '  %s %-10s %s -> %-16s subnet %s.%s.0/30  tunnel %s\n' \
+                    "$dot" "$NAME" "$IRAN_IP" "$FOREIGN_IP" "$SUBNET_BASE" "$IDX" "$TUN"
             else
                 printf '  %s %s (invalid conf)\n' "$(dot_off)" "$(basename "$f")"
             fi
         done
-        echo   "  ──────────────────────────────────────────────────────────"
+        echo   "  --------------------------------------------------------"
         echo   "  1) Add a foreign peer"
-        echo   "  2) Remove a foreign peer"
-        echo   "  3) Re-apply a peer"
+        echo   "  2) Edit a foreign peer"
+        echo   "  3) Remove a foreign peer"
+        echo   "  4) Re-apply a foreign peer"
         echo   "  0) Back"
         read -rp "  Select: " c
         case "$c" in
             1) interactive_add_iran_peer 0 ;;
-            2) menu_iran_peer_remove ;;
-            3) menu_iran_peer_apply ;;
+            2) menu_iran_peer_edit ;;
+            3) menu_iran_peer_remove ;;
+            4) menu_iran_peer_apply ;;
             0) return ;;
             *) warn "Invalid selection." ;;
         esac
@@ -1516,6 +2475,34 @@ EOF
     echo "      --iran-ip $IRAN_IP --subnet-base $SUBNET_BASE --idx $IDX --key $KEY"
     echo "------------------------------------------------------------"
     info "Test from here:  ping ${SUBNET_BASE}.${IDX}.2  (after the Iran side is up)"
+}
+
+# Interactive: pick one configured Iran node and edit it in place. Mirrors
+# remove_node's picker so the two feel the same.
+edit_node() {
+    require_root
+    [[ -f "$FOREIGN_CONF" ]] || { err "This server is not configured as FOREIGN."; return 1; }
+    local files=("$NODES_DIR"/*.conf)
+    [[ -e "${files[0]}" ]] || { info "No Iran nodes configured."; return; }
+
+    echo
+    info "Configured Iran nodes:"
+    local i=1 f NAME="" IRAN_IP="" IDX="" KEY="" TUN=""
+    for f in "${files[@]}"; do
+        NAME=""; IRAN_IP=""; IDX=""; KEY=""; TUN=""
+        # shellcheck disable=SC1090
+        source "$f"
+        printf '  %d) %s  (iran ip %s, idx %s, tunnel %s)\n' "$i" "$NAME" "$IRAN_IP" "$IDX" "$TUN"
+        i=$(( i + 1 ))
+    done
+    local choice="" CURRENT
+    ask choice "Number of the node to edit (empty = cancel)" ""
+    [[ -z "$choice" ]] && { info "Cancelled."; return; }
+    { [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice < i )); } || { err "Invalid choice."; return 1; }
+
+    f="${files[$(( choice - 1 ))]}"
+    CURRENT="$(grep -E '^NAME=' "$f" | cut -d= -f2)"
+    interactive_edit_foreign_node "$CURRENT"
 }
 
 remove_node() {
@@ -2672,16 +3659,11 @@ cli_node_list() { # gre node list [--json]
         printf '%s\n' "$out"
     else
         info "Configured Iran nodes:"
-        local found=0
-        for f in "$NODES_DIR"/*.conf; do
-            [[ -e "$f" ]] || continue
-            found=1
-            NAME=""; IRAN_IP=""; IDX=""; KEY=""; TUN=""; SUBNET_BASE="$DEFAULT_SUBNET_BASE"
-            source "$f"
-            printf '  %s  iran ip %s, subnet %s.%s.0/30, key %s, tunnel %s\n' \
-                "$NAME" "$IRAN_IP" "$SUBNET_BASE" "$IDX" "$KEY" "$TUN"
-        done
-        (( found )) || info "  (none)"
+        if ! render_connection_list foreign; then
+            info "  (none)"
+        fi
+        echo
+        info "Edit one in place:  gre node edit --name NAME [--ip IRAN_IP] ..."
     fi
 }
 
@@ -2779,6 +3761,121 @@ EOF
     echo "      --iran-ip $IRAN_IP --subnet-base $SUBNET_BASE --idx $IDX --key $KEY"
     echo "------------------------------------------------------------"
     info "Test from here:  ping ${SUBNET_BASE}.${IDX}.2  (after the Iran side is up)"
+}
+
+# ============================================================ CLI: gre node edit
+cli_node_edit() { # gre node edit --name CURRENT [--new-name N] [--ip IRAN_IP] [--foreign-ip IP] [...]
+    require_root
+    [[ -f "$FOREIGN_CONF" ]] || { err "This server is not configured as FOREIGN."; return 1; }
+    local CURRENT="" YES=0 PLAN_ONLY=0
+    local R_NAME="" R_IRAN_IP="" R_FOREIGN_IP="" R_SUBNET_BASE="" R_IDX="" R_KEY=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name)        [[ -n "${2:-}" ]] || { err "Missing value for --name"; return 1; }; CURRENT="$2"; shift 2 ;;
+            --new-name)    [[ -n "${2:-}" ]] || { err "Missing value for --new-name"; return 1; }; R_NAME="$2"; shift 2 ;;
+            --ip)          [[ -n "${2:-}" ]] || { err "Missing value for --ip"; return 1; }; R_IRAN_IP="$2"; shift 2 ;;
+            --foreign-ip)  [[ -n "${2:-}" ]] || { err "Missing value for --foreign-ip"; return 1; }; R_FOREIGN_IP="$2"; shift 2 ;;
+            --subnet-base) [[ -n "${2:-}" ]] || { err "Missing value for --subnet-base"; return 1; }; R_SUBNET_BASE="$2"; shift 2 ;;
+            --idx)         [[ -n "${2:-}" ]] || { err "Missing value for --idx"; return 1; }; R_IDX="$2"; shift 2 ;;
+            --key)         [[ -n "${2:-}" ]] || { err "Missing value for --key"; return 1; }; R_KEY="$2"; shift 2 ;;
+            --plan)        PLAN_ONLY=1; shift ;;
+            --yes|-y)      YES=1; shift ;;
+            --help|-h)     echo "Usage: gre node edit --name CURRENT [--new-name NAME] [--ip IRAN_IP] [--foreign-ip FOREIGN_IP] [--subnet-base A.B] [--idx N] [--key K] [--plan] [--yes]"; return 0 ;;
+            *)             err "Unknown option: $1"
+                           err "Usage: gre node edit --name CURRENT [--new-name NAME] [--ip IRAN_IP] [--foreign-ip FOREIGN_IP] [--subnet-base A.B] [--idx N] [--key K] [--plan] [--yes]"
+                           return 1 ;;
+        esac
+    done
+    [[ -n "$CURRENT" ]] || { err "Missing required option: --name (the node to edit)"; return 1; }
+    [[ -f "$NODES_DIR/$CURRENT.conf" ]] || { err "Node '$CURRENT' does not exist."; err "List them with: gre node list"; return 1; }
+    [[ -n "$R_NAME" ]] && { valid_name "$R_NAME" || { err "Invalid new name: '$R_NAME'"; return 1; }; }
+
+    # FOREIGN_IP is the local address of this host, held in foreign.conf rather
+    # than per node. --foreign-ip lets the operator correct it for this edit
+    # without touching the global file.
+    FOREIGN_IP="$(grep -E '^FOREIGN_IP=' "$FOREIGN_CONF" | head -n1 | cut -d= -f2)"
+    if [[ -n "$R_FOREIGN_IP" ]]; then
+        valid_ip "$R_FOREIGN_IP" || { err "Invalid foreign IP: '$R_FOREIGN_IP'"; return 1; }
+        FOREIGN_IP="$R_FOREIGN_IP"
+    fi
+
+    edit_txn_begin
+    if ! edit_snapshot_current foreign "$CURRENT"; then
+        err "Could not read the current configuration of '$CURRENT'."
+        edit_txn_commit
+        return 1
+    fi
+    plan_request_from_current
+    [[ -n "$R_NAME" ]]        && PLAN_REQ_NAME="$R_NAME"
+    [[ -n "$R_IRAN_IP" ]]     && PLAN_REQ_IRAN_IP="$R_IRAN_IP"
+    [[ -n "$R_SUBNET_BASE" ]] && PLAN_REQ_SUBNET_BASE="$R_SUBNET_BASE"
+    [[ -n "$R_IDX" ]]         && PLAN_REQ_IDX="$R_IDX"
+    [[ -n "$R_KEY" ]]         && PLAN_REQ_KEY="$R_KEY"
+    [[ -n "$R_FOREIGN_IP" ]]  && PLAN_REQ_FOREIGN_IP="$R_FOREIGN_IP"
+    PLAN_REQ_TUN="gre-$PLAN_REQ_NAME"
+
+    preview_connection_edit foreign "$CURRENT" || { edit_txn_commit; return 1; }
+
+    if (( PLAN_ONLY )); then
+        info "Plan only (--plan): nothing was changed."
+        return 0
+    fi
+    if (( ! YES )); then
+        confirm "Apply this change to node '$CURRENT'?" || { info "Cancelled."; return 0; }
+    fi
+
+    if ! edit_connection_txn foreign "$CURRENT"; then
+        err "Edit of '$CURRENT' failed and the previous configuration was restored."
+        return 1
+    fi
+
+    # Keep the GRE input whitelist in step when the peer address changed: the old
+    # ACCEPT for this node is replaced, never left behind and never duplicated.
+    if [[ "$EDIT_OLD_IRAN_IP" != "$EDIT_NEW_IRAN_IP" ]]; then
+        ipt_del filter INPUT -p gre -s "$EDIT_OLD_IRAN_IP" \
+            -m comment --comment "multi-gre-node-$EDIT_OLD_NAME" -j ACCEPT
+        if [[ "${GRE_WHITELIST:-0}" == "1" ]]; then
+            # Insert before the catch-all DROP so the new address is actually allowed.
+            ipt_del filter INPUT -p gre -m comment --comment "multi-gre-block" -j DROP
+            ipt_add filter INPUT -p gre -s "$EDIT_NEW_IRAN_IP" \
+                -m comment --comment "multi-gre-node-$EDIT_NEW_NAME" -j ACCEPT
+            ipt_add filter INPUT -p gre -m comment --comment "multi-gre-block" -j DROP
+        fi
+    elif [[ "$EDIT_OLD_NAME" != "$EDIT_NEW_NAME" ]]; then
+        # Rename: the comment carries the name, so move the rule with it.
+        ipt_del filter INPUT -p gre -s "$EDIT_OLD_IRAN_IP" \
+            -m comment --comment "multi-gre-node-$EDIT_OLD_NAME" -j ACCEPT
+        if [[ "${GRE_WHITELIST:-0}" == "1" ]]; then
+            ipt_del filter INPUT -p gre -m comment --comment "multi-gre-block" -j DROP
+            ipt_add filter INPUT -p gre -s "$EDIT_NEW_IRAN_IP" \
+                -m comment --comment "multi-gre-node-$EDIT_NEW_NAME" -j ACCEPT
+            ipt_add filter INPUT -p gre -m comment --comment "multi-gre-block" -j DROP
+        fi
+    fi
+
+    audit_log "node-edit from=$CURRENT name=$EDIT_NEW_NAME iran_ip=$EDIT_NEW_IRAN_IP base=$EDIT_NEW_SUBNET_BASE idx=$EDIT_NEW_IDX key=$EDIT_NEW_KEY class=$PLAN_CLASS"
+
+    echo
+    ok "Node '$EDIT_NEW_NAME' updated (${PLAN_CLASS}: $(plan_class_label "$PLAN_CLASS"))."
+    info "Tunnel: $EDIT_NEW_TUN  ${EDIT_NEW_SUBNET_BASE}.${EDIT_NEW_IDX}.1/30  <->  $EDIT_NEW_IRAN_IP (key $EDIT_NEW_KEY)"
+
+    # Commands for the other side, only when the other side must change.
+    local changed=0 f
+    for f in "${PLAN_FIELDS[@]}"; do
+        case "$f" in IRAN_IP|SUBNET_BASE|IDX|KEY|NAME|FOREIGN_IP) changed=1 ;; esac
+    done
+    if (( changed )); then
+        echo
+        warn "This change also affects the IRAN side. Run there:"
+        printf 'gre iran peer edit \\\n'
+        printf '  --name %s \\\n' "$EDIT_OLD_NAME"
+        [[ "$EDIT_NEW_NAME" != "$EDIT_OLD_NAME" ]] && printf '  --new-name %s \\\n' "$EDIT_NEW_NAME"
+        printf '  --iran-ip %s \\\n' "$EDIT_NEW_IRAN_IP"
+        printf '  --subnet-base %s \\\n' "$EDIT_NEW_SUBNET_BASE"
+        printf '  --idx %s \\\n' "$EDIT_NEW_IDX"
+        printf '  --key %s\n' "$EDIT_NEW_KEY"
+    fi
+    return 0
 }
 
 cli_node_remove() { # gre node remove --name NAME [--yes]
@@ -3111,6 +4208,131 @@ cli_suggest_resources() { # cli_suggest_resources peer|node [--json] [--count N]
 cli_node_suggest() { cli_suggest_resources node "$@"; }
 cli_iran_peer_suggest() { cli_suggest_resources peer "$@"; }
 
+# ---------------------------------------------------------------- list rendering
+#
+# A connection is a PAIR, so the list always shows both endpoints. Showing only the
+# far end and assuming "this server is obviously the local one" is exactly what made
+# an operator hold two configs in their head.
+terminal_width() {
+    local w=""
+    if [[ -t 1 ]]; then
+        w="$(tput cols 2>/dev/null || true)"
+    fi
+    # `tput` needs a terminal; fall back to COLUMNS, then to a safe default.
+    if [[ -z "$w" || ! "$w" =~ ^[0-9]+$ ]]; then w="${COLUMNS:-}"; fi
+    if [[ -z "$w" || ! "$w" =~ ^[0-9]+$ ]]; then w=120; fi
+    printf '%s' "$w"
+}
+
+# Is the tunnel's own interface up? Purely local: this reports what THIS side can
+# see, which is all a single CLI invocation can honestly know.
+tunnel_state_local() { # tunnel_state_local TUN
+    local tun="$1"
+    if ! tun_exists "$tun"; then printf 'MISSING'; return 0; fi
+    if ip link show "$tun" 2>/dev/null | grep -qE 'state (UP|UNKNOWN)'; then printf 'UP'; else printf 'DOWN'; fi
+}
+
+# Compact two-line rendering for a narrow terminal.
+print_connection_compact() { # print_connection_compact NAME IRAN_IP FOREIGN_IP TUN SUBNET_CIDR KEY TCP UDP STATE
+    local name="$1" iran="$2" foreign="$3" tun="$4" subnet="$5" key="$6" tcp="$7" udp="$8" state="$9"
+    printf '  %s\n' "$name"
+    printf '    %s -> %s\n' "$iran" "$foreign"
+    printf '    %s · %s · key %s · tcp/udp %s · %s\n' \
+        "$tun" "$subnet" "$key" "${tcp:-none}" "$state"
+}
+
+# Full table. Column widths are computed from the data so nothing is truncated by a
+# hardcoded guess.
+print_connection_table() { # print_connection_table <rows-file>
+    local rows="$1"
+    awk -F'\t' '
+        BEGIN {
+            h[1]="NAME"; h[2]="IRAN IP"; h[3]="FOREIGN IP"; h[4]="TUNNEL";
+            h[5]="SUBNET"; h[6]="KEY"; h[7]="TCP"; h[8]="UDP"; h[9]="STATE"
+        }
+        { for (i=1;i<=9;i++) { if (length($i) > w[i]) w[i]=length($i) } n++ }
+        END {
+            for (i=1;i<=9;i++) { if (length(h[i]) > w[i]) w[i]=length(h[i]) }
+            for (i=1;i<=9;i++) printf "%-*s  ", w[i], h[i]
+            printf "\n"
+            for (i=1;i<=9;i++) { s=""; for (j=0;j<w[i];j++) s=s"-"; printf "%-*s  ", w[i], s }
+            printf "\n"
+        }
+    ' "$rows"
+    while IFS=$'\t' read -r c1 c2 c3 c4 c5 c6 c7 c8 c9; do
+        [[ -n "$c1" ]] || continue
+        printf '%-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %-*s  %s\n' \
+            "${LIST_W[1]}" "$c1" "${LIST_W[2]}" "$c2" "${LIST_W[3]}" "$c3" \
+            "${LIST_W[4]}" "$c4" "${LIST_W[5]}" "$c5" "${LIST_W[6]}" "$c6" \
+            "${LIST_W[7]}" "$c7" "${LIST_W[8]}" "$c8" "$c9"
+    done < "$rows"
+}
+
+# Emit a list of connections for one side, in whichever layout fits the terminal.
+# SIDE is "iran" (peers) or "foreign" (nodes).
+render_connection_list() { # render_connection_list SIDE
+    local side="$1" f found=0 width
+    width="$(terminal_width)"
+    local -a rows=()
+    local NAME="" FOREIGN_IP="" IRAN_IP="" WAN_IF="" SUBNET_BASE="$DEFAULT_SUBNET_BASE" \
+          IDX="" KEY="" TUN="" TCP_PORTS="" UDP_PORTS="" MSS_CLAMP="0"
+
+    if [[ "$side" == "iran" ]]; then
+        for f in "$FOREIGNS_DIR"/*.conf; do
+            [[ -e "$f" ]] || continue
+            load_peer_conf "$f" || { warn "  invalid peer conf: $f"; continue; }
+            found=1
+            rows+=("$NAME"$'\t'"$IRAN_IP"$'\t'"$FOREIGN_IP"$'\t'"$TUN"$'\t'"${SUBNET_BASE}.${IDX}.0/30"$'\t'"$KEY"$'\t'"${TCP_PORTS:-none}"$'\t'"${UDP_PORTS:-none}"$'\t'"$(tunnel_state_local "$TUN")")
+        done
+    else
+        FOREIGN_IP="$(grep -E '^FOREIGN_IP=' "$FOREIGN_CONF" 2>/dev/null | head -n1 | cut -d= -f2)"
+        for f in "$NODES_DIR"/*.conf; do
+            [[ -e "$f" ]] || continue
+            NAME=""; IRAN_IP=""; SUBNET_BASE="$DEFAULT_SUBNET_BASE"; IDX=""; KEY=""; TUN=""
+            # shellcheck disable=SC1090
+            source "$f"
+            [[ -n "$TUN" ]] || TUN="gre-$NAME"
+            found=1
+            # The foreign side has no per-node port list, so TCP/UDP read as "-".
+            rows+=("$NAME"$'\t'"$IRAN_IP"$'\t'"$FOREIGN_IP"$'\t'"$TUN"$'\t'"${SUBNET_BASE}.${IDX}.0/30"$'\t'"$KEY"$'\t'"-"$'\t'"-"$'\t'"$(tunnel_state_local "$TUN")")
+        done
+    fi
+    (( found )) || return 1
+
+    # 110 columns fits the full table of nine columns with typical values; below
+    # that a two-line row is far more readable than a wrapped table.
+    if (( width >= 110 )); then
+        local tmp
+        tmp="$(mktemp)"
+        printf '%s\n' "${rows[@]}" > "$tmp"
+        # Column widths, computed once and reused by the row printer.
+        LIST_W=()
+        local i
+        for (( i=1; i<=9; i++ )); do
+            local maxlen
+            maxlen="$(awk -F'\t' -v c="$i" '{ if (length($c) > m) m=length($c) } END { print m+0 }' "$tmp")"
+            local hlen
+            case "$i" in
+                1) hlen=4 ;; 2) hlen=7 ;; 3) hlen=10 ;; 4) hlen=6 ;; 5) hlen=6 ;;
+                6) hlen=3 ;; 7) hlen=3 ;; 8) hlen=3 ;; 9) hlen=5 ;;
+            esac
+            (( maxlen < hlen )) && maxlen=$hlen
+            LIST_W[$i]="$maxlen"
+        done
+        print_connection_table "$tmp"
+        rm -f "$tmp"
+    else
+        local row
+        for row in "${rows[@]}"; do
+            local -a c=()
+            IFS=$'\t' read -r -a c <<< "$row"
+            print_connection_compact "${c[0]}" "${c[1]}" "${c[2]}" "${c[3]}" \
+                "${c[4]}" "${c[5]}" "${c[6]}" "${c[7]}" "${c[8]}"
+        done
+    fi
+    return 0
+}
+
 cli_iran_peer_list() { # gre iran peer list [--json]
     local json=0
     while [[ $# -gt 0 ]]; do
@@ -3128,18 +4350,11 @@ cli_iran_peer_list() { # gre iran peer list [--json]
         return 0
     fi
     info "Configured foreign peers:"
-    local f NAME="" FOREIGN_IP="" IRAN_IP="" WAN_IF="" SUBNET_BASE="$DEFAULT_SUBNET_BASE" \
-          IDX="" KEY="" TUN="" TCP_PORTS="" UDP_PORTS="" MSS_CLAMP="0"
-    local found=0
-    for f in "$FOREIGNS_DIR"/*.conf; do
-        [[ -e "$f" ]] || continue
-        found=1
-        load_peer_conf "$f" || { warn "  invalid peer conf: $f"; continue; }
-        printf '  %s  foreign %s, subnet %s.%s.0/30, key %s, tunnel %s, tcp [%s] udp [%s]\n' \
-            "$NAME" "$FOREIGN_IP" "$SUBNET_BASE" "$IDX" "$KEY" "$TUN" \
-            "${TCP_PORTS:-none}" "${UDP_PORTS:-none}"
-    done
-    (( found )) || info "  (none — add one: gre iran peer add)"
+    if ! render_connection_list iran; then
+        info "  (none — add one: gre iran peer add)"
+    fi
+    echo
+    info "Edit one in place:  gre iran peer edit --name NAME [--tcp-ports LIST] ..."
 }
 
 cli_iran_peer_add() { # gre iran peer add --name NAME --foreign-ip IP [options]
@@ -3244,8 +4459,179 @@ cli_iran_peer_add() { # gre iran peer add --name NAME --foreign-ip IP [options]
     info "Test from here:  ping ${SUBNET_BASE}.${IDX}.1"
 }
 
-cli_iran_peer_remove() { # gre iran peer remove --name NAME [--yes]
+# ===================================================== CLI: gre iran peer edit
+#
+# Non-interactive connection edit. Every option is optional: an option that is not
+# given keeps its current value, which is what makes "change only the ports" a
+# one-liner instead of a full re-specification.
+# shellcheck disable=SC2034  # PLAN_REQ_* are read by plan_edit via indirect expansion
+cli_iran_peer_edit() { # gre iran peer edit --name CURRENT [--new-name N] [options]
     require_root
+    migrate_legacy_iran_conf || return 1
+    local CURRENT="" YES=0 PLAN_ONLY=0
+    local R_NAME="" R_FOREIGN_IP="" R_IRAN_IP="" R_SUBNET_BASE="" R_IDX="" R_KEY="" \
+          R_WAN="" R_TCP="" R_UDP="" R_MSS=""
+    # Track which options were supplied, so "keep current" is distinguishable from
+    # "explicitly set to empty" (clearing a port list is a legitimate edit).
+    local set_TCP=0 set_UDP=0 set_MSS=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name)        [[ -n "${2:-}" ]] || { err "Missing value for --name"; return 1; }; CURRENT="$2"; shift 2 ;;
+            --new-name)    [[ -n "${2:-}" ]] || { err "Missing value for --new-name"; return 1; }; R_NAME="$2"; shift 2 ;;
+            --foreign-ip)  [[ -n "${2:-}" ]] || { err "Missing value for --foreign-ip"; return 1; }; R_FOREIGN_IP="$2"; shift 2 ;;
+            --iran-ip)     [[ -n "${2:-}" ]] || { err "Missing value for --iran-ip"; return 1; }; R_IRAN_IP="$2"; shift 2 ;;
+            --subnet-base) [[ -n "${2:-}" ]] || { err "Missing value for --subnet-base"; return 1; }; R_SUBNET_BASE="$2"; shift 2 ;;
+            --idx)         [[ -n "${2:-}" ]] || { err "Missing value for --idx"; return 1; }; R_IDX="$2"; shift 2 ;;
+            --key)         [[ -n "${2:-}" ]] || { err "Missing value for --key"; return 1; }; R_KEY="$2"; shift 2 ;;
+            --wan)         [[ -n "${2:-}" ]] || { err "Missing value for --wan"; return 1; }; R_WAN="$2"; shift 2 ;;
+            --tcp-ports)   R_TCP="${2:-}"; set_TCP=1; shift 2 ;;
+            --udp-ports)   R_UDP="${2:-}"; set_UDP=1; shift 2 ;;
+            --mss-clamp)   [[ "${2:-}" == "on" || "${2:-}" == "off" ]] || { err "--mss-clamp must be 'on' or 'off'"; return 1; }
+                           [[ "$2" == "on" ]] && R_MSS="1" || R_MSS="0"; set_MSS=1; shift 2 ;;
+            --plan)        PLAN_ONLY=1; shift ;;
+            --yes|-y)      YES=1; shift ;;
+            --help|-h)     echo "Usage: gre iran peer edit --name CURRENT [--new-name NAME] [--foreign-ip IP] [--iran-ip IP] [--subnet-base A.B] [--idx N] [--key K] [--wan IFACE] [--tcp-ports LIST] [--udp-ports LIST] [--mss-clamp on|off] [--plan] [--yes]"; return 0 ;;
+            *)             err "Unknown option: $1"
+                           err "Usage: gre iran peer edit --name CURRENT [--new-name NAME] [--foreign-ip IP] [--iran-ip IP] [--subnet-base A.B] [--idx N] [--key K] [--wan IFACE] [--tcp-ports LIST] [--udp-ports LIST] [--mss-clamp on|off] [--plan] [--yes]"
+                           return 1 ;;
+        esac
+    done
+    [[ -n "$CURRENT" ]] || { err "Missing required option: --name (the connection to edit)"; return 1; }
+    [[ -f "$FOREIGNS_DIR/$CURRENT.conf" ]] || { err "Peer '$CURRENT' does not exist."; err "List them with: gre iran peer list"; return 1; }
+
+    # Read + snapshot the current state, seed the request from it, then apply only
+    # the overrides the operator actually gave.
+    edit_txn_begin
+    if ! edit_snapshot_current iran "$CURRENT"; then
+        err "Could not read the current configuration of '$CURRENT'."
+        edit_txn_commit
+        return 1
+    fi
+    plan_request_from_current
+    [[ -n "$R_NAME" ]]        && PLAN_REQ_NAME="$R_NAME"
+    [[ -n "$R_FOREIGN_IP" ]]  && PLAN_REQ_FOREIGN_IP="$R_FOREIGN_IP"
+    [[ -n "$R_IRAN_IP" ]]     && PLAN_REQ_IRAN_IP="$R_IRAN_IP"
+    [[ -n "$R_SUBNET_BASE" ]] && PLAN_REQ_SUBNET_BASE="$R_SUBNET_BASE"
+    [[ -n "$R_IDX" ]]         && PLAN_REQ_IDX="$R_IDX"
+    [[ -n "$R_KEY" ]]         && PLAN_REQ_KEY="$R_KEY"
+    [[ -n "$R_WAN" ]]         && PLAN_REQ_WAN_IF="$R_WAN"
+    (( set_TCP )) && PLAN_REQ_TCP_PORTS="$R_TCP"
+    (( set_UDP )) && PLAN_REQ_UDP_PORTS="$R_UDP"
+    (( set_MSS )) && PLAN_REQ_MSS_CLAMP="$R_MSS"
+    # The tunnel name follows the connection name.
+    PLAN_REQ_TUN="gre-$PLAN_REQ_NAME"
+
+    preview_connection_edit iran "$CURRENT" || { edit_txn_commit; return 1; }
+
+    # A handful of validations before any snapshot, so an obviously bad request
+    # never even opens a transaction.
+    if [[ -n "$R_TCP" ]] && ! valid_port_list "$R_TCP"; then err "Invalid TCP port list: '$R_TCP'"; return 1; fi
+    if [[ -n "$R_UDP" ]] && ! valid_port_list "$R_UDP"; then err "Invalid UDP port list: '$R_UDP'"; return 1; fi
+    if [[ -n "$R_NAME" ]] && ! valid_name "$R_NAME"; then err "Invalid new name: '$R_NAME'"; return 1; fi
+
+    if (( PLAN_ONLY )); then
+        info "Plan only (--plan): nothing was changed."
+        return 0
+    fi
+    if (( ! YES )); then
+        confirm "Apply this change to connection '$CURRENT'?" || { info "Cancelled."; return 0; }
+    fi
+
+    if ! edit_connection_txn iran "$CURRENT"; then
+        err "Edit of '$CURRENT' failed and the previous configuration was restored."
+        return 1
+    fi
+
+    # edit_connection_txn may run inside a command substitution, which would trap
+    # any variable it set in a subshell. Derive the summary from the requested
+    # state here, in the caller's scope, so the audit line and the message never
+    # read an unset variable.
+    EDIT_NEW_NAME="$PLAN_REQ_NAME"
+    EDIT_NEW_FOREIGN_IP="$PLAN_REQ_FOREIGN_IP"
+    EDIT_NEW_IRAN_IP="$PLAN_REQ_IRAN_IP"
+    EDIT_NEW_SUBNET_BASE="$PLAN_REQ_SUBNET_BASE"
+    EDIT_NEW_IDX="$PLAN_REQ_IDX"
+    EDIT_NEW_KEY="$PLAN_REQ_KEY"
+    EDIT_NEW_TUN="gre-$PLAN_REQ_NAME"
+
+    audit_log "iran-peer-edit from=$CURRENT name=$EDIT_NEW_NAME foreign=$EDIT_NEW_FOREIGN_IP iran=$EDIT_NEW_IRAN_IP base=$EDIT_NEW_SUBNET_BASE idx=$EDIT_NEW_IDX key=$EDIT_NEW_KEY tcp='$PLAN_REQ_TCP_PORTS' udp='$PLAN_REQ_UDP_PORTS' mss=$PLAN_REQ_MSS_CLAMP class=$PLAN_CLASS"
+
+    echo
+    ok "Connection '$EDIT_NEW_NAME' updated (${PLAN_CLASS}: $(plan_class_label "$PLAN_CLASS"))."
+    info "Tunnel: $EDIT_NEW_TUN  ${EDIT_NEW_SUBNET_BASE}.${EDIT_NEW_IDX}.2/30  <->  $EDIT_NEW_FOREIGN_IP (key $EDIT_NEW_KEY)"
+
+    # Only print the far-side command when the far side actually has to change.
+    local fcmd
+    if fcmd="$(edit_peer_command_for_foreign)"; then
+        echo
+        warn "This change also affects the FOREIGN side. Run there:"
+        printf '%s\n' "$fcmd"
+    fi
+    return 0
+}
+
+# Human-readable before/after preview, plus the impact list.
+#
+# Read-only with respect to the live system: it renders whatever the planner
+# decided. The caller has already snapshotted the current state and populated the
+# PLAN_REQ_* vars, so this function never mutates anything — which is what makes
+# --plan safe to run against production.
+preview_connection_edit() { # preview_connection_edit SIDE CURRENT
+    local side="$1" current="$2"
+    plan_edit
+    if [[ "$PLAN_CLASS" == "NONE" ]]; then
+        info "No changes requested — '$current' is already in the requested state."
+        EDIT_PREVIEW_EMPTY=1
+        return 0
+    fi
+    EDIT_PREVIEW_EMPTY=0
+
+    local NAME="$PLAN_REQ_NAME" FOREIGN_IP="$PLAN_REQ_FOREIGN_IP" IRAN_IP="$PLAN_REQ_IRAN_IP" \
+          WAN_IF="$PLAN_REQ_WAN_IF" SUBNET_BASE="$PLAN_REQ_SUBNET_BASE" IDX="$PLAN_REQ_IDX" \
+          KEY="$PLAN_REQ_KEY" TCP_PORTS="$PLAN_REQ_TCP_PORTS" UDP_PORTS="$PLAN_REQ_UDP_PORTS" \
+          MSS_CLAMP="$PLAN_REQ_MSS_CLAMP"
+
+    echo
+    printf '%s\n' "CURRENT"
+    printf '  %-12s %s\n' "NAME"    "$EDIT_OLD_NAME"
+    printf '  %-12s %s\n' "IRAN"    "${EDIT_OLD_IRAN_IP:-—}"
+    printf '  %-12s %s\n' "FOREIGN" "${EDIT_OLD_FOREIGN_IP:-—}"
+    printf '  %-12s %s\n' "SUBNET"  "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.0/30"
+    printf '  %-12s %s\n' "KEY"     "$EDIT_OLD_KEY"
+    if [[ "$side" == "iran" ]]; then
+        printf '  %-12s %s\n' "TCP" "${EDIT_OLD_TCP:-none}"
+        printf '  %-12s %s\n' "UDP" "${EDIT_OLD_UDP:-none}"
+        printf '  %-12s %s\n' "MSS" "$([[ "${EDIT_OLD_MSS:-0}" == "1" ]] && echo on || echo off)"
+    fi
+
+    echo
+    printf '%s\n' "NEW"
+    local f
+    for f in "${PLAN_FIELDS[@]}"; do
+        case "$f" in
+            NAME)        printf '  %-10s %s -> %s\n' "Name:"    "$EDIT_OLD_NAME" "$NAME" ;;
+            FOREIGN_IP)  printf '  %-10s %s -> %s\n' "Foreign:" "$EDIT_OLD_FOREIGN_IP" "$FOREIGN_IP" ;;
+            IRAN_IP)     printf '  %-10s %s -> %s\n' "Iran:"    "$EDIT_OLD_IRAN_IP" "$IRAN_IP" ;;
+            WAN_IF)      printf '  %-10s %s -> %s\n' "WAN:"     "$EDIT_OLD_WAN_IF" "$WAN_IF" ;;
+            SUBNET_BASE) printf '  %-10s %s -> %s\n' "Subnet:"  "$EDIT_OLD_SUBNET_BASE" "$SUBNET_BASE" ;;
+            IDX)         printf '  %-10s %s -> %s\n' "Index:"   "$EDIT_OLD_IDX" "$IDX" ;;
+            KEY)         printf '  %-10s %s -> %s\n' "Key:"     "$EDIT_OLD_KEY" "$KEY" ;;
+            TCP_PORTS)   printf '  %-10s %s -> %s\n' "TCP:"     "${EDIT_OLD_TCP:-none}" "${TCP_PORTS:-none}" ;;
+            UDP_PORTS)   printf '  %-10s %s -> %s\n' "UDP:"     "${EDIT_OLD_UDP:-none}" "${UDP_PORTS:-none}" ;;
+            MSS_CLAMP)   printf '  %-10s %s -> %s\n' "MSS:" "$([[ "${EDIT_OLD_MSS:-0}" == "1" ]] && echo on || echo off)" "$([[ "$MSS_CLAMP" == "1" ]] && echo on || echo off)" ;;
+        esac
+    done
+
+    echo
+    printf '%s\n' "Impact:"
+    plan_impact_lines | while IFS= read -r line; do printf '  - %s\n' "$line"; done
+    echo
+    printf 'Change class: %s (%s)\n' "$PLAN_CLASS" "$(plan_class_label "$PLAN_CLASS")"
+    return 0
+}
+
+cli_iran_peer_remove() { # gre iran peer remove --name NAME [--yes]    require_root
     migrate_legacy_iran_conf || return 1
     local NAME="" YES=0
     while [[ $# -gt 0 ]]; do
@@ -3798,22 +5184,23 @@ EOF
             "$C_YELLOW" "$C_RESET"
     fi
     echo   "  ── Tunnels ─────────────────────────────────────────────────"
-    echo   "  1) Configure this server as IRAN (add / manage foreign peers)"
+    echo   "  1) Configure this server as IRAN (add / edit / manage foreign peers)"
     echo   "  2) Configure this server as FOREIGN / add an Iran node"
-    printf '  3) Remove an Iran node from FOREIGN                  [%s nodes]\n' "$ncount"
-    echo   "  4) Restart all configured tunnels"
-    echo   "  5) Stop all configured tunnels"
+    printf '  3) Edit an Iran node on FOREIGN                      [%s nodes]\n' "$ncount"
+    printf '  4) Remove an Iran node from FOREIGN                  [%s nodes]\n' "$ncount"
+    echo   "  5) Restart all configured tunnels"
+    echo   "  6) Stop all configured tunnels"
     echo   "  ── Monitoring ──────────────────────────────────────────────"
-    echo   "  6) Status & health"
-    printf '  7) Auto-heal watchdog                                %s %s\n' "$wdot" "$wlabel"
-    echo   "  8) Doctor (diagnostics)"
+    echo   "  7) Status & health"
+    printf '  8) Auto-heal watchdog                                %s %s\n' "$wdot" "$wlabel"
+    echo   "  9) Doctor (diagnostics)"
     echo   "  ── Maintenance ─────────────────────────────────────────────"
-    echo   "  9) Backup / restore (export / import)"
-    echo   " 10) Clean up original vatanhost gre.sh (vatan-m2)"
-    echo   " 11) Update gre-manager + gre-hub to the latest release"
-    echo   " 12) Uninstall from this server"
-    printf ' %s13) PURGE: remove EVERYTHING GRE (danger)%s\n' "$C_RED" "$C_RESET"
-    echo   " 14) gre-hub dashboard (web UI: install / manage)"
+    echo   " 10) Backup / restore (export / import)"
+    echo   " 11) Clean up original vatanhost gre.sh (vatan-m2)"
+    echo   " 12) Update gre-manager + gre-hub to the latest release"
+    echo   " 13) Uninstall from this server"
+    printf ' %s14) PURGE: remove EVERYTHING GRE (danger)%s\n' "$C_RED" "$C_RESET"
+    echo   " 15) gre-hub dashboard (web UI: install / manage)"
     echo   "  0) Exit"
     echo   "  ═════════════════════════════════════════════════════════════"
 }
@@ -3884,18 +5271,19 @@ main_menu() {
         case "$choice" in
             1)  iran_peers_menu ;;
             2)  setup_foreign ;;
-            3)  remove_node ;;
-            4)  restart_all ;;
-            5)  stop_menu ;;
-            6)  show_status ;;
-            7)  watchdog_settings_menu ;;
-            8)  doctor ;;
-            9)  backup_restore_menu ;;
-            10) legacy_cleanup ;;
-            11) self_update ;;
-            12) uninstall ;;
-            13) purge_all ;;
-            14) hub_settings_menu ;;
+            3)  edit_node ;;
+            4)  remove_node ;;
+            5)  restart_all ;;
+            6)  stop_menu ;;
+            7)  show_status ;;
+            8)  watchdog_settings_menu ;;
+            9)  doctor ;;
+            10) backup_restore_menu ;;
+            11) legacy_cleanup ;;
+            12) self_update ;;
+            13) uninstall ;;
+            14) purge_all ;;
+            15) hub_settings_menu ;;
             0)  trap - INT; echo "Bye."; exit 0 ;;
             *)  warn "Invalid selection." ;;
         esac
@@ -3978,6 +5366,7 @@ case "${1:-}" in
             list)    cli_node_list "${@:3}" ;;
             suggest) cli_node_suggest "${@:3}" ;;
             add)     cli_node_add "${@:3}" ;;
+            edit)    cli_node_edit "${@:3}" ;;
             remove)  cli_node_remove "${@:3}" ;;
             --help|-h)
                 cat <<'EOF'
@@ -3985,10 +5374,17 @@ Usage:
   gre node list [--json]
   gre node suggest [--json] [--count N] [--base A.B]
   gre node add --name NAME --ip IRAN_IP [--idx N] [--key K] [--subnet-base A.B] [--yes]
+  gre node edit --name CURRENT [--new-name NAME] [--ip IRAN_IP] [--foreign-ip IP]
+                [--subnet-base A.B] [--idx N] [--key K] [--plan] [--yes]
   gre node remove --name NAME [--yes]
+
+Edit changes an existing node in place. Every option is optional: an option you do
+not pass keeps its current value, and the current values are shown as the defaults
+in the interactive wizard. A change of ip/subnet/idx/key rebuilds only this node's
+tunnel; if a failure occurs, the previous configuration is restored.
 EOF
                 ;;
-            *)       err "Usage: gre node <list|add|remove> ...  (see: gre node --help)"; exit 1 ;;
+            *)       err "Usage: gre node <list|add|edit|remove> ...  (see: gre node --help)"; exit 1 ;;
         esac ;;
     iran)
         case "${2:-}" in
@@ -3996,6 +5392,7 @@ EOF
                 case "${3:-}" in
                     list)    cli_iran_peer_list "${@:4}" ;;
                     add)     cli_iran_peer_add "${@:4}" ;;
+                    edit)    cli_iran_peer_edit "${@:4}" ;;
                     remove)  cli_iran_peer_remove "${@:4}" ;;
                     apply)   cli_iran_peer_apply "${@:4}" ;;
                     suggest) cli_iran_peer_suggest "${@:4}" ;;
@@ -4007,6 +5404,10 @@ Usage:
   gre iran peer add --name NAME --foreign-ip IP [--iran-ip IP] [--subnet-base A.B]
                     [--idx N] [--key K] [--wan IFACE] [--tcp-ports LIST]
                     [--udp-ports LIST] [--mss-clamp on|off] [--yes]
+  gre iran peer edit --name CURRENT [--new-name NAME] [--foreign-ip IP]
+                    [--iran-ip IP] [--subnet-base A.B] [--idx N] [--key K]
+                    [--wan IFACE] [--tcp-ports LIST] [--udp-ports LIST]
+                    [--mss-clamp on|off] [--plan] [--yes]
   gre iran peer remove --name NAME [--yes]
   gre iran peer apply --name NAME
 EOF

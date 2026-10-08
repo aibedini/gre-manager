@@ -242,11 +242,13 @@ Addressing plan (automatic — subnet base, index and key are suggested for you)
 | `gre` | Interactive menu |
 | `gre status [--json]` | Status; `--json` for machine-readable output (no `jq` needed) |
 | `gre doctor` | Diagnostics: PASS/WARN/FAIL per check, non-zero exit on FAIL |
-| `gre node list [--json]` | List configured Iran nodes (FOREIGN) |
+| `gre node list [--json]` | List configured Iran nodes (FOREIGN). Shows **both** the Iran and the foreign address |
 | `gre node add` | Add an Iran node (FOREIGN): `--name NAME --ip IRAN_IP [--idx N] [--key K] [--subnet-base A.B] [--yes]` |
+| `gre node edit` | Edit an Iran node in place: `--name CURRENT [--new-name NAME] [--ip IRAN_IP] [--foreign-ip IP] [--subnet-base A.B] [--idx N] [--key K] [--plan] [--yes]` |
 | `gre node remove` | Remove an Iran node (FOREIGN): `--name NAME [--yes]` |
-| `gre iran peer list [--json]` | List foreign peers of this Iran server |
+| `gre iran peer list [--json]` | List foreign peers of this Iran server. Shows **both** the Iran and the foreign address |
 | `gre iran peer add` | Connect this Iran to a foreign: `--name NAME --foreign-ip IP [--iran-ip IP] [--subnet-base A.B] [--idx N] [--key K] [--wan IFACE] [--tcp-ports LIST] [--udp-ports LIST] [--mss-clamp on\|off] [--yes]` |
+| `gre iran peer edit` | Edit one peer **in place** — no remove+add: `--name CURRENT [--new-name NAME] [--foreign-ip IP] [--iran-ip IP] [--subnet-base A.B] [--idx N] [--key K] [--wan IFACE] [--tcp-ports LIST] [--udp-ports LIST] [--mss-clamp on\|off] [--plan] [--yes]` |
 | `gre iran peer remove` | Remove one foreign peer (only its tunnel/rules/config): `--name NAME [--yes]` |
 | `gre iran peer apply` | Re-apply one peer's tunnel + rules: `--name NAME` |
 | `gre iran-setup` | Non-interactive first-peer Iran setup (legacy v1-compatible): `--foreign-ip IP [--iran-ip IP] [--name NAME] [--idx N] [--key K] [--subnet-base A.B] [--wan IFACE] [--tcp-ports LIST] [--udp-ports LIST] [--mss-clamp on\|off] [--downtime MIN] [--yes]` |
@@ -261,8 +263,51 @@ Addressing plan (automatic — subnet base, index and key are suggested for you)
 | `gre --version` / `gre --help` | Version / usage |
 
 All mutating commands ask for confirmation unless `--yes` is passed.
+
 `gre iran peer add` with values identical to an existing peer succeeds idempotently; different
-values are rejected (remove the peer first, then re-add).
+values are rejected. To change a peer, use `gre iran peer edit` — the equivalent of remove + add
+without the outage:
+
+```bash
+gre iran peer edit --name de1 --tcp-ports 3049 --udp-ports 3049 --yes   # rules only
+gre iran peer edit --name de1 --new-name Germany01 --yes                # rename
+gre iran peer edit --name Germany01 --key 5005 --subnet-base 10.220 --idx 5 --yes
+gre iran peer edit --name Germany01 --tcp-ports 9999 --plan             # preview, change nothing
+```
+
+An option you do not pass keeps its current value. The change is classified before anything runs:
+
+| Class | Fields | What happens |
+| --- | --- | --- |
+| **A** — rule-only | `--tcp-ports`, `--udp-ports`, `--mss-clamp` | Only the NAT/MSS rules are replaced. **The tunnel is not rebuilt**, so a port change costs no outage |
+| **B** — tunnel recreate | `--key`, `--subnet-base`, `--idx`, `--iran-ip`, `--foreign-ip`, `--new-name` | Only *this* connection's tunnel is rebuilt, then re-verified |
+
+`--plan` prints the before/after, the impact list and the change class, and never mutates anything.
+
+**Rollback:** every edit snapshots the current config first. If any step fails — install, recreate
+or verification — the previous connection is restored from that snapshot, including its tunnel and
+its exact rule set. A failed edit never leaves you rebuilding a peer by hand.
+
+**The two sides are independent.** The CLI on one server has no credential for the other, so when a
+change also affects the far side, the exact command to run there is printed:
+
+```
+[!] This change also affects the FOREIGN side. Run there:
+gre node edit \
+  --name de1 \
+  --ip 198.51.100.20 \
+  --subnet-base 10.200 \
+  --idx 1 \
+  --key 5005
+```
+
+A port-only change is local to the Iran side, so no far-side command is printed. Keeping "edit the
+ports" and "edit the endpoint" as different classes is what keeps the common case fast and low-risk.
+
+**Identity:** each connection gets a stable `connection_id` (in `/etc/multi-gre/connections.identity`)
+derived from its pairing fingerprint. The id survives a rename and an endpoint change, and no existing
+`.conf` file is modified to store it.
+
 
 ### Automation example
 

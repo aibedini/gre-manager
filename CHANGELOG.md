@@ -4,6 +4,92 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.16.0] - 2026-10-05
+
+### Added
+
+- **Edit a GRE connection in place, with a transactional apply.** Changing a peer
+  previously meant `iran peer remove` + `iran peer add`, which dropped the tunnel
+  even when nothing about the tunnel had changed. There is now
+  `gre iran peer edit` and `gre node edit`, plus an **Edit** entry in both
+  interactive menus. Every option is optional: an option you do not pass keeps its
+  current value, and the interactive wizard shows the current value as the default
+  in `[brackets]` so pressing Enter keeps it.
+- **A change planner, so a change is classified before anything runs.** Blind
+  remove+add is not what happens:
+  - **Class A — rule-only** (`--tcp-ports`, `--udp-ports`, `--mss-clamp`): only the
+    NAT/MSS rules are replaced. **The tunnel is not rebuilt**, so changing
+    3001 → 3049 costs no outage at all. The old rules are removed by exact spec and
+    the new ones installed, and the interface keeps running throughout.
+  - **Class B — tunnel recreate** (`--key`, `--subnet-base`, `--idx`, `--iran-ip`,
+    `--foreign-ip`, `--new-name`): only this connection's tunnel is rebuilt, then
+    re-verified.
+  - A connection that changes only ports is never treated as an endpoint change,
+    and vice versa.
+- **`--plan`**: prints the current state, the new state field by field, the impact
+  list ("NAT TCP rules will change", "GRE tunnel recreation required", …) and the
+  change class — and mutates nothing, so it is safe to run against production.
+- **Transactional edit with real rollback.** Every edit snapshots the current config
+  bytes, values, tunnel and rule set before the first mutation. If install, recreate
+  or verification fails, the previous connection is restored from that snapshot:
+  config file byte-for-byte, tunnel rebuilt, exact rules reinstalled. A failed edit
+  never leaves the operator rebuilding a peer by hand.
+- **Collision and port checks run before any mutation**, reusing the add-time
+  validators: name, tunnel interface, subnet+idx, port ownership, local listener
+  ports, SSH port protection and WAN interface. `check_peer_collisions()` now takes
+  an extra exclusion so the connection being edited is not a collision with itself —
+  and during a rename **both** its names are excluded, because the old file is still
+  on disk while the new state is evaluated. New ports are proven free before the old
+  rule is touched, so a rejected port change leaves the working rule in place.
+- **Renames move everything that carries the name**: the config file, the tunnel
+  interface, the iptables rule comments and the GRE input whitelist. The old file and
+  the old interface are removed only after the new state is written and verified, so
+  a failure never leaves the connection with neither.
+- **Stable connection identity.** `/etc/multi-gre/connections.identity` maps a
+  `connection_id` to the pairing fingerprint, derived deterministically from the
+  fingerprint when no mapping exists yet, so an existing installation correlates on
+  first look without a migration. The id survives a rename and an endpoint change.
+  It is deliberately a **sidecar file and not a config field**: no `.conf` is
+  modified and `PEER_CONF_FIELDS_RE` is untouched, so every existing config stays
+  valid.
+- **The list shows both endpoints.** `gre iran peer list` and `gre node list` now
+  render a connection as a pair instead of showing only the far end and assuming the
+  operator knows the local address:
+
+  ```
+  NAME        IRAN IP         FOREIGN IP      TUNNEL          SUBNET          KEY   TCP     UDP   STATE
+  parshetz02  94.182.134.126  178.105.185.80  gre-parshetz02  10.212.12.0/30  1012  3001    3001  UP
+  ```
+
+  Column widths are computed from the data. On a terminal narrower than 110 columns
+  the same information is rendered as a two-line row (`94.182.134.126 ->
+  178.105.185.80`), so both addresses are always visible.
+- **Cross-side guidance.** The CLI on one server has no credential for the other, so
+  when a change also affects the far side the exact command to run there is printed.
+  A port-only change is local to the Iran side and prints nothing, which keeps the
+  common case quiet.
+- **Interactive menus** now offer Add / Edit / Remove / Re-apply for both roles, and
+  the tables inside them show both addresses.
+
+### Security
+
+- Only resources owned by the connection being edited are touched. Rule removal is
+  driven by exact rule specs carrying this connection's own DNAT target and its own
+  comment, never by a wildcard sweep or a line number, so a rule belonging to another
+  connection cannot be matched by accident. No operation rewrites `/etc/multi-gre` as
+  a whole, and other peers are asserted unchanged by the tests.
+
+### Tests
+
+- 89 new assertions in `tests/edit-suite.sh` (sourced from `tests/run.sh`), covering
+  the port-only class, MSS only, the recreate class, rename (file, tunnel, rule
+  comments, whitelist), identity surviving rename and endpoint change, collision and
+  port refusals leaving the config and rules untouched, `--plan` mutating nothing,
+  invalid input refused before any mutation, no-op detection, usage errors, the
+  two-endpoint list in wide and narrow terminals, the FOREIGN-side node edit, and
+  backward compatibility for `iran peer add|apply|remove`, `status` and `doctor`.
+  Suite total **327 passed / 0 failed**.
+
 ## [2.15.3] - 2026-10-05
 
 ### Fixed

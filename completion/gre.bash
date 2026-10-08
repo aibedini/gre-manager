@@ -15,20 +15,30 @@ _gre() {
     case "${COMP_WORDS[1]}" in
         node)
             if (( COMP_CWORD == 2 )); then
-                COMPREPLY=( $(compgen -W "list add remove" -- "$cur") )
+                COMPREPLY=( $(compgen -W "list suggest add edit remove" -- "$cur") )
             elif (( COMP_CWORD >= 3 )); then
-                COMPREPLY=( $(compgen -W "--name --ip --idx --key --subnet-base --yes --json" -- "$cur") )
+                case "${COMP_WORDS[2]}" in
+                    edit)
+                        COMPREPLY=( $(compgen -W "--name --new-name --ip --foreign-ip --subnet-base --idx --key --plan --yes" -- "$cur") )
+                        ;;
+                    *)
+                        COMPREPLY=( $(compgen -W "--name --ip --idx --key --subnet-base --yes --json" -- "$cur") )
+                        ;;
+                esac
             fi
             ;;
         iran)
             if (( COMP_CWORD == 2 )); then
                 COMPREPLY=( $(compgen -W "peer" -- "$cur") )
             elif (( COMP_CWORD == 3 )); then
-                COMPREPLY=( $(compgen -W "list add remove apply suggest" -- "$cur") )
+                COMPREPLY=( $(compgen -W "list add edit remove apply suggest" -- "$cur") )
             elif (( COMP_CWORD >= 4 )); then
                 case "${COMP_WORDS[3]}" in
                     add)
                         COMPREPLY=( $(compgen -W "--name --foreign-ip --iran-ip --subnet-base --idx --key --wan --tcp-ports --udp-ports --mss-clamp --yes" -- "$cur") )
+                        ;;
+                    edit)
+                        COMPREPLY=( $(compgen -W "--name --new-name --foreign-ip --iran-ip --subnet-base --idx --key --wan --tcp-ports --udp-ports --mss-clamp --plan --yes" -- "$cur") )
                         ;;
                     remove|apply)
                         COMPREPLY=( $(compgen -W "--name --yes" -- "$cur") )
