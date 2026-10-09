@@ -86,7 +86,8 @@ jobs:
                    hub/scripts/connections-test.js hub/scripts/_fake-gre-ssh.js \
                    hub/server/connections.js hub/server/connection-planner.js \
                    hub/public/connections-ui.js \
-                   hub/public/app.js hub/public/index.html hub/public/style.css; do
+                   hub/public/app.js hub/public/index.html hub/public/style.css \
+                   tests/foreign-endpoint-suite.sh tests/netns-gre.sh; do
             [ -f "$TMP/$f" ] || { echo "::error::gre-hub.tar.gz is missing $f"; exit 1; }
           done
           [ "$(tr -d '[:space:]' < "$TMP/hub/VERSION")" = "$VERSION" ] || { echo "::error::tarball hub/VERSION mismatch"; exit 1; }
