@@ -1081,11 +1081,15 @@ edit_snapshot_current() { # edit_snapshot_current SIDE NAME (sets EDIT_OLD_*)
             EDIT_OLD_UDP="$UDP_PORTS"; EDIT_OLD_MSS="$MSS_CLAMP"
         else
             local NAME="" IRAN_IP="" SUBNET_BASE="$DEFAULT_SUBNET_BASE" IDX="" KEY="" TUN=""
-            # shellcheck disable=SC1090
-            source "$file"
+            node_conf_read "$file" NAME IRAN_IP SUBNET_BASE IDX KEY TUN
             EDIT_OLD_NAME="$NAME"; EDIT_OLD_IRAN_IP="$IRAN_IP"; EDIT_OLD_SUBNET_BASE="$SUBNET_BASE"
             EDIT_OLD_IDX="$IDX"; EDIT_OLD_KEY="$KEY"; EDIT_OLD_TUN="$TUN"
             EDIT_OLD_MSS="0"
+            # This host's own endpoint is not stored in a node config, so capture it
+            # rather than reading a caller's global at rollback time. The live
+            # interface is the most truthful source; foreign.conf is the fallback.
+            EDIT_OLD_FOREIGN_IP="$(tunnel_local_endpoint "$TUN")"
+            [[ -n "$EDIT_OLD_FOREIGN_IP" ]] || EDIT_OLD_FOREIGN_IP="$(foreign_local_ip)"
         fi
     fi
     return 0
@@ -1130,12 +1134,40 @@ edit_rollback() { # edit_rollback SIDE
                 "$EDIT_OLD_TCP" "$EDIT_OLD_UDP" "$EDIT_OLD_MSS" \
                 >/dev/null 2>&1 || true
         else
-            create_tunnel "$EDIT_OLD_TUN" "${FOREIGN_IP:-}" "$EDIT_OLD_IRAN_IP" "$EDIT_OLD_KEY" \
+            create_tunnel "$EDIT_OLD_TUN" "${EDIT_OLD_FOREIGN_IP:-$(foreign_local_ip)}" "$EDIT_OLD_IRAN_IP" "$EDIT_OLD_KEY" \
                 "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.1/30" >/dev/null 2>&1 || true
+            # A rollback that silently fails is worse than no rollback: the operator
+            # believes the old connection is back when there is no tunnel at all.
+            if ! edit_verify_tunnel "$EDIT_OLD_TUN" "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.1/30" >/dev/null 2>&1; then
+                err "Rollback could not restore tunnel '$EDIT_OLD_TUN' on this host."
+                err "Check: gre tunnel diagnose --name $EDIT_OLD_NAME"
+                return 1
+            fi
         fi
     fi
     ok "Rolled back to the previous configuration of '${EDIT_OLD_NAME:-connection}'."
     return 0
+}
+
+# Roll back a failed edit and report the outcome honestly.
+#
+# Both failure paths end in the same place (commit the transaction, return 1), so
+# they share one helper. The important part is the marker: callers and tests can
+# assert on ROLLBACK_FAILED instead of having to guess from prose, and a rollback
+# that could not be verified never reports success.
+edit_fail_and_rollback() { # edit_fail_and_rollback SIDE REASON
+    local side="$1" reason="$2"
+    if edit_rollback "$side"; then
+        edit_txn_commit
+        return 1
+    fi
+    edit_txn_commit
+    err "ROLLBACK_FAILED: '$reason' left the connection in an unknown state."
+    err "  the previous configuration of '${EDIT_OLD_NAME:-?}' could NOT be restored."
+    err "  inspect this host with:  gre status ; gre doctor"
+    err "  then re-apply by hand:   gre iran peer edit --name ${EDIT_OLD_NAME:-NAME} --yes"
+    err "                        or: gre node edit --name ${EDIT_OLD_NAME:-NAME} --yes"
+    return 1
 }
 
 # Does the connection's own interface exist and carry the expected local address?
@@ -1292,8 +1324,7 @@ edit_connection_txn() { # edit_connection_txn SIDE CURRENT_NAME
             peer_rules_install "$NAME" "$EDIT_OLD_TUN" "$IRAN_IP" "$WAN_IF" \
                 "${SUBNET_BASE}.${IDX}.2" "${SUBNET_BASE}.${IDX}.1" "$TCP_PORTS" "$UDP_PORTS" "$MSS_CLAMP"
             if ! edit_verify_tunnel "$EDIT_OLD_TUN" "${SUBNET_BASE}.${IDX}.2/30"; then
-                edit_rollback "$side"
-                edit_txn_commit
+                edit_fail_and_rollback "$side" "the rule-only update left the tunnel unverified"
                 return 1
             fi
         else
@@ -1303,29 +1334,25 @@ edit_connection_txn() { # edit_connection_txn SIDE CURRENT_NAME
                 "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.2" "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.1" \
                 "$EDIT_OLD_TCP" "$EDIT_OLD_UDP" "$EDIT_OLD_MSS"
             if ! create_tunnel "$TUN" "$IRAN_IP" "$FOREIGN_IP" "$KEY" "${SUBNET_BASE}.${IDX}.2/30"; then
-                edit_rollback "$side"
-                edit_txn_commit
+                edit_fail_and_rollback "$side" "the tunnel could not be recreated"
                 return 1
             fi
             enable_ip_forward
             peer_rules_install "$NAME" "$TUN" "$IRAN_IP" "$WAN_IF" \
                 "${SUBNET_BASE}.${IDX}.2" "${SUBNET_BASE}.${IDX}.1" "$TCP_PORTS" "$UDP_PORTS" "$MSS_CLAMP"
             if ! edit_verify_tunnel "$TUN" "${SUBNET_BASE}.${IDX}.2/30"; then
-                edit_rollback "$side"
-                edit_txn_commit
+                edit_fail_and_rollback "$side" "the rebuilt tunnel could not be verified"
                 return 1
             fi
         fi
     else
         # FOREIGN side: no per-node NAT rules, so a rebuild is the whole change.
-        if ! create_tunnel "$TUN" "${FOREIGN_IP:-}" "$IRAN_IP" "$KEY" "${SUBNET_BASE}.${IDX}.1/30"; then
-            edit_rollback "$side"
-            edit_txn_commit
+        if ! create_tunnel "$TUN" "${EDIT_NEW_FOREIGN_IP:-$(foreign_local_ip)}" "$IRAN_IP" "$KEY" "${SUBNET_BASE}.${IDX}.1/30"; then
+            edit_fail_and_rollback "$side" "the tunnel could not be recreated"
             return 1
         fi
         if ! edit_verify_tunnel "$TUN" "${SUBNET_BASE}.${IDX}.1/30"; then
-            edit_rollback "$side"
-            edit_txn_commit
+            edit_fail_and_rollback "$side" "the rebuilt tunnel could not be verified"
             return 1
         fi
     fi
@@ -1477,10 +1504,82 @@ enable_ip_forward() {
 }
 
 # ------------------------------------------------------------- apply / stop
-apply_foreign_node() { # node-conf-file
-    local f="$1" NAME="" IRAN_IP="" IDX="" KEY="" TUN="" SUBNET_BASE="$DEFAULT_SUBNET_BASE"
-    source "$f"
-    create_tunnel "$TUN" "$FOREIGN_IP" "$IRAN_IP" "$KEY" "${SUBNET_BASE}.${IDX}.1/30"
+# Read a node config into the caller's variables.
+#
+# Wraps `source` in a subshell so a malformed or hostile config file cannot leak
+# unrelated assignments into the caller. Only the known fields are copied back.
+# The caller must declare the targets (NAME, IRAN_IP, ...) before calling.
+node_conf_read() { # node_conf_read FILE NAME_VAR IRAN_IP_VAR SUBNET_BASE_VAR IDX_VAR KEY_VAR TUN_VAR
+    local f="$1"
+    local -n _name="$2" _iran="$3" _base="$4" _idx="$5" _key="$6" _tun="$7"
+    local -a vals=()
+    if [[ -f "$f" ]]; then
+        mapfile -t vals < <(
+            # shellcheck disable=SC1090  # this host's own config file
+            source "$f" >/dev/null 2>&1
+            printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
+                "${NAME:-}" "${IRAN_IP:-}" "${SUBNET_BASE:-$DEFAULT_SUBNET_BASE}" \
+                "${IDX:-}" "${KEY:-}" "${TUN:-}"
+        )
+    fi
+    _name="${vals[0]:-}"; _iran="${vals[1]:-}"
+    _base="${vals[2]:-$DEFAULT_SUBNET_BASE}"
+    _idx="${vals[3]:-}"; _key="${vals[4]:-}"; _tun="${vals[5]:-}"
+}
+
+# This host's public IP, for use as the GRE local endpoint.
+#
+# It lives in foreign.conf, NOT in a node config. Callers used to pass it in from
+# whatever happened to be in scope, which meant a node config applied on its own got
+# an empty `local` and the tunnel could not come up.
+foreign_local_ip() {
+    # Not named `ip`: that would shadow the ip(8) command for anything called from
+    # here, which is how tunnel_local_endpoint silently returned an empty string.
+    local addr=""
+    if [[ -f "$FOREIGN_CONF" ]]; then
+        addr="$(grep -E '^FOREIGN_IP=' "$FOREIGN_CONF" 2>/dev/null | head -n1 | cut -d= -f2)"
+    fi
+    printf '%s' "$addr"
+}
+
+# The local endpoint an interface is ACTUALLY using, so a rebuild reproduces the
+# live tunnel rather than trusting a stored value that may have drifted.
+tunnel_local_endpoint() { # tunnel_local_endpoint IFACE
+    local iface="$1" out="" local_addr=""
+    [[ -n "$iface" ]] || return 0
+    out="$(ip -d tunnel show "$iface" 2>/dev/null || true)"
+    [[ -n "$out" ]] || out="$(ip tunnel show "$iface" 2>/dev/null || true)"
+    local_addr="$(printf '%s\n' "$out" | sed -n 's/.*[[:space:]]local[[:space:]]\+\([0-9.]\+\)[[:space:]].*/\1/p' | head -n1)"
+    printf '%s' "$local_addr"
+}
+
+apply_foreign_node() { # apply_foreign_node NODE_CONF_FILE [LOCAL_IP]
+    local f="$1" local_ip="${2:-}"
+    local NAME="" IRAN_IP="" SUBNET_BASE="$DEFAULT_SUBNET_BASE" IDX="" KEY="" TUN=""
+    node_conf_read "$f" NAME IRAN_IP SUBNET_BASE IDX KEY TUN
+
+    # The local endpoint is this host's own IP. It is resolved HERE rather than
+    # inherited from the caller, so applying one node config on its own is
+    # self-contained: previously the value had to be in scope or the tunnel was
+    # created with no `local` address at all.
+    if [[ -z "$local_ip" ]]; then
+        local_ip="$(foreign_local_ip)"
+    fi
+    if [[ -z "$TUN" ]]; then
+        err "Node config $f has no TUN value; cannot create a tunnel."
+        return 1
+    fi
+    if ! valid_ip "$local_ip"; then
+        err "This host's public IP is unknown or invalid ('${local_ip:-empty}')."
+        err "Set it first:  gre foreign setup --foreign-ip <THIS_HOST_PUBLIC_IP>"
+        return 1
+    fi
+    if ! valid_ip "$IRAN_IP"; then
+        err "Node config $f has an invalid IRAN_IP ('${IRAN_IP:-empty}')."
+        return 1
+    fi
+
+    create_tunnel "$TUN" "$local_ip" "$IRAN_IP" "$KEY" "${SUBNET_BASE}.${IDX}.1/30"
 }
 
 # Distinct subnet bases used by the foreign-side nodes (default base included).

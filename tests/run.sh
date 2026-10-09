@@ -1119,6 +1119,7 @@ echo
 # 19-22. connection editing (sourced so the suites stay readable)
 # ======================================================================
 source "$TESTS_DIR/edit-suite.sh"
+source "$TESTS_DIR/foreign-endpoint-suite.sh"
 
 echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]
