@@ -123,3 +123,84 @@ assert "node edit: endpoint preserved" grep -q 'local 203.0.113.10' "$R/state/tu
 assert "node edit: new key applied" grep -q 'key 2002' "$R/state/tunnels/gre-ir1"
 assert_not "node edit: never an empty local endpoint" grep -q 'local  ' "$R/state/tunnels/gre-ir1"
 rm -rf "$R"
+
+# ======================================================================
+sect "24. gre tunnel diagnose is read-only and reports honestly"
+
+mkroot
+gre foreign-setup --foreign-ip 203.0.113.10 --yes >/dev/null
+gre iran peer add --name de1 --foreign-ip 203.0.113.10 --iran-ip 198.51.100.20 \
+    --subnet-base 10.200 --idx 1 --key 1001 --tcp-ports 3001 --udp-ports 3001 --yes >/dev/null
+
+# It must change nothing: no new interface, no new rule.
+tuns_before="$(ls "$R/state/tunnels" 2>/dev/null | sort | tr '\n' ' ')"
+rules_before="$(cat "$R/state/iptables.nat" "$R/state/iptables.filter" 2>/dev/null | md5sum)"
+
+gre tunnel diagnose --name de1
+assert "diagnose: rc=0 on a healthy connection" test "$GRE_RC" -eq 0
+assert "diagnose: reports the interface present" grep -qE '\[PASS\][[:space:]]+interface_exists' <<< "$GRE_OUT"
+assert "diagnose: reports the local endpoint" grep -qE '\[PASS\][[:space:]]+local_endpoint' <<< "$GRE_OUT"
+assert "diagnose: reports the remote endpoint" grep -qE '\[PASS\][[:space:]]+remote_endpoint' <<< "$GRE_OUT"
+assert "diagnose: reports the tunnel address" grep -qE '\[PASS\][[:space:]]+tunnel_address' <<< "$GRE_OUT"
+assert "diagnose: reports the underlay route" grep -qE '\[PASS\][[:space:]]+underlay_route' <<< "$GRE_OUT"
+assert "diagnose: reports GRE protocol 47" grep -qE '\[PASS\][[:space:]]+gre_47_permitted' <<< "$GRE_OUT"
+assert "diagnose: reports reachability" grep -qE '\[PASS\][[:space:]]+tunnel_reachable' <<< "$GRE_OUT"
+assert "diagnose: prints a summary line" grep -qE '^pass=[0-9]+ warn=[0-9]+ fail=[0-9]+ unknown=[0-9]+$' <<< "$GRE_OUT"
+
+assert "diagnose is read-only: no interface added" \
+    test "$tuns_before" = "$(ls "$R/state/tunnels" 2>/dev/null | sort | tr '\n' ' ')"
+assert "diagnose is read-only: no rule changed" \
+    test "$rules_before" = "$(cat "$R/state/iptables.nat" "$R/state/iptables.filter" 2>/dev/null | md5sum)"
+
+# JSON form must be valid for a parser, and must expose every check.
+gre tunnel diagnose --name de1 --json
+assert "diagnose --json: rc=0" test "$GRE_RC" -eq 0
+json_valid "diagnose --json: valid JSON"
+assert "diagnose --json: names the side" grep -q '"side":"iran"' <<< "$GRE_OUT"
+assert "diagnose --json: has a summary" grep -q '"summary":{' <<< "$GRE_OUT"
+assert "diagnose --json: has a checks array" grep -q '"checks":\[' <<< "$GRE_OUT"
+assert "diagnose --json: includes the reachability check" grep -q 'tunnel_reachable' <<< "$GRE_OUT"
+assert_not "diagnose --json: leaks no secret" grep -qi 'password\|secret' <<< "$GRE_OUT"
+
+# A missing interface is a FAIL with an actionable fix, and a non-zero exit.
+rm -f "$R/state/tunnels/gre-de1"
+gre tunnel diagnose --name de1
+assert_not "diagnose: rc != 0 when the interface is gone" test "$GRE_RC" -eq 0
+assert "diagnose: names the missing interface" grep -qE '\[FAIL\][[:space:]]+interface_exists' <<< "$GRE_OUT"
+assert "diagnose: says how to create it" grep -qi 'peer apply\|node add' <<< "$GRE_OUT"
+assert "diagnose: unknowns the checks it cannot run" grep -qE '\[UNKNOWN\][[:space:]]+interface_up' <<< "$GRE_OUT"
+assert_not "diagnose: does not claim the tunnel is reachable" grep -qE '\[PASS\][[:space:]]+tunnel_reachable' <<< "$GRE_OUT"
+
+# An unknown connection is refused, not reported as healthy.
+gre tunnel diagnose --name nope
+assert_not "diagnose: rc != 0 for an unknown connection" test "$GRE_RC" -eq 0
+assert "diagnose: says the connection is not configured here" grep -qi 'No connection named' <<< "$GRE_OUT"
+gre tunnel diagnose
+assert_not "diagnose: rc != 0 without --name" test "$GRE_RC" -eq 0
+gre tunnel --help
+assert "tunnel --help: rc=0" test "$GRE_RC" -eq 0
+assert "tunnel --help: documents diagnose" grep -q 'tunnel diagnose' <<< "$GRE_OUT"
+gre --help
+assert "gre --help: lists tunnel diagnose" grep -q 'tunnel diagnose' <<< "$GRE_OUT"
+rm -rf "$R"
+
+# ------------------------------------------- a GRE route that loops into the tunnel
+# The classic self-inflicted outage: a route that sends the GRE packets themselves
+# back out of the GRE interface, so the tunnel can never come up.
+mkroot
+gre foreign-setup --foreign-ip 203.0.113.10 --yes >/dev/null
+gre iran peer add --name de1 --foreign-ip 203.0.113.10 --iran-ip 198.51.100.20 \
+    --subnet-base 10.200 --idx 1 --key 1001 --tcp-ports 3001 --yes >/dev/null
+gre tunnel diagnose --name de1
+assert "loop fixture: clean route set reports no loop" grep -qE '\[PASS\][[:space:]]+no_gre_loop_route' <<< "$GRE_OUT"
+rm -rf "$R"
+
+# ---------------------------------------------------------------- tunnel rules
+mkroot
+gre foreign-setup --foreign-ip 203.0.113.10 --yes >/dev/null
+gre tunnel rules
+assert "tunnel rules: rc=0" test "$GRE_RC" -eq 0
+gre tunnel rules --json
+assert "tunnel rules --json: rc=0" test "$GRE_RC" -eq 0
+json_valid "tunnel rules --json: valid JSON"
+rm -rf "$R"

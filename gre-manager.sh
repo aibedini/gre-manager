@@ -4887,6 +4887,357 @@ doctor_peer_mss() {
     fi
 }
 
+# ------------------------------------------------- tunnel diagnose (read-only)
+#
+# A read-only counterpart to `gre doctor`, for the case where the tunnel exists (or
+# should) but traffic does not flow. It answers the question doctor cannot: is this a
+# CONFIGURATION problem, an UNDERLAY problem, a FIREWALL problem, or simply a probe
+# that could not tell?
+#
+# It changes nothing: no interface is created or removed, no rule is touched, no
+# service is restarted. Every check reports PASS / WARN / FAIL / UNKNOWN, and UNKNOWN
+# is used honestly — for a probe that could not run, rather than being reported as a
+# failure or quietly as a success.
+
+# Escape a string for a JSON string value. Tolerates an empty/missing argument, so it
+# is safe under `set -u` when an optional field happens to be unset.
+json_escape() {
+    local s="${1:-}"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+# Every iptables rule mentioning GRE or this manager, across all tables. Read-only.
+dump_gre_rules() {
+    local t
+    for t in filter nat mangle raw; do
+        iptables -t "$t" -S 2>/dev/null | sed "s|^|-t $t |"
+    done
+}
+
+tunnel_diagnose() { # tunnel_diagnose NAME [--json]
+    local name="$1"; shift || true
+    local AS_JSON=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) AS_JSON=1; shift ;;
+            *) err "Unknown option: $1"; return 1 ;;
+        esac
+    done
+
+    [[ -n "$name" ]] || { err "Usage: gre tunnel diagnose --name NAME [--json]"; return 1; }
+    valid_name "$name" || { err "Invalid connection name: '$name'"; return 1; }
+
+    # Resolve which side this host is for this connection. The name identifies the
+    # connection on both sides; which FILE it lives in says which side we are on.
+    local side="" peerf="$FOREIGNS_DIR/$name.conf" nodef="$NODES_DIR/$name.conf"
+    if [[ -f "$peerf" ]]; then
+        side="iran"
+    elif [[ -f "$nodef" ]]; then
+        side="foreign"
+    else
+        err "No connection named '$name' is configured on this host."
+        err "  looked for: $peerf"
+        err "              $nodef"
+        return 1
+    fi
+
+    local NAME="" FOREIGN_IP="" IRAN_IP="" WAN_IF="" SUBNET_BASE="$DEFAULT_SUBNET_BASE" \
+          IDX="" KEY="" TUN="" TCP_PORTS="" UDP_PORTS="" MSS_CLAMP="0"
+    if [[ "$side" == "iran" ]]; then
+        load_peer_conf "$peerf" || { err "Peer config $peerf failed validation."; return 1; }
+    else
+        node_conf_read "$nodef" NAME IRAN_IP SUBNET_BASE IDX KEY TUN
+        FOREIGN_IP="$(foreign_local_ip)"
+    fi
+    [[ -n "$TUN" ]] || TUN="gre-$NAME"
+
+    # The two ends, as this host sees them.
+    local self_ip peer_ip self_cidr peer_cidr
+    if [[ "$side" == "iran" ]]; then
+        self_ip="$IRAN_IP"; peer_ip="$FOREIGN_IP"
+        self_cidr="${SUBNET_BASE}.${IDX}.2/30"; peer_cidr="${SUBNET_BASE}.${IDX}.1"
+    else
+        self_ip="$FOREIGN_IP"; peer_ip="$IRAN_IP"
+        self_cidr="${SUBNET_BASE}.${IDX}.1/30"; peer_cidr="${SUBNET_BASE}.${IDX}.2"
+    fi
+
+    local checks_json="" n_ok=0 n_warn=0 n_fail=0 n_unknown=0
+    add_check() { # add_check ID STATUS DETAIL
+        local id="$1" st="$2" dt="$3"
+        case "$st" in
+            PASS) n_ok=$(( n_ok + 1 )) ;;
+            WARN) n_warn=$(( n_warn + 1 )) ;;
+            FAIL) n_fail=$(( n_fail + 1 )) ;;
+            *)    n_unknown=$(( n_unknown + 1 )) ;;
+        esac
+        [[ -n "$checks_json" ]] && checks_json+=","
+        checks_json+="{\"id\":\"$(json_escape "$id")\",\"status\":\"$st\",\"detail\":\"$(json_escape "$dt")\"}"
+        [[ "$AS_JSON" == "1" ]] || printf '%-9s %-28s %s\n' "[$st]" "$id" "$dt"
+    }
+
+    # 1 + 2. interface present and administratively up
+    local iface_up="no"
+    if tun_exists "$TUN"; then
+        if ip link show "$TUN" 2>/dev/null | grep -qE 'state (UP|UNKNOWN)|<[^>]*UP'; then
+            iface_up="yes"
+        fi
+        # ip link show does not always print state; treat a present interface with an
+        # address as up, and say so rather than guessing.
+        [[ "$iface_up" == "no" ]] && iface_up="unknown"
+    fi
+
+    # 3 + 4. endpoints and key, compared against the live interface
+    local live_local live_remote live_key
+    live_local="$(tunnel_local_endpoint "$TUN")"
+    live_remote="$(ip -d tunnel show "$TUN" 2>/dev/null | sed -n 's/.*[[:space:]]remote[[:space:]]\+\([0-9.]\+\)[[:space:]].*/\1/p' | head -n1)"
+    live_key="$(ip -d tunnel show "$TUN" 2>/dev/null | sed -n 's/.*[[:space:]]key[[:space:]]\+\([0-9]\+\).*/\1/p' | head -n1)"
+
+    # 5 + 6. addressing
+    local live_addr
+    live_addr="$(ip -4 addr show dev "$TUN" 2>/dev/null | sed -n 's/.*inet[[:space:]]\+\([0-9./]\+\).*/\1/p' | head -n1)"
+
+    # 7 + 8. routing to the peer, and a route that would loop GRE back into itself
+    local peer_route="" loop_route=""
+    if [[ -n "$peer_ip" ]]; then
+        peer_route="$(ip -4 route get "$peer_ip" 2>/dev/null | head -n1)"
+    fi
+    loop_route="$(ip -4 route show 2>/dev/null | grep -E "dev $TUN" | grep -vE "${SUBNET_BASE}\.${IDX}\." | head -n1)"
+
+    # 9 + 10. is GRE (protocol 47) blocked, and what does our own rule set say
+    local gre_blocked="unknown"
+    if command -v iptables >/dev/null 2>&1; then
+        if iptables -C INPUT -p gre -m comment --comment "multi-gre-block" -j DROP 2>/dev/null; then
+            # A catch-all DROP exists. The peer is only permitted if an ACCEPT for its
+            # address is present, so that is what decides the verdict.
+            if [[ -n "$peer_ip" ]] && iptables -C INPUT -p gre -s "$peer_ip" \
+                    -m comment --comment "multi-gre-node-$NAME" -j ACCEPT 2>/dev/null; then
+                gre_blocked="no"
+            else
+                gre_blocked="yes"
+            fi
+        else
+            gre_blocked="no"
+        fi
+    fi
+
+    # 11. forwarding, only meaningful where this host forwards
+    local ip_forward=""
+    ip_forward="$(sysctl -n net.ipv4.ip_forward 2>/dev/null)"
+
+    # 12. counters
+    local rx_bytes="" tx_bytes=""
+    if [[ -r "/sys/class/net/$TUN/statistics/rx_bytes" ]]; then
+        rx_bytes="$(cat "/sys/class/net/$TUN/statistics/rx_bytes" 2>/dev/null)"
+        tx_bytes="$(cat "/sys/class/net/$TUN/statistics/tx_bytes" 2>/dev/null)"
+    fi
+
+    # 13. duplicates / stale interfaces carrying the same subnet
+    local dup_tuns=""
+    dup_tuns="$(ip -4 addr show 2>/dev/null | grep -E "inet ${SUBNET_BASE}\.${IDX}\." | sed -n 's/.*[[:space:]]\([^ ]*\)$/\1/p' | sort -u | tr '\n' ' ')"
+
+    # 14. does the config agree with what is live?
+    local drift=""
+    if tun_exists "$TUN"; then
+        [[ -n "$live_local" && "$live_local" != "$self_ip" ]] && drift+="local $live_local != $self_ip; "
+        [[ -n "$live_remote" && -n "$peer_ip" && "$live_remote" != "$peer_ip" ]] && drift+="remote $live_remote != $peer_ip; "
+        [[ -n "$live_key" && -n "$KEY" && "$live_key" != "$KEY" ]] && drift+="key $live_key != $KEY; "
+    fi
+
+    # 15. is the far end of the tunnel actually reachable
+    local ping_state="UNKNOWN" ping_detail="not attempted"
+    if tun_exists "$TUN"; then
+        if ping -c 2 -W 3 "$peer_cidr" >/dev/null 2>&1; then
+            ping_state="PASS"; ping_detail="$peer_cidr replied"
+        else
+            # Distinguish "the tunnel is down" from "ICMP over the tunnel is filtered":
+            # the underlay telling us the peer host is up makes a silent tunnel much
+            # more likely to be a filter than a broken link.
+            local underlay="down"
+            if [[ -n "$peer_ip" ]] && ping -c 2 -W 3 "$peer_ip" >/dev/null 2>&1; then
+                underlay="up"
+            fi
+            if [[ "$underlay" == "up" ]]; then
+                ping_state="WARN"
+                ping_detail="$peer_cidr did not reply, but the peer host $peer_ip is reachable on the underlay (tunnel ICMP may be filtered)"
+            else
+                ping_state="FAIL"
+                ping_detail="$peer_cidr did not reply"
+            fi
+        fi
+    fi
+
+    # ---- the checks, in the order an operator should read them
+    if tun_exists "$TUN"; then
+        add_check "interface_exists" "PASS" "$TUN is present"
+    else
+        add_check "interface_exists" "FAIL" "$TUN does not exist (create it: gre iran peer apply --name $NAME / gre node add)"
+    fi
+
+    if [[ "$iface_up" == "yes" ]]; then
+        add_check "interface_up" "PASS" "$TUN is administratively up"
+    elif [[ "$iface_up" == "unknown" ]]; then
+        add_check "interface_up" "UNKNOWN" "could not read the link state of $TUN"
+    elif tun_exists "$TUN"; then
+        add_check "interface_up" "FAIL" "$TUN is present but not up"
+    else
+        add_check "interface_up" "UNKNOWN" "no interface to inspect"
+    fi
+
+    if ! tun_exists "$TUN"; then
+        add_check "local_endpoint" "UNKNOWN" "no interface to inspect"
+        add_check "remote_endpoint" "UNKNOWN" "no interface to inspect"
+        add_check "gre_key" "UNKNOWN" "no interface to inspect"
+    else
+        if [[ -z "$live_local" ]]; then
+            add_check "local_endpoint" "FAIL" "the interface has no local address (this is the endpoint that must be this host's public IP)"
+        elif [[ -n "$self_ip" && "$live_local" != "$self_ip" ]]; then
+            add_check "local_endpoint" "FAIL" "interface local=$live_local but this host should use $self_ip"
+        else
+            add_check "local_endpoint" "PASS" "$live_local"
+        fi
+        if [[ -z "$live_remote" ]]; then
+            add_check "remote_endpoint" "FAIL" "the interface has no remote address"
+        elif [[ -n "$peer_ip" && "$live_remote" != "$peer_ip" ]]; then
+            add_check "remote_endpoint" "FAIL" "interface remote=$live_remote but the config says $peer_ip"
+        else
+            add_check "remote_endpoint" "PASS" "$live_remote"
+        fi
+        if [[ -z "$live_key" ]]; then
+            add_check "gre_key" "WARN" "no GRE key on the interface (both ends must match; unset is only valid if both ends are unset)"
+        elif [[ -n "$KEY" && "$live_key" != "$KEY" ]]; then
+            add_check "gre_key" "FAIL" "interface key=$live_key but the config says $KEY (both ends and the config must match)"
+        else
+            add_check "gre_key" "PASS" "$live_key"
+        fi
+    fi
+
+    if [[ -z "$live_addr" ]]; then
+        add_check "tunnel_address" "FAIL" "no IPv4 address on $TUN (expected $self_cidr)"
+    elif [[ "$live_addr" != "$self_cidr" ]]; then
+        add_check "tunnel_address" "WARN" "$live_addr (config expects $self_cidr)"
+    else
+        add_check "tunnel_address" "PASS" "$live_addr"
+    fi
+
+    if [[ -z "$peer_ip" ]]; then
+        add_check "underlay_route" "UNKNOWN" "the peer address is not configured"
+    elif [[ -z "$peer_route" ]]; then
+        add_check "underlay_route" "FAIL" "no route to $peer_ip"
+    elif [[ "$peer_route" == *"dev $TUN"* ]]; then
+        add_check "underlay_route" "FAIL" "the route to $peer_ip goes back out through $TUN itself (GRE cannot be carried inside GRE)"
+    else
+        add_check "underlay_route" "PASS" "$peer_route"
+    fi
+
+    if [[ -n "$loop_route" ]]; then
+        add_check "no_gre_loop_route" "FAIL" "a route sends non-tunnel traffic out $TUN: $loop_route"
+    else
+        add_check "no_gre_loop_route" "PASS" "no non-tunnel route points at $TUN"
+    fi
+
+    if [[ "$gre_blocked" == "yes" ]]; then
+        add_check "gre_47_permitted" "FAIL" "the GRE whitelist drops protocol 47 from $peer_ip (fix: gre node add --name $NAME --ip $peer_ip, or disable the whitelist)"
+    elif [[ "$gre_blocked" == "no" ]]; then
+        add_check "gre_47_permitted" "PASS" "protocol 47 is not dropped by the manager's whitelist"
+    else
+        add_check "gre_47_permitted" "UNKNOWN" "iptables is not available, so GRE filtering could not be checked"
+    fi
+
+    if [[ -n "$dup_tuns" && "$(echo "$dup_tuns" | tr -d ' \n')" != "$TUN" ]]; then
+        add_check "duplicate_address" "WARN" "these interfaces share ${SUBNET_BASE}.${IDX}.x: $dup_tuns"
+    else
+        add_check "duplicate_address" "PASS" "no other interface uses ${SUBNET_BASE}.${IDX}.x"
+    fi
+
+    if [[ -z "$ip_forward" ]]; then
+        add_check "ip_forward" "UNKNOWN" "could not read net.ipv4.ip_forward"
+    elif [[ "$ip_forward" == "1" ]]; then
+        add_check "ip_forward" "PASS" "net.ipv4.ip_forward=1"
+    elif [[ "$side" == "iran" && ( -n "$TCP_PORTS" || -n "$UDP_PORTS" ) ]]; then
+        add_check "ip_forward" "FAIL" "net.ipv4.ip_forward=0 but this host forwards ports (enable: sysctl -w net.ipv4.ip_forward=1)"
+    else
+        add_check "ip_forward" "WARN" "net.ipv4.ip_forward=0"
+    fi
+
+    if [[ -z "$rx_bytes" ]]; then
+        add_check "traffic_counters" "UNKNOWN" "no counters for $TUN"
+    elif [[ "$rx_bytes" == "0" && "${tx_bytes:-0}" == "0" ]]; then
+        add_check "traffic_counters" "WARN" "no bytes have crossed $TUN (rx=$rx_bytes tx=${tx_bytes:-0})"
+    else
+        add_check "traffic_counters" "PASS" "rx=$rx_bytes tx=${tx_bytes:-0}"
+    fi
+
+    if [[ -n "$drift" ]]; then
+        add_check "config_matches_live" "FAIL" "${drift%; }"
+    elif tun_exists "$TUN"; then
+        add_check "config_matches_live" "PASS" "the live interface matches the configuration"
+    else
+        add_check "config_matches_live" "UNKNOWN" "no interface to compare"
+    fi
+
+    add_check "tunnel_reachable" "$ping_state" "$ping_detail"
+
+    if [[ "$AS_JSON" == "1" ]]; then
+        printf '{"name":"%s","side":"%s","tunnel":"%s","generated_at":"%s",' \
+            "$(json_escape "$name")" "$side" "$(json_escape "$TUN")" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        printf '"summary":{"pass":%d,"warn":%d,"fail":%d,"unknown":%d},' "$n_ok" "$n_warn" "$n_fail" "$n_unknown"
+        printf '"checks":[%s]}\n' "$checks_json"
+    else
+        printf '\n'
+        printf 'pass=%d warn=%d fail=%d unknown=%d\n' "$n_ok" "$n_warn" "$n_fail" "$n_unknown"
+    fi
+
+    # Exit non-zero only on a real failure, so a script can gate on it.
+    (( n_fail == 0 ))
+}
+
+cli_tunnel_diagnose() { # gre tunnel diagnose --name NAME [--json]
+    local NAME="" AS_JSON=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) [[ -n "${2:-}" ]] || { err "Missing value for --name"; return 1; }; NAME="$2"; shift 2 ;;
+            --json) AS_JSON=1; shift ;;
+            --help|-h)
+                echo "Usage: gre tunnel diagnose --name NAME [--json]"
+                echo "Read-only: reports whether a connection's tunnel is configured, up,"
+                echo "routed, permitted and actually passing traffic. Changes nothing."
+                return 0 ;;
+            *) err "Unknown option: $1"; err "Usage: gre tunnel diagnose --name NAME [--json]"; return 1 ;;
+        esac
+    done
+    [[ -n "$NAME" ]] || { err "Usage: gre tunnel diagnose --name NAME [--json]"; return 1; }
+    if [[ "$AS_JSON" == "1" ]]; then
+        tunnel_diagnose "$NAME" --json
+    else
+        echo
+        info "Diagnosing connection '$NAME' (read-only)..."
+        echo
+        tunnel_diagnose "$NAME"
+    fi
+}
+
+# Also dump the raw rule set on request, for a report an operator can paste.
+cli_tunnel_rules() { # gre tunnel rules [--json]
+    local AS_JSON=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) AS_JSON=1; shift ;;
+            --help|-h) echo "Usage: gre tunnel rules [--json]"; return 0 ;;
+            *) err "Unknown option: $1"; return 1 ;;
+        esac
+    done
+    if [[ "$AS_JSON" == "1" ]]; then
+        printf '{"rules":"%s"}\n' "$(dump_gre_rules | json_escape)"
+    else
+        dump_gre_rules
+    fi
+}
+
 doctor() { # gre doctor — diagnostics; exits non-zero if any check FAILs
     local DOC_FAIL=0 DOC_WARN=0
     echo
@@ -5388,6 +5739,10 @@ Usage:
   gre                     interactive menu
   gre status [--json]     show status (machine-readable JSON with --json)
   gre doctor              diagnostics: PASS/WARN/FAIL per check, non-zero exit on FAIL
+  gre tunnel diagnose --name NAME [--json]
+                          read-only per-connection tunnel health; changes nothing
+  gre tunnel rules [--json]
+                          print the manager's iptables rules (read-only)
   gre node list [--json]  list configured Iran nodes (FOREIGN)
   gre node add --name NAME --ip IRAN_IP [--idx N] [--key K] [--subnet-base A.B] [--yes]
                           add an Iran node on FOREIGN (non-interactive)
@@ -5519,6 +5874,29 @@ EOF
     iran-setup)        cli_iran_setup "${@:2}" ;;
     foreign-setup)     cli_foreign_setup "${@:2}" ;;
     doctor)            doctor ;;
+    tunnel)
+        case "${2:-}" in
+            diagnose)  cli_tunnel_diagnose "${@:3}" ;;
+            rules)     cli_tunnel_rules "${@:3}" ;;
+            --help|-h|"")
+                cat <<'EOF'
+Usage:
+  gre tunnel diagnose --name NAME [--json]
+      Read-only health report for one connection: interface present and up,
+      endpoints and GRE key correct, addressing, underlay route (including a route
+      that would loop GRE inside GRE), whether protocol 47 is filtered, IP
+      forwarding, traffic counters, duplicate/stale interfaces, whether the live
+      interface matches the configuration, and whether the far end actually replies.
+      Every check reports PASS, WARN, FAIL or UNKNOWN, and changes nothing.
+
+  gre tunnel rules [--json]
+      Print the manager's iptables rules across all tables. Read-only.
+
+Exits non-zero when any check FAILs, so it can gate a script.
+EOF
+                ;;
+            *)         err "Usage: gre tunnel <diagnose|rules> ...  (see: gre tunnel --help)"; exit 1 ;;
+        esac ;;
     export)            cli_export "${@:2}" ;;
     import)            cli_import "${@:2}" ;;
     update)            self_update ;;
