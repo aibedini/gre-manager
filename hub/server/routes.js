@@ -1457,12 +1457,13 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
   // records. A mismatch means one side was changed outside the Hub (or a previous
   // operation half-completed), and editing on top of that would silently pick a
   // winner. Reported, never auto-corrected.
+  //
+  // `iran_endpoint` is only compared when it holds the JSON this code writes. The
+  // orchestrator also stores a bare IP there, and treating that as a pairing record
+  // used to look like permanent drift (or hid real drift) depending on the value.
   function detectDrift(row) {
     const endpoint = connections.parseEndpoint(row.iran_endpoint);
     const mismatches = [];
-    if (endpoint.subnet_base && row.host_group_id && endpoint.subnet_base !== row.host_group_id) {
-      mismatches.push(`subnet base: recorded ${row.host_group_id}, endpoint says ${endpoint.subnet_base}`);
-    }
     if (endpoint.foreign_ip && row.foreign_ip && endpoint.foreign_ip !== row.foreign_ip) {
       mismatches.push(`foreign IP: recorded ${row.foreign_ip}, endpoint says ${endpoint.foreign_ip}`);
     }
@@ -1531,7 +1532,33 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     const row = connectionRow(req.params.id);
     if (!row) return res.status(404).json({ error: 'not found' });
     const requested = sanitizeEditRequest(req.body || {});
-    const thePlan = connections.plan(db, row, requested);
+
+    // Before planning, make sure the Hub actually KNOWS this connection's tunnel
+    // parameters. It stores identity and history; /etc/multi-gre holds the truth. When
+    // the DB has never learned subnet/index/key, read them from the Iran server and
+    // record them — because the alternative is planning a change against a guessed
+    // baseline, and then rewriting a live tunnel from it.
+    const learned = await connections.learnStateFromServers({
+      db, row, remote: remoteFor, resolveServer: (id) => getServer(id),
+    }).catch((err) => ({ learned: false, source: 'none', error: err.message }));
+    const fresh = learned.learned ? connectionRow(req.params.id) : row;
+    const thePlan = connections.plan(db, fresh, requested, {
+      stateSource: learned.learned ? `read from ${learned.source}` : 'hub-metadata',
+    });
+    // Not being able to read the server only blocks a change that DEPENDS on the
+    // tunnel parameters. A rule-only edit re-points NAT and takes its ports from the
+    // route's own columns, so refusing it because the peer could not be read would
+    // refuse a safe edit for no reason.
+    const needsTunnelState = thePlan.class === 'B' || thePlan.class === 'C';
+    if (learned.error && needsTunnelState) {
+      thePlan.preflight.push({
+        name: 'Current tunnel parameters could be read from the server',
+        ok: false,
+        detail: learned.error,
+      });
+      thePlan.can_apply = false;
+      thePlan.blocked_reason = thePlan.blocked_reason || learned.error;
+    }
 
     // A migration additionally needs to know the targets are actually usable.
     if (thePlan.class === 'C') {

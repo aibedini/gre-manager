@@ -389,12 +389,16 @@ async function main() {
     check('TEST 18 — connection_id survives an Iran migration', (await hub.client.call(`/api/gre-connections/${connId}`)).data.connection_id === uuidBefore);
 
     console.log('\nTEST 20 — drift blocks a direct edit');
-    db.prepare('UPDATE gre_routes SET host_group_id = ? WHERE id = ?').run('10.250', connId);
+    // Drift is a disagreement between the pairing record and the route row. Note it is
+    // deliberately NOT expressed through host_group_id: that column is a 3x-ui
+    // managed-host id, and reading it as tunnel data was itself a defect (TEST 27).
+    const foreignIpBefore = db.prepare('SELECT foreign_ip FROM gre_routes WHERE id = ?').get(connId).foreign_ip;
+    db.prepare('UPDATE gre_routes SET foreign_ip = ? WHERE id = ?').run('203.0.113.250', connId);
     r = await hub.client.call(`/api/gre-connections/${connId}`, { method: 'PUT', body: { key: 1111 } });
     check('a drifted connection refuses a direct edit with 409', r.status === 409, `status=${r.status}`);
     check('the refusal says drift', /drift/i.test(String(r.data.error)), String(r.data.error));
     check('the refusal offers reconcile as an option', JSON.stringify(r.data.options || []).includes('reconcile'));
-    db.prepare('UPDATE gre_routes SET host_group_id = ? WHERE id = ?').run('10.200', connId);
+    db.prepare('UPDATE gre_routes SET foreign_ip = ? WHERE id = ?').run(foreignIpBefore, connId);
 
     console.log('\nTEST 21/22 — locks');
     // Deterministic, and honest about what it proves: hold the connection's real
@@ -471,6 +475,35 @@ async function main() {
     check('rolling back an unknown operation → 404', r.status === 404, `status=${r.status}`);
     r = await hub.client.call(`/api/gre-connections/${connId}/rollback`, { method: 'POST', body: {} });
     check('rollback without an operation_id → 400', r.status === 400, `status=${r.status}`);
+
+    console.log('\nTEST 27 — host_group_id is a 3x-ui host id, never a tunnel parameter');
+    // The Hub used to fall back to host_group_id for subnet_base when its pairing
+    // record was missing. host_group_id is a managed-host group id passed to the
+    // panel's deleteHost API, so that fallback fed a panel host id into the GRE
+    // planner — and the planner would then "helpfully" rewrite the live tunnel from it.
+    const hgId = seedConnection(hub, {
+      name: 'hg1', iranId: iranA, foreignId: foreignA, iranIp: '198.51.100.44',
+      foreignIp: '203.0.113.44', subnetBase: '10.240', idx: 4, key: 1400, tcp: '7443', udp: '',
+    });
+    db.prepare('UPDATE gre_routes SET iran_endpoint = ?, host_group_id = ? WHERE id = ?')
+      .run('198.51.100.44', 'HOSTGROUP-99', hgId);
+    r = await hub.client.call(`/api/gre-connections/${hgId}`);
+    check('the host id is never shown as the subnet base',
+      r.data.subnet_base !== 'HOSTGROUP-99', String(r.data.subnet_base));
+    check('the unknown subnet is reported as unknown, not invented',
+      r.data.subnet_base === null, String(r.data.subnet_base));
+    r = await hub.client.call(`/api/gre-connections/${hgId}/plan-edit`, { method: 'POST', body: { key: 9 } });
+    check('a recreate is refused when the baseline is unknown', r.data.can_apply === false, JSON.stringify(r.data.validation_errors));
+    check('the refusal explains what is unknown',
+      /not known to the Hub/i.test(JSON.stringify(r.data.validation_errors)), JSON.stringify(r.data.validation_errors));
+    check('the refusal never mentions the panel host id',
+      !JSON.stringify(r.data).includes('HOSTGROUP-99'));
+    // A rule-only change does not depend on the tunnel parameters, so it must still
+    // work. 7445 is free (nl1 holds 8443), so this tests the unknown-baseline rule and
+    // not an accidental port collision.
+    r = await hub.client.call(`/api/gre-connections/${hgId}/plan-edit`, { method: 'POST', body: { tcp_ports: '7445' } });
+    check('a rule-only change is still allowed with an unknown tunnel baseline',
+      r.data.can_apply === true, JSON.stringify({ can: r.data.can_apply, err: r.data.validation_errors, blocked: r.data.blocked_reason }));
 
     console.log('\n404s');
     check('GET an unknown connection → 404', (await hub.client.call('/api/gre-connections/99999')).status === 404);

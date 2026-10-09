@@ -106,9 +106,13 @@ function project(db, row) {
     foreign_server_id: row.foreign_server_id,
     foreign_server: foreign.name || null,
     foreign_ip: row.foreign_ip || foreign.host || null,
-    subnet_base: row.host_group_id || null,
-    idx: null,
-    key: null,
+    // Read from the pairing record only. `host_group_id` is a 3x-ui managed-host id
+    // and must never be presented as a tunnel parameter — doing so showed an operator
+    // a panel host id where the GRE subnet belonged, and fed the planner the same
+    // wrong value.
+    subnet_base: parseEndpoint(row.iran_endpoint).subnet_base || null,
+    idx: parseEndpoint(row.iran_endpoint).idx === undefined ? null : Number(parseEndpoint(row.iran_endpoint).idx),
+    key: parseEndpoint(row.iran_endpoint).key === undefined ? null : Number(parseEndpoint(row.iran_endpoint).key),
     tcp_ports: row.tcp_ports || String(row.port || ''),
     udp_ports: row.udp_ports || String(row.port || ''),
     mss_clamp: row.mss_clamp === null || row.mss_clamp === undefined ? null : Number(row.mss_clamp),
@@ -128,30 +132,53 @@ function project(db, row) {
 
 // The shape the planner and the CLI need: the authoritative current state.
 //
-// subnet_base/idx/key are reconstructed from the route's own ownership metadata.
-// Where the Hub never learned a value it reports null rather than guessing, and the
-// planner treats a null as "no opinion" instead of silently inventing one.
+// IMPORTANT: every value here comes from a column whose meaning is actually known.
+//
+// This used to fall back to `row.host_group_id` for subnet_base. That column is a
+// 3x-ui MANAGED-HOST GROUP ID — a value passed straight to the panel's deleteHost
+// API (see route-orchestrator's cleanup) — not a GRE subnet base. Reading it as one
+// meant the planner could be handed a panel host id and treat it as a tunnel
+// parameter, which is exactly how a "safe" edit would rewrite a live tunnel with
+// garbage.
+//
+// A parameter the Hub genuinely does not know is reported as null, and `plan()` then
+// REFUSES to build a change that depends on it (see UNKNOWN_PARAM_FIELDS). Silently
+// substituting a plausible value is the failure mode this guards against.
 function currentState(db, row) {
   const parsed = parseEndpoint(row.iran_endpoint);
+  const unknown = [];
+  const orUnknown = (value, field) => {
+    if (value === null || value === undefined || value === '') { unknown.push(field); return null; }
+    return value;
+  };
   return {
     id: row.id,
     name: row.name,
     iran_server_id: row.iran_server_id,
     foreign_server_id: row.foreign_server_id,
+    // Addresses have dedicated columns; iran_endpoint is only a fallback because the
+    // orchestrator historically stored a bare IP there.
     iran_ip: row.iran_ip || parsed.iran_ip || null,
     foreign_ip: row.foreign_ip || parsed.foreign_ip || null,
-    subnet_base: parsed.subnet_base || row.host_group_id || null,
-    idx: parsed.idx !== undefined ? parsed.idx : null,
-    key: parsed.key !== undefined ? parsed.key : null,
+    subnet_base: orUnknown(parsed.subnet_base, 'subnet_base'),
+    idx: parsed.idx === undefined || parsed.idx === null ? (unknown.push('idx'), null) : Number(parsed.idx),
+    key: parsed.key === undefined || parsed.key === null ? (unknown.push('key'), null) : Number(parsed.key),
     tcp_ports: row.tcp_ports || String(row.port || ''),
     udp_ports: row.udp_ports || String(row.port || ''),
     mss_clamp: row.mss_clamp === null || row.mss_clamp === undefined ? null : Number(row.mss_clamp),
     peer_name: row.peer_name,
+    unknown_fields: unknown,
   };
 }
 
-// iran_endpoint is the one place the orchestrator already persists pairing values,
-// so read them back rather than re-deriving them.
+// Tunnel parameters the Hub cannot safely guess. A change that touches one of these
+// is refused until the authoritative value has been read from the managed server
+// (the API does that via learnStateFromServers before planning).
+const UNKNOWN_PARAM_FIELDS = ['subnet_base', 'idx', 'key'];
+
+// iran_endpoint is read back only when it holds the JSON the connections code writes.
+// The orchestrator also stores a bare IP string there, so a parse failure is normal
+// and means "no pairing values recorded", not "corrupt".
 function parseEndpoint(json) {
   if (!json) return {};
   try {
@@ -166,6 +193,64 @@ function parseEndpoint(json) {
     };
   } catch { return {}; }
 }
+
+// Read the authoritative tunnel parameters from the servers themselves.
+//
+// The Hub DB holds identity, correlation and history; /etc/multi-gre holds the truth.
+// When the DB has never learned subnet/index/key (a route provisioned before this
+// release, or one whose iran_endpoint was overwritten with a bare IP), the honest
+// move is to ask the Iran side and record what it says — not to invent a value.
+//
+// Returns { state, learned, source, error } and never throws: a server that cannot be
+// reached simply leaves the parameters unknown, and the caller then blocks the edit.
+async function learnStateFromServers({ db, row, remote, resolveServer }) {
+  const parsed = parseEndpoint(row.iran_endpoint);
+  const needs = UNKNOWN_PARAM_FIELDS.filter((f) => {
+    if (f === 'subnet_base') return !parsed.subnet_base;
+    return parsed[f] === undefined || parsed[f] === null;
+  });
+  if (!needs.length) return { learned: false, source: 'hub-metadata' };
+
+  let iran;
+  try { iran = resolveServer(row.iran_server_id); } catch { iran = null; }
+  if (!iran) return { learned: false, source: 'none', error: 'the Iran server is not configured' };
+
+  let out;
+  try {
+    out = await remote(iran, actions.buildAction('peer_list_json', {}), 60000);
+  } catch (err) {
+    return { learned: false, source: 'none', error: `could not read state from ${iran.name}: ${err.message}` };
+  }
+  if (!out || out.rc !== 0) {
+    return { learned: false, source: 'none', error: `could not read state from ${iran.name}` };
+  }
+  let list;
+  try { list = JSON.parse(String(out.stdout).trim()); } catch {
+    return { learned: false, source: 'none', error: `${iran.name} returned output that is not JSON` };
+  }
+  if (!Array.isArray(list)) return { learned: false, source: 'none', error: `${iran.name} returned an unexpected shape` };
+
+  const entry = list.find((e) => String(e.name) === String(row.peer_name || row.name));
+  if (!entry) {
+    return { learned: false, source: 'none', error: `'${row.peer_name || row.name}' is not present on ${iran.name}` };
+  }
+
+  // Record what the server says so later plans are cheap and consistent.
+  const endpoint = JSON.stringify({
+    iran_ip: entry.iran_ip,
+    foreign_ip: entry.foreign_ip,
+    subnet_base: entry.subnet_base,
+    idx: entry.idx === undefined ? undefined : Number(entry.idx),
+    key: entry.key === undefined ? undefined : Number(entry.key),
+  });
+  try {
+    db.prepare('UPDATE gre_routes SET iran_endpoint = ?, iran_ip = COALESCE(?, iran_ip), foreign_ip = COALESCE(?, foreign_ip), updated_at = ? WHERE id = ?')
+      .run(endpoint, entry.iran_ip || null, entry.foreign_ip || null, Date.now(), row.id);
+  } catch { /* recording is best effort; the plan below uses the read values anyway */ }
+
+  return { learned: true, source: iran.name, entry };
+}
+
 
 // ---------------------------------------------------------------- the journal
 
@@ -224,25 +309,66 @@ function markInterrupted(db, operationId, reason) {
 // ------------------------------------------------------------------- planning
 
 // Build a plan. Reads only; performs no mutation and no SSH.
+//
+// `options.current` lets a caller pass an authoritative state it has just read from
+// the servers. Without it the Hub's own metadata is used, and any change that would
+// depend on a parameter the Hub does not actually know is REFUSED rather than
+// guessed. That refusal is the point: a plausible-looking wrong value here rewrites a
+// working tunnel with garbage.
 function plan(db, row, requested, options = {}) {
-  const current = currentState(db, row);
+  const current = options.current || currentState(db, row);
   const uuid = row.connection_uuid || null;
 
   const validationErrors = validateRequest(requested, current);
   const result = planEdit(current, requested);
+
+  // Guard against planning FROM an unknown baseline.
+  //
+  // Changing subnet/index/key is perfectly legitimate — those are exactly the fields
+  // an operator edits. What is not legitimate is doing it when the Hub does not know
+  // the CURRENT value, because the recreate path re-applies every parameter, so a
+  // null baseline becomes an empty value written into a live config.
+  //
+  // So the trigger is `unknown`, not "the change touches a tunnel field".
+  const unknown = current.unknown_fields || [];
+  const relevant = (result.class === 'B' || result.class === 'C')
+    // A recreate re-applies every tunnel parameter, so all of them must be known.
+    ? UNKNOWN_PARAM_FIELDS
+    // A rule-only change never touches them.
+    : [];
+  const dependent = relevant.filter((f) => unknown.includes(f));
+  if (dependent.length && (result.class === 'B' || result.class === 'C')) {
+    validationErrors.push(
+      `Cannot plan this change: the current ${dependent.join(', ')} of this connection is not known to the Hub. `
+      + 'Open the connection and let the Hub read it from the server first (Reconcile), then retry.',
+    );
+  }
 
   const servers = db.prepare('SELECT * FROM servers ORDER BY name').all().map((s) => ({
     id: s.id, name: s.name, host: s.host, has_secret: !!s.secret_enc,
     key_installed: !!s.key_installed, ssh_auth: s.ssh_auth,
   }));
   const connections = db.prepare('SELECT * FROM gre_routes WHERE deleted_at IS NULL ORDER BY id').all()
-    .map((r) => ({ ...currentState(db, r) }));
+    .map((r) => { const s = currentState(db, r); return { ...s }; });
 
   const checks = preflight(requested, current, {
     servers, connections, currentId: row.id,
   });
 
-  const preflightOk = checks.every((c) => c.ok);
+  // Surface the unknown parameters as an explicit preflight result only when the
+  // change actually depends on them. A rule-only change does not: it re-points NAT at
+  // the peer address, and the ports come from the route's own columns. Blocking it
+  // would refuse a safe, useful edit for no reason.
+  const unknownChecks = [];
+  if (dependent.length) {
+    unknownChecks.push({
+      name: 'Current tunnel parameters are known',
+      ok: false,
+      detail: `unknown: ${dependent.join(', ')} — Reconcile to read them from the server`,
+    });
+  }
+  const allChecks = checks.concat(unknownChecks);
+  const preflightOk = allChecks.every((c) => c.ok);
   const canApply = validationErrors.length === 0 && preflightOk && !!result.class;
 
   // Drift handling: if the two sides disagree, editing would silently pick a
@@ -256,15 +382,16 @@ function plan(db, row, requested, options = {}) {
     class_label: result.class_label,
     changes: result.changes,
     impact: result.impact,
-    preflight: checks,
+    preflight: allChecks,
     validation_errors: validationErrors,
     estimated_disruption: estimateDisruption(result.class),
     current,
     requested: { ...requested },
+    state_source: options.stateSource || 'hub-metadata',
     can_apply: canApply,
     blocked_reason: drift
       ? 'Connection drift detected'
-      : (canApply ? null : (validationErrors[0] || checks.find((c) => !c.ok)?.name || 'no changes requested')),
+      : (canApply ? null : (validationErrors[0] || allChecks.find((c) => !c.ok)?.name || 'no changes requested')),
     drift,
   };
 }
@@ -350,9 +477,18 @@ async function verifySide(remote, server, verb, want) {
 async function apply({
   db, row, requested, emit, remote, resolveServer,
 }) {
-  const current = currentState(db, row);
   const uuid = ensureUuid(db, row);
-  const thePlan = plan(db, row, requested);
+
+  // Learn the authoritative parameters BEFORE planning anything. Mutating from a
+  // guessed baseline is the failure this guards: a null subnet would be written to
+  // the live config as an empty value.
+  const learned = await learnStateFromServers({ db, row, remote, resolveServer })
+    .catch((err) => ({ learned: false, error: err.message }));
+  const fresh = learned.learned ? (getRoute(db, row.id) || row) : row;
+  const current = currentState(db, fresh);
+  const thePlan = plan(db, fresh, requested, {
+    stateSource: learned.learned ? `read from ${learned.source}` : 'hub-metadata',
+  });
   if (!thePlan.can_apply && thePlan.class !== 'C') {
     const err = new Error(thePlan.blocked_reason || 'this edit cannot be applied');
     err.plan = thePlan;
@@ -602,9 +738,29 @@ function manualRecovery({ iran, foreign, current, peerName }) {
 async function migrate({
   db, row, requested, emit, remote, resolveServer,
 }) {
-  const current = currentState(db, row);
   const uuid = ensureUuid(db, row);
-  const thePlan = plan(db, row, requested);
+
+  // A migration rebuilds the tunnel from every parameter, so an unknown one would be
+  // written as an empty value on the NEW host. Learn them first, and refuse if the
+  // server cannot tell us — a half-known migration is worse than no migration.
+  const learned = await learnStateFromServers({ db, row, remote, resolveServer })
+    .catch((err) => ({ learned: false, error: err.message }));
+  const fresh = learned.learned ? (getRoute(db, row.id) || row) : row;
+  const current = currentState(db, fresh);
+  const thePlan = plan(db, fresh, requested, {
+    stateSource: learned.learned ? `read from ${learned.source}` : 'hub-metadata',
+  });
+  const unknown = current.unknown_fields || [];
+  if (unknown.length) {
+    const err = new Error(
+      `Cannot migrate this connection: its current ${unknown.join(', ')} could not be read`
+      + `${learned.error ? ` (${learned.error})` : ''}. A migration rebuilds the tunnel, so it must not `
+      + 'run from a guessed baseline.',
+    );
+    err.status = 409;
+    err.plan = thePlan;
+    throw err;
+  }
 
   const targetForeignId = requested.foreign_server_id !== undefined
     ? Number(requested.foreign_server_id) : Number(row.foreign_server_id);
@@ -913,6 +1069,8 @@ module.exports = {
   acquireLock: acquire,
   releaseLock: release,
   parseEndpoint,
+  learnStateFromServers,
+  UNKNOWN_PARAM_FIELDS,
   getRoute,
   manualRecovery,
 };
