@@ -8034,6 +8034,14 @@ Usage:
                           restore the MTU recorded before the last change
   gre mtu nic list|analyze
                           advanced, read-only physical NIC MTU analysis
+  gre health-check --name NAME [--json] [--quick|--full] [--budget SECONDS]
+                          full network health check: every layer this connection depends
+                          on, with issue codes and evidence. Read-only; changes nothing.
+                          Exits non-zero when the verdict is BROKEN.
+  gre repair preview --name NAME [--json]
+                          the repairs available for a connection (read-only)
+  gre repair apply --name NAME --code CODE [--yes]
+                          apply ONE named repair, verified, with rollback on failure
   gre node list [--json]  list configured Iran nodes (FOREIGN)
   gre node add --name NAME --ip IRAN_IP [--idx N] [--key K] [--subnet-base A.B] [--yes]
                           add an Iran node on FOREIGN (non-interactive)

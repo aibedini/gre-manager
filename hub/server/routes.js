@@ -862,6 +862,14 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
         error: `${action} changes a live tunnel MTU and must go through the connection MTU flow (PUT /api/gre-connections/:id/mtu)`,
       });
     }
+    // A health check answers a question about a CONNECTION, not about a host: one
+    // side's answer cannot be merged with anything, and a repair has to be verified on
+    // both ends. Offering them per server would be a shortcut that looks equivalent.
+    if (action === 'health_check' || action === 'repair_preview' || action === 'repair_apply') {
+      return res.status(400).json({
+        error: `${action} inspects or repairs one CONNECTION and must go through the connection health flow (POST /api/gre-connections/:id/health-check, POST /api/gre-connections/:id/repairs/apply)`,
+      });
+    }
     try {
       // Validate every action before doing network preflight work.
       const command = actions.buildAction(action, params || {});
@@ -1435,6 +1443,7 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
 
   const connections = require('./connections');
   const connectionMtu = require('./connection-mtu');
+  const connectionHealth = require('./connection-health');
 
   // Only these fields may be edited. Anything else in the body is dropped rather
   // than passed through, so a client cannot smuggle an unexpected key into the
@@ -1842,6 +1851,155 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     const row = connectionRow(req.params.id);
     if (!row) return res.status(404).json({ error: 'not found' });
     res.json(await connectionMtu.analyzeNicBothSides({ db, row, remote: remoteFor, resolveServer: resolveServerFor }));
+  }));
+
+  // ================================================================ health
+  //
+  // The Full Network Health Check is READ-ONLY on the servers: `gre health-check`
+  // inspects and reports, and `gre repair preview` only reads what a host can repair.
+  // The single mutation here is `repairs/apply`, which goes through the journaled,
+  // locked and VERIFIED transaction in connection-health.js.
+  //
+  // The check itself runs commands on two hosts, so it takes the connection lock: two
+  // concurrent runs on one connection would double the load on a host that is already
+  // suspect and could interleave their timeline stages. It creates no remote state, so
+  // a refused run leaves nothing behind — no journal row, no lock, no timeline entries.
+  //
+  // A BROKEN verdict is DATA, not an error: the check exits non-zero when it finds a
+  // broken connection, and that answer is returned as a successful diagnosis.
+
+  authed.post('/gre-connections/:id/health-check', wrap(async (req, res) => {
+    const row = connectionRow(req.params.id);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    const body = req.body || {};
+    const mode = body.mode === undefined || body.mode === null || body.mode === '' ? 'quick' : String(body.mode);
+    if (!actions.HEALTH_MODES.includes(mode)) {
+      auditEvent(row.iran_server_id, row.name, 'gre_connection_health_check_refused',
+        { connection_id: row.connection_uuid, name: row.name, mode: String(body.mode) }, 1, 'unknown mode');
+      return res.status(400).json({ error: `mode must be one of: ${actions.HEALTH_MODES.join(', ')}` });
+    }
+    if (body.budget !== undefined && body.budget !== null && body.budget !== '') {
+      const budget = Number(body.budget);
+      if (!Number.isInteger(budget) || budget < 1 || budget > actions.HEALTH_BUDGET_MAX) {
+        auditEvent(row.iran_server_id, row.name, 'gre_connection_health_check_refused',
+          { connection_id: row.connection_uuid, name: row.name, mode }, 1, 'invalid budget');
+        return res.status(400).json({ error: `budget must be an integer 1-${actions.HEALTH_BUDGET_MAX}` });
+      }
+    }
+    if (routeOrchestrator.running && routeOrchestrator.running.has(row.id)) {
+      return res.status(409).json({ error: 'this connection is provisioning right now' });
+    }
+
+    const iran = getServer(row.iran_server_id);
+    try {
+      const run = await connectionHealth.runHealthCheck({
+        db, row, mode, budget: body.budget, emit: emitEvent(row.id), remote: remoteFor, resolveServer: resolveServerFor,
+      });
+      const combined = run.combined;
+      auditEvent(row.iran_server_id, iran ? iran.name : 'hub', 'gre_connection_health_check', {
+        connection_id: row.connection_uuid, name: row.name, mode,
+        check_id: run.check_id, overall_status: combined.overall_status,
+      }, combined.sides_readable > 0 ? 0 : 1,
+      `${combined.overall_status} (${combined.evidence_completeness} evidence); read ${combined.sides_readable}/2 sides, ${combined.summary.findings} finding(s), ${combined.summary.critical_findings} critical`);
+      res.json(run);
+    } catch (err) {
+      if (err.hostkey_mismatch) return hostKeyMismatchResponse(res, row.iran_server_id, err.presented_fp);
+      auditEvent(row.iran_server_id, iran ? iran.name : 'hub', 'gre_connection_health_check_failed',
+        { connection_id: row.connection_uuid, name: row.name, mode, check_id: err.operation_id || null }, 1, err.message);
+      res.status(err.status || 500).json({ error: err.message, operation_id: err.operation_id || null });
+    }
+  }));
+
+  // The diagnostic history: the stored runs of this connection, newest first. A pure
+  // read of the hub's own journal — it runs nothing on a server.
+  authed.get('/gre-connections/:id/health-checks', wrap(async (req, res) => {
+    const row = connectionRow(req.params.id);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    const limit = Number(req.query.limit || 25);
+    const checks = connectionHealth.healthHistory(db, row.connection_uuid, limit);
+    auditEvent(row.iran_server_id, row.name, 'gre_connection_health_history',
+      { connection_id: row.connection_uuid, name: row.name, limit }, 0, `${checks.length} stored run(s)`);
+    res.json({ connection_id: row.connection_uuid, name: row.peer_name || row.name, count: checks.length, checks });
+  }));
+
+  authed.get('/gre-connections/:id/health-checks/:checkId', wrap(async (req, res) => {
+    const row = connectionRow(req.params.id);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    const stored = connectionHealth.storedRun(db, row.connection_uuid, String(req.params.checkId || ''));
+    if (!stored) return res.status(404).json({ error: 'no such run for this connection' });
+    auditEvent(row.iran_server_id, row.name, 'gre_connection_health_check_read',
+      { connection_id: row.connection_uuid, name: row.name, check_id: stored.check_id }, 0, `${stored.kind} ${stored.status}`);
+    res.json(stored);
+  }));
+
+  // Read-only: which ends can repair a code, what that would do, and how it would be
+  // verified. It holds no lock and creates no operation, so it is safe to call while
+  // the operator is still deciding.
+  authed.post('/gre-connections/:id/repairs/preview', wrap(async (req, res) => {
+    const row = connectionRow(req.params.id);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    const code = (req.body || {}).code;
+    try {
+      const plan = await connectionHealth.planRepair({ db, row, code, remote: remoteFor, resolveServer: resolveServerFor });
+      auditEvent(row.iran_server_id, row.name, 'gre_connection_repair_preview',
+        { connection_id: row.connection_uuid, name: row.name, code: plan.code, sides: plan.repairable_sides }, 0,
+        plan.can_apply ? `read-only preview: repairable on ${plan.repairable_sides.join(', ')}` : `read-only preview: ${plan.blocked_reason}`);
+      res.json(plan);
+    } catch (err) {
+      if (err.hostkey_mismatch) return hostKeyMismatchResponse(res, row.iran_server_id, err.presented_fp);
+      auditEvent(row.iran_server_id, row.name, 'gre_connection_repair_preview_failed',
+        { connection_id: row.connection_uuid, name: row.name, code }, 1, err.message);
+      res.status(err.status || 500).json({ error: err.message, code: err.code || null });
+    }
+  }));
+
+  // Apply ONE named repair, then verify it with a fresh check on both sides. A repair
+  // that is only half applied, or that leaves the code in place, is reported as the
+  // partial or failed outcome it is — never as a success.
+  authed.post('/gre-connections/:id/repairs/apply', wrap(async (req, res) => {
+    const row = connectionRow(req.params.id);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    const body = req.body || {};
+    if (body.confirm !== true) {
+      auditEvent(row.iran_server_id, row.name, 'gre_connection_repair_apply_refused',
+        { connection_id: row.connection_uuid, name: row.name, code: body.code || null }, 1, 'no explicit confirmation');
+      return res.status(400).json({ error: 'applying a repair requires confirm: true' });
+    }
+    if (routeOrchestrator.running && routeOrchestrator.running.has(row.id)) {
+      return res.status(409).json({ error: 'this connection is provisioning right now' });
+    }
+
+    const iran = getServer(row.iran_server_id);
+    try {
+      const result = await connectionHealth.applyRepair({
+        db, row, code: body.code, confirm: true, emit: emitEvent(row.id), remote: remoteFor, resolveServer: resolveServerFor,
+      });
+      auditEvent(row.iran_server_id, iran ? iran.name : 'hub', 'gre_connection_repair_apply', {
+        connection_id: row.connection_uuid, name: row.name, code: result.code, operation_id: result.operation_id,
+      }, 0, `${result.code} applied on ${result.applied_sides.join(', ')} and no longer reported on either side`);
+      res.json({ ...result, connection: connections.project(db, connections.getRoute(db, row.id)) });
+    } catch (err) {
+      if (err.hostkey_mismatch) return hostKeyMismatchResponse(res, row.iran_server_id, err.presented_fp);
+      auditEvent(row.iran_server_id, iran ? iran.name : 'hub', 'gre_connection_repair_apply_failed', {
+        connection_id: row.connection_uuid, name: row.name, code: err.code || body.code,
+        operation_id: err.operation_id || null, partial: err.partial === true,
+      }, 1, err.message);
+      res.status(err.status || 500).json({
+        error: err.message,
+        ok: false,
+        outcome: err.outcome || null,
+        code: err.code || body.code || null,
+        operation_id: err.operation_id || null,
+        partial: err.partial === true,
+        applied_sides: err.applied_sides || null,
+        attempted_sides: err.attempted_sides || null,
+        applied: err.applied || null,
+        after: err.after || null,
+        verification: err.verification || null,
+        reasons: err.reasons || null,
+        plan: err.plan || null,
+      });
+    }
   }));
 
   // Test-only: the scripted SSH transport's own state, so a test can assert on

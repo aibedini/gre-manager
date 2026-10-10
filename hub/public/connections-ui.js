@@ -183,6 +183,7 @@ function renderConnections() {
       <td class="muted">${m.lastVerified ? esc(timeAgo(m.lastVerified)) : 'never'}</td>
       <td>${mtuDriftBadge(m.drift, m.error || '')}</td>
       <td class="conn-actions conn-mtu-actions">
+        <button class="btn btn-ghost btn-sm btn-health-check" data-id="${c.id}">Full Network Health Check</button>
         <button class="btn btn-ghost btn-sm btn-mtu-analyze" data-id="${c.id}">Analyze MTU</button>
         <button class="btn btn-ghost btn-sm btn-mtu-details" data-id="${c.id}">View Detailed Results</button>
         <button class="btn btn-ghost btn-sm btn-mtu-recommend" data-id="${c.id}">Recommend MTU</button>
@@ -227,6 +228,9 @@ function renderConnections() {
   });
   $$('.btn-mtu-analyze', wrap).forEach((btn) => {
     btn.addEventListener('click', () => analyzeMtu(Number(btn.dataset.id)).then(() => toast('MTU diagnostics read from both sides')));
+  });
+  $$('.btn-health-check', wrap).forEach((btn) => {
+    btn.addEventListener('click', () => openHealthView(Number(btn.dataset.id)));
   });
   $$('.btn-mtu-details', wrap).forEach((btn) => {
     btn.addEventListener('click', () => openMtuDetails(Number(btn.dataset.id)));
@@ -844,5 +848,546 @@ if (mtuPanelClose) {
   });
 }
 
+// ======================================================= full network health
+//
+// The diagnostic view is a PAIR. Every check is one row with an Iran and a Foreign
+// column, because a connection only means something as two ends — and the findings are
+// already correlated server-side into one code per problem, naming the sides that
+// reported it. Nothing here re-derives the diagnosis; it renders what the two hosts
+// said, and it never offers to apply a repair the hosts did not call safe.
+
+const HEALTH_CATEGORY_SECTIONS = [
+  { title: 'Underlay', categories: ['B_underlay'] },
+  { title: 'GRE configuration', categories: ['C_gre_config'] },
+  { title: 'GRE traffic', categories: ['D_gre_protocol47', 'E_tunnel_connectivity'] },
+  { title: 'Routing and firewall', categories: ['F_routing_and_firewall'] },
+  { title: 'MTU/MSS', categories: ['G_mtu_and_mss'] },
+  { title: 'Service health', categories: ['H_service'] },
+  { title: 'Diagnostic', categories: ['Z_diagnostic'] },
+];
+
+const HEALTH_STATUS_CLASS = { PASS: 'green', WARN: 'yellow', FAIL: 'red', UNKNOWN: 'blue', SKIPPED: 'gray' };
+const HEALTH_VERDICT_CLASS = { HEALTHY: 'green', DEGRADED: 'yellow', BROKEN: 'red', UNKNOWN: 'gray' };
+const HEALTH_SEVERITY_CLASS = { critical: 'red', warning: 'yellow', info: 'gray' };
+const HEALTH_RUN_CLASS = { SUCCEEDED: 'green', PARTIAL: 'yellow', FAILED: 'red', REJECTED: 'gray', RUNNING: 'blue' };
+
+function healthState() {
+  if (!state.connHealth) state.connHealth = {};
+  if (!state.connHealthBusy) state.connHealthBusy = {};
+  if (!state.connHealthError) state.connHealthError = {};
+  if (!state.connHealthHistory) state.connHealthHistory = {};
+  if (state.connHealthOpen === undefined) state.connHealthOpen = null;
+  return state.connHealth;
+}
+
+function healthStatusBadge(status) {
+  const text = String(status || 'UNKNOWN').toUpperCase();
+  return `<span class="badge ${HEALTH_STATUS_CLASS[text] || 'gray'}">${esc(text)}</span>`;
+}
+
+function healthVerdictBadge(verdict) {
+  const text = String(verdict || 'UNKNOWN').toUpperCase();
+  return `<span class="badge ${HEALTH_VERDICT_CLASS[text] || 'gray'}">${esc(text)}</span>`;
+}
+
+const healthCounts = (summary) => {
+  const s = summary || {};
+  return `pass ${s.pass || 0} · warn ${s.warn || 0} · fail ${s.fail || 0} · unknown ${s.unknown || 0} · skipped ${s.skipped || 0}`;
+};
+
+// The complete run for one connection. Read-only on the server and serialised by the
+// connection lock, so a second click while one is running comes back as a 409 rather
+// than doubling the load on a suspect host.
+async function runConnectionHealth(id, { mode = 'quick', silent = false } = {}) {
+  healthState();
+  state.connHealthBusy[id] = true;
+  if (!silent) renderHealthPanel(id);
+  try {
+    state.connHealth[id] = await api(`/api/gre-connections/${id}/health-check`, { method: 'POST', body: { mode } });
+    delete state.connHealthError[id];
+    return state.connHealth[id];
+  } catch (err) {
+    state.connHealthError[id] = err.message;
+    if (!silent) toast(`Health check failed: ${err.message}`, true);
+    return null;
+  } finally {
+    state.connHealthBusy[id] = false;
+    await loadHealthHistory(id, { silent: true });
+    renderHealthPanel(id);
+  }
+}
+
+async function loadHealthHistory(id, { silent = false } = {}) {
+  healthState();
+  try {
+    const data = await api(`/api/gre-connections/${id}/health-checks`);
+    state.connHealthHistory[id] = (data && data.checks) || [];
+  } catch (err) {
+    state.connHealthHistory[id] = [];
+    if (!silent) toast(`Could not load the diagnostic history: ${err.message}`, true);
+  }
+  return state.connHealthHistory[id];
+}
+
+async function openHealthView(id, { mode = null } = {}) {
+  const c = connectionById(id);
+  if (!c) { toast('that connection is no longer loaded; refresh first', true); return; }
+  healthState();
+  state.connHealthOpen = Number(id);
+  const host = $('#connections-health');
+  const title = $('#conn-health-title');
+  if (title) title.textContent = `Full network health check — ${c.name}`;
+  if (!host) {
+    // Without the panel (a page that does not carry it) the check still runs and its
+    // verdict is reported through the toast rather than silently.
+    const run = await runConnectionHealth(id, { mode: mode || 'quick' });
+    if (run) toast(`Health check: ${run.combined.overall_status} (${run.combined.evidence_completeness} evidence)`);
+    return;
+  }
+  host.classList.remove('hidden');
+  renderHealthPanel(id);
+  if (!state.connHealth[id] || mode) await runConnectionHealth(id, { mode: mode || 'quick', silent: true });
+  await loadHealthHistory(id, { silent: true });
+  renderHealthPanel(id);
+}
+
+// One check row is one row with two columns, and a side that did not report the check
+// says so rather than looking like a pass.
+function healthCheckRows(checks, categories) {
+  const rows = (checks || []).filter((c) => categories.includes(c.category));
+  if (!rows.length) return '<tr><td colspan="3" class="muted">no checks were reported for this layer</td></tr>';
+  return rows.map((c) => {
+    const cell = (side) => {
+      const value = c.sides[side];
+      if (!value) return '<span class="health-check-missing">not reported</span>';
+      return `${healthStatusBadge(value.status)}<div class="health-check-detail">${esc(value.detail || '')}</div>`;
+    };
+    return `<tr>
+      <td><span class="health-check-id">${esc(c.id)}</span></td>
+      <td>${cell('iran')}</td>
+      <td>${cell('foreign')}</td>
+    </tr>`;
+  }).join('');
+}
+
+function healthCheckTable(checks, categories) {
+  return `<div class="conn-table-wrap"><table class="conn-table health-check-table">
+    <thead><tr><th>Check</th><th>Iran</th><th>Foreign</th></tr></thead>
+    <tbody>${healthCheckRows(checks, categories)}</tbody>
+  </table></div>`;
+}
+
+// The per-host layers are shown as one column for that host: on this host only, so a
+// paired table would be a table with one column filled in and one blank.
+function healthSideCheckTable(combined, key, categories) {
+  const checks = (combined.per_side[key] || {}).checks || [];
+  const rows = checks.filter((c) => categories.includes(c.category));
+  if (!rows.length) return '<div class="muted">no checks were reported for this layer</div>';
+  return `<div class="conn-table-wrap"><table class="conn-table health-check-table">
+    <thead><tr><th>Check</th><th>Status</th></tr></thead>
+    <tbody>${rows.map((c) => `<tr>
+      <td><span class="health-check-id">${esc(c.id)}</span></td>
+      <td>${healthStatusBadge(c.status)}<div class="health-check-detail">${esc(c.detail || '')}</div></td>
+    </tr>`).join('')}</tbody>
+  </table></div>`;
+}
+
+function healthSideHtml(combined, key) {
+  const side = (combined.per_side || {})[key] || {};
+  return `<div class="health-side">
+    <h4>${esc(side.label || key)} server — ${esc(side.server || 'unknown')} ${healthStatusBadge(side.overall_status)}</h4>
+    ${side.ok ? '' : `<div class="form-error">${esc(side.error || 'this side could not be read')}</div>`}
+    <div class="health-counts">${esc(healthCounts(side.summary))}${side.evidence_completeness ? ` · evidence ${esc(side.evidence_completeness)}` : ''}</div>
+    <div class="muted" style="font-size:11.5px">${side.tested_at ? `tested ${esc(timeAgo(side.tested_at))}` : 'no timestamp reported'}</div>
+  </div>`;
+}
+
+// The reason a repair is not offered. A finding with no verified automated repair says
+// why instead of showing a button the Hub would refuse to press.
+function healthUnsafeReason(finding) {
+  const action = String(finding.recommended_action || '').trim();
+  const reason = action || 'This end reports no verified automated repair for this code.';
+  return `${reason}${finding.risk && finding.risk !== 'none' ? ` (risk: ${finding.risk})` : ''}`;
+}
+
+function healthFindingHtml(finding, id) {
+  const safe = finding.safe_repair === true;
+  const sev = String(finding.severity || 'info').toLowerCase();
+  const sides = (finding.sides || []).join(' + ');
+  const perSide = Object.entries(finding.by_side || {}).map(([key, value]) => `
+    <div class="muted" style="font-size:11.5px">${esc(key)}: ${esc(value.evidence || 'no evidence recorded')}${value.repair_key ? ` · repair ${esc(value.repair_key)}` : ''}</div>`).join('');
+  return `<details class="health-finding sev-${esc(sev)}" data-code="${esc(finding.code)}">
+    <summary>
+      <span class="badge ${HEALTH_SEVERITY_CLASS[sev] || 'gray'}">${esc(sev.toUpperCase())}</span>
+      <span class="health-finding-code">${esc(finding.code)}</span>
+      <span class="muted">${esc(sides)}${finding.server ? ` · ${esc(finding.server)}` : ''}</span>
+      <span class="muted">confidence ${esc(finding.confidence || 'unknown')}</span>
+      ${safe ? '<span class="badge green">repairable</span>' : '<span class="badge gray">manual</span>'}
+    </summary>
+    <div class="health-finding-body">
+      <div><strong>Evidence</strong><div class="output-pane">${esc(finding.evidence || 'no evidence recorded')}</div></div>
+      ${perSide}
+      <div><strong>Probable cause</strong><div>${esc(finding.probable_cause || 'not stated')}</div></div>
+      <div><strong>Recommended remediation</strong><div>${esc(finding.recommended_action || 'not stated')}</div></div>
+      <div class="health-finding-actions">
+        <button class="btn btn-ghost btn-sm health-view-evidence" data-id="${id}" data-code="${esc(finding.code)}">View Evidence</button>
+        ${safe
+    ? `<button class="btn btn-ghost btn-sm health-preview-repair" data-id="${id}" data-code="${esc(finding.code)}">Preview Repair</button>
+           <button class="btn btn-ghost btn-sm health-apply-repair" data-id="${id}" data-code="${esc(finding.code)}">Apply Approved Repair</button>`
+    : `<span class="health-not-safe">No Apply button: ${esc(healthUnsafeReason(finding))}</span>`}
+      </div>
+    </div>
+  </details>`;
+}
+
+function healthHistoryHtml(id) {
+  const runs = state.connHealthHistory[id] || [];
+  if (!runs.length) return '<div class="muted">No diagnostic run has been stored for this connection yet.</div>';
+  return runs.map((run) => `<div class="health-history-row">
+    <span class="badge ${HEALTH_RUN_CLASS[run.status] || 'gray'}">${esc(run.status)}</span>
+    <span class="badge gray">${esc(run.kind === 'HEALTH_REPAIR' ? 'REPAIR' : 'CHECK')}</span>
+    ${run.code ? `<span class="health-finding-code">${esc(run.code)}</span>` : ''}
+    ${run.kind === 'HEALTH_REPAIR' ? '' : healthVerdictBadge(run.overall_status)}
+    ${run.partial ? '<span class="badge yellow">PARTIAL</span>' : ''}
+    <span class="muted">${esc(run.mode || '')}</span>
+    <span class="muted">${run.created_at ? esc(timeAgo(run.created_at)) : ''}</span>
+    <span class="muted" style="flex:1">${esc(String(run.detail || '').slice(0, 140))}</span>
+    <button class="btn btn-ghost btn-sm health-open-run" data-id="${id}" data-check="${esc(run.check_id)}">View run</button>
+  </div>`).join('');
+}
+
+function bindHealthPanel(scope) {
+  $$('.health-view-evidence', scope).forEach((btn) => {
+    btn.addEventListener('click', () => openHealthEvidence(Number(btn.dataset.id), btn.dataset.code));
+  });
+  $$('.health-preview-repair', scope).forEach((btn) => {
+    btn.addEventListener('click', () => openHealthRepairPreview(Number(btn.dataset.id), btn.dataset.code));
+  });
+  $$('.health-apply-repair', scope).forEach((btn) => {
+    btn.addEventListener('click', () => openHealthRepairApply(Number(btn.dataset.id), btn.dataset.code));
+  });
+  $$('.health-open-run', scope).forEach((btn) => {
+    btn.addEventListener('click', () => openHealthRun(Number(btn.dataset.id), btn.dataset.check));
+  });
+}
+
+function renderHealthPanel(id) {
+  healthState();
+  const body = $('#conn-health-body');
+  const verdict = $('#conn-health-verdict');
+  if (!body) return;
+  if (!state.connHealthOpen || Number(state.connHealthOpen) !== Number(id)) return;
+
+  const run = state.connHealth[id] || null;
+  const busy = !!state.connHealthBusy[id];
+  const error = state.connHealthError[id] || null;
+  const combined = run ? run.combined : null;
+
+  if (verdict) {
+    verdict.innerHTML = busy
+      ? '<span class="badge blue">RUNNING</span><span class="muted">reading both sides…</span>'
+      : (combined ? healthVerdictBadge(combined.overall_status) : '<span class="badge gray">NO CHECK YET</span>');
+  }
+
+  if (!combined) {
+    body.innerHTML = `${error ? `<div class="form-error">${esc(error)}</div>` : '<div class="muted">No diagnostic run loaded yet. Run a quick check to read both sides.</div>'}`;
+    return;
+  }
+
+  const findings = combined.findings || [];
+  const repairable = findings.filter((f) => f.safe_repair === true);
+  const previous = combined.previous;
+  const previousText = previous
+    ? `previous run ${esc(String(previous.overall_status || 'unknown'))} (${esc(previous.evidence_completeness || 'unknown')} evidence, ${esc(timeAgo(previous.created_at))})`
+    : 'this is the first stored run of this connection';
+
+  body.innerHTML = `
+    ${error ? `<div class="form-error">${esc(error)}</div>` : ''}
+    <div class="${busy ? 'health-panel-busy' : ''}">
+      <div class="health-overall">
+        ${healthVerdictBadge(combined.overall_status)}
+        <span>Evidence: <strong>${esc(combined.evidence_completeness)}</strong></span>
+        <span>Sides read: <strong>${esc(String(combined.sides_readable))}/2</strong></span>
+        <span class="muted">${esc(run.mode || combined.mode || '')} mode${combined.elapsed_seconds === null || combined.elapsed_seconds === undefined ? '' : ` · ${esc(String(combined.elapsed_seconds))}s`} · tested ${combined.tested_at ? esc(timeAgo(combined.tested_at)) : 'unknown'}</span>
+        <span class="muted">${previousText}</span>
+      </div>
+      <div class="health-counts">
+        <span>${esc(healthCounts(combined.summary))}</span>
+        <span>findings <strong>${esc(String(combined.summary.findings || 0))}</strong></span>
+        <span>critical <strong>${esc(String(combined.summary.critical_findings || 0))}</strong></span>
+        <span>repairable <strong>${esc(String(combined.summary.repairable_findings || 0))}</strong></span>
+      </div>
+
+      <div class="health-grid">
+        ${healthSideHtml(combined, 'iran')}
+        ${healthSideHtml(combined, 'foreign')}
+      </div>
+
+      <div class="health-section">
+        <h4>Iran server</h4>
+        ${healthSideCheckTable(combined, 'iran', ['A_ssh_and_server'])}
+      </div>
+      <div class="health-section">
+        <h4>Foreign server</h4>
+        ${healthSideCheckTable(combined, 'foreign', ['A_ssh_and_server'])}
+      </div>
+
+      ${HEALTH_CATEGORY_SECTIONS.map((section) => `<div class="health-section">
+        <h4>${esc(section.title)}</h4>
+        ${healthCheckTable(combined.checks, section.categories)}
+      </div>`).join('')}
+
+      <div class="health-section">
+        <h4>Root-cause findings</h4>
+        ${findings.length
+    ? findings.map((f) => healthFindingHtml(f, id)).join('')
+    : '<div class="muted">No finding was reported on either side.</div>'}
+      </div>
+
+      <div class="health-section">
+        <h4>Recommended repairs</h4>
+        ${repairable.length
+    ? `<div class="muted" style="font-size:12px; margin-bottom:8px">Each repair is applied only on the ends that offer it, then verified by a fresh check on BOTH sides. Nothing is claimed as fixed until the code is gone from every side.</div>
+             <ul class="impact-list">${repairable.map((f) => `<li><span class="health-finding-code">${esc(f.code)}</span> — ${esc(f.recommended_action || 'repair offered by this host')} <span class="muted">(${esc((f.repairable_on || f.sides || []).join(', ') || 'unknown sides')}, risk ${esc(f.risk || 'unknown')})</span></li>`).join('')}</ul>`
+    : '<div class="muted">No safe automated repair is available for this connection. Every finding is reported for a human to act on.</div>'}
+      </div>
+
+      <div class="health-section">
+        <h4>Diagnostic history</h4>
+        ${healthHistoryHtml(id)}
+      </div>
+
+      <div class="muted" style="font-size:11.5px">A repair converges a host onto its own configuration and is NOT rolled back; use the recorded MTU operations for a state restore.</div>
+    </div>`;
+
+  bindHealthPanel(body);
+}
+
+async function openHealthEvidence(id, code) {
+  const run = healthState()[id];
+  const finding = run && (run.combined.findings || []).find((f) => f.code === code);
+  if (!finding) { toast('that finding is no longer in the loaded run', true); return; }
+  const relevantCheckIds = (finding.sides || []).flatMap((side) => ((run.combined.per_side[side] || {}).checks || [])
+    .filter((c) => c.detail && finding.evidence && String(finding.evidence).includes(c.detail)).map((c) => c.id));
+  const checkRows = (run.combined.checks || []).filter((c) => relevantCheckIds.includes(c.id));
+  openModal(`
+    <h2>${esc(finding.code)}</h2>
+    <p class="sub">${esc((finding.sides || []).join(' + '))} · severity ${esc(finding.severity)} · confidence ${esc(finding.confidence)}</p>
+    <div class="section"><h3>Evidence as reported</h3><div class="output-pane">${esc(finding.evidence || 'no evidence recorded')}</div></div>
+    <div class="section"><h3>Per side</h3>
+      <table class="review-table"><thead><tr><th>Side</th><th>Evidence</th><th>Action offered</th></tr></thead>
+      <tbody>${(finding.sides || []).map((side) => {
+    const v = finding.by_side[side] || {};
+    return `<tr><td>${esc(side)}</td><td>${esc(v.evidence || '—')}</td><td>${esc(v.recommended_action || '—')}</td></tr>`;
+  }).join('')}</tbody></table>
+    </div>
+    ${checkRows.length ? `<div class="section"><h3>Checks behind it</h3><ul class="preflight-list">${checkRows.map((c) => `<li class="${c.status === 'PASS' ? 'ok' : c.status === 'FAIL' ? 'bad' : ''}">${esc(`${c.status} ${c.id}`)} <span class="muted">${esc((c.sides.iran && c.sides.iran.detail) || (c.sides.foreign && c.sides.foreign.detail) || '')}</span></li>`).join('')}</ul></div>` : ''}
+    <div class="section"><h3>Raw payload from this run</h3>
+      <details><summary class="muted">show the stored JSON</summary>
+        <pre class="health-evidence-pre">${esc(JSON.stringify({ combined: { overall_status: run.combined.overall_status, findings: run.combined.findings }, iran: run.iran && run.iran.data, foreign: run.foreign && run.foreign.data }, null, 2))}</pre>
+      </details>
+    </div>
+    <div class="foot"><button type="button" class="btn modal-cancel">Close</button></div>`, { wide: true });
+}
+
+// Read-only preview. It runs on both hosts, so it is deliberately a POST — and it
+// takes no lock and changes nothing.
+async function openHealthRepairPreview(id, code) {
+  openModal(`<h2>Preview repair — ${esc(code)}</h2><p class="sub">Reading what each side can repair… nothing is changed by a preview.</p>`);
+  let plan;
+  try {
+    plan = await api(`/api/gre-connections/${id}/repairs/preview`, { method: 'POST', body: { code } });
+  } catch (err) {
+    openModal(`<h2>Preview repair — ${esc(code)}</h2>
+      <div class="form-error">${esc(err.message)}</div>
+      <div class="foot"><button type="button" class="btn modal-cancel">Close</button></div>`);
+    return;
+  }
+  const sideRow = (key) => {
+    const s = plan.sides[key] || {};
+    return `<tr>
+      <td>${esc(s.label || key)}<div class="muted">${esc(s.server || '')}</div></td>
+      <td>${s.can_repair ? '<span class="badge green">CAN REPAIR</span>' : '<span class="badge gray">NO SAFE REPAIR</span>'}</td>
+      <td>${esc(String(s.severity || '—'))}</td>
+      <td>${esc(String(s.risk || '—'))}</td>
+      <td>${esc(s.repair_key || '—')}</td>
+      <td>${esc(s.recommended_action || s.reason || '—')}</td>
+    </tr>`;
+  };
+  openModal(`
+    <h2>Preview repair — ${esc(code)}</h2>
+    <p class="sub">Read-only. The risk below is the hosts' own assessment, not the Hub's.</p>
+    <div class="review-grid"><table class="review-table">
+      <thead><tr><th>Side</th><th>Verdict</th><th>Severity</th><th>Risk</th><th>Repair</th><th>What it would do</th></tr></thead>
+      <tbody>${['iran', 'foreign'].map(sideRow).join('')}</tbody>
+    </table></div>
+    <div class="section"><h3>What will happen</h3><ul class="impact-list">${(plan.what_happens || []).map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>
+    <div class="section"><h3>Verification that will run</h3><ul class="preflight-list">${(plan.verification || []).map((x) => `<li class="ok">${esc(x.description || x.id)}</li>`).join('')}</ul></div>
+    <div class="section"><h3>Rollback conditions</h3><ul class="impact-list">${(plan.rollback_conditions || []).map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>
+    ${plan.can_apply ? '' : `<div class="form-error">${esc(plan.blocked_reason || 'this repair cannot be applied')}</div>`}
+    <div class="foot">
+      <button type="button" class="btn btn-ghost modal-cancel">Close</button>
+      <button class="btn" id="health-repair-confirm" ${plan.can_apply ? '' : 'disabled'}>Apply Approved Repair</button>
+    </div>`, { wide: true });
+
+  const confirm = $('#health-repair-confirm');
+  if (confirm && plan.can_apply) {
+    confirm.addEventListener('click', () => { closeModal(); openHealthRepairApply(id, code); });
+  }
+}
+
+async function openHealthRepairApply(id, code) {
+  openModal(`
+    <h2>Apply repair — ${esc(code)}</h2>
+    <p class="sub">This re-applies the connection's own configuration on the ends that offer it, then re-checks BOTH sides. A repair is not rolled back.</p>
+    <div class="form-error" id="health-apply-error"></div>
+    <div class="foot">
+      <button type="button" class="btn btn-ghost modal-cancel">Cancel</button>
+      <button class="btn" id="health-apply-confirm">I understand — apply this repair</button>
+    </div>`);
+
+  const confirm = $('#health-apply-confirm');
+  if (!confirm) return;
+  confirm.addEventListener('click', async () => {
+    const err = $('#health-apply-error');
+    confirm.disabled = true;
+    confirm.textContent = 'Applying…';
+    err.textContent = '';
+    try {
+      const result = await api(`/api/gre-connections/${id}/repairs/apply`, { method: 'POST', body: { code, confirm: true } });
+      closeModal();
+      toast(`${code} repaired on ${(result.applied_sides || []).join(', ')} and no longer reported on either side`);
+      await runConnectionHealth(id, { mode: 'quick', silent: true });
+    } catch (e) {
+      // A partial outcome is reported as a partial outcome, with what was and was not
+      // fixed, instead of a generic failure that hides a half-repaired connection.
+      const data = e.data || {};
+      if (data.partial) {
+        openModal(`
+          <h2>Repair only partly applied — ${esc(code)}</h2>
+          <p class="sub">The repair ran on some ends and not others. The connection is NOT fully repaired.</p>
+          <div class="form-error">${esc(e.message)}</div>
+          <div class="section"><h3>What each side did</h3>
+            <table class="review-table"><thead><tr><th>Side</th><th>Applied</th><th>Detail</th></tr></thead>
+            <tbody>${(data.applied || []).map((a) => `<tr><td>${esc(a.label || a.side)}<div class="muted">${esc(a.server || '')}</div></td><td>${a.ok ? '<span class="badge green">applied</span>' : '<span class="badge red">failed</span>'}</td><td class="muted">${esc(a.detail || '')}</td></tr>`).join('')}</tbody></table>
+          </div>
+          <div class="section"><h3>Verification</h3><div class="output-pane">${esc(JSON.stringify(data.verification || {}, null, 2))}</div></div>
+          <div class="foot">
+            <button type="button" class="btn btn-ghost modal-cancel">Close</button>
+            <button class="btn" id="health-retry-apply">Retry this repair</button>
+          </div>`);
+        const retry = $('#health-retry-apply');
+        if (retry) retry.addEventListener('click', () => { closeModal(); openHealthRepairApply(id, code); });
+      } else {
+        err.textContent = e.message;
+        confirm.disabled = false;
+        confirm.textContent = 'I understand — apply this repair';
+        return;
+      }
+      confirm.disabled = false;
+      confirm.textContent = 'I understand — apply this repair';
+      await runConnectionHealth(id, { mode: 'quick', silent: true });
+    }
+  });
+}
+
+async function openHealthRun(id, checkId) {
+  openModal('<h2>Stored diagnostic run</h2><p class="sub">Loading…</p>', { wide: true });
+  let stored;
+  try {
+    stored = await api(`/api/gre-connections/${id}/health-checks/${checkId}`);
+  } catch (err) {
+    openModal(`<h2>Stored diagnostic run</h2><div class="form-error">${esc(err.message)}</div>
+      <div class="foot"><button type="button" class="btn modal-cancel">Close</button></div>`);
+    return;
+  }
+  openModal(`
+    <h2>${esc(stored.kind === 'HEALTH_REPAIR' ? 'Stored repair' : 'Stored diagnostic run')}</h2>
+    <p class="sub">${esc(stored.check_id)} · ${esc(stored.status)}${stored.overall_status ? ` · ${esc(stored.overall_status)}` : ''}${stored.created_at ? ` · ${esc(timeAgo(stored.created_at))}` : ''}</p>
+    <div class="section"><h3>Stored payload</h3>
+      <pre class="health-evidence-pre">${esc(JSON.stringify(stored.run, null, 2))}</pre>
+    </div>
+    <div class="foot"><button type="button" class="btn modal-cancel">Close</button></div>`, { wide: true });
+}
+
+// Export the run and its history as a self-contained JSON report. Nothing here comes
+// from a credential: every payload was redacted on the way out of the Hub.
+async function exportHealthReport(id) {
+  const c = connectionById(id);
+  const run = healthState()[id] || null;
+  const history = state.connHealthHistory[id] || await loadHealthHistory(id, { silent: true });
+  const report = {
+    exported_at: new Date().toISOString(),
+    connection: c
+      ? {
+        id: c.id, name: c.name, connection_id: c.connection_id, iran_server: c.iran_server, foreign_server: c.foreign_server,
+      }
+      : { id },
+    last_check: run,
+    history,
+  };
+  const blob = new Blob([JSON.stringify(report, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `health-${(c && c.name) || id}-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast('Diagnostic report downloaded');
+}
+
+// "Restore Previous State" is honest about what can be undone: an MTU change is
+// reversible through the journaled MTU operations, a repair is not — it re-applied the
+// connection's own configuration, so undoing it would put the fault back.
+function openHealthRestore(id) {
+  openModal(`
+    <h2>Restore previous state</h2>
+    <p class="sub">What can be undone on this connection, and what cannot.</p>
+    <div class="section"><h3>MTU changes</h3>
+      <div class="muted">Every MTU change recorded the value both sides had before it, so it can be put back and verified.</div>
+      <div style="margin-top:8px"><button class="btn btn-ghost btn-sm" id="health-restore-mtu">Restore Previous MTU</button></div>
+    </div>
+    <div class="section"><h3>Repairs</h3>
+      <div class="muted">A repair re-applies the connection's own configuration on the ends that needed it. It is not rolled back: undoing it would restore the fault it removed. If a repair did not fully fix the connection, the diagnostic history names the ends that were and were not repaired.</div>
+    </div>
+    <div class="foot"><button type="button" class="btn modal-cancel">Close</button></div>`);
+  const btn = $('#health-restore-mtu');
+  if (btn) btn.addEventListener('click', () => { closeModal(); openMtuRestore(id); });
+}
+
+// The panel's own controls. They act on whichever connection the panel is showing,
+// which is why they read the open id at click time rather than binding to one.
+function healthStateOpenId() {
+  healthState();
+  return state.connHealthOpen;
+}
+const healthPanelControls = [
+  ['#btn-conn-health-full', () => { const id = healthStateOpenId(); if (id) runConnectionHealth(id, { mode: 'full' }); }],
+  ['#btn-conn-health-quick', () => { const id = healthStateOpenId(); if (id) runConnectionHealth(id, { mode: 'quick' }); }],
+  ['#btn-conn-health-mtu', () => { const id = healthStateOpenId(); if (id) openMtuDetails(id); }],
+  ['#btn-conn-health-report', () => { const id = healthStateOpenId(); if (id) exportHealthReport(id); }],
+  ['#btn-conn-health-restore', () => { const id = healthStateOpenId(); if (id) openHealthRestore(id); }],
+  ['#btn-conn-health-close', () => {
+    const panel = document.getElementById('connections-health');
+    if (panel) panel.classList.add('hidden');
+    state.connHealthOpen = null;
+  }],
+];
+
+for (const [selector, handler] of healthPanelControls) {
+  const el = document.querySelector(selector);
+  if (el) el.addEventListener('click', handler);
+}
+
 // The page controls in app.js reach the renderer through this namespace.
-window.ConnectionsUI = { load: loadConnections, render: renderConnections, analyzeMtu, openMtuDetails };
+window.ConnectionsUI = {
+  load: loadConnections,
+  render: renderConnections,
+  analyzeMtu,
+  openMtuDetails,
+  openHealthView,
+  runHealth: runConnectionHealth,
+};
+

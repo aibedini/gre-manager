@@ -8,11 +8,17 @@
 // from the interface, or the Hub's verification step would be meaningless and its
 // tests would pass for the wrong reason.
 //
+// The health layer needs one more kind of state than a parameter change does: a
+// DIAGNOSIS. A finding seeded on a host must survive until a repair removes it, and
+// that removal has to be visible to the next `gre health-check` — otherwise the Hub's
+// "verify with a fresh check" step would pass for the wrong reason.
+//
 // Faults are injected through HUB_TEST_GRE_FAULT (a JSON file, re-read on every
 // call so one process can drive several scenarios):
-//   { "fail": { "<server name>": ["peer_edit", "doctor", "mtu_set"] },
+//   { "fail": { "<server name>": ["peer_edit", "doctor", "mtu_set", "health_check"] },
 //     "ping_fail": ["<server name>"],
 //     "reachability_fail": ["<server name>"],
+//     "repair_noop": ["<server name>"],
 //     "unreachable": ["<server name>"] }
 //
 // Loaded via HUB_TEST_SSH_MODULE.
@@ -83,12 +89,13 @@ function loadSeed(force) {
       nic_mtu: value.nic_mtu || existing.nic_mtu,
       probe: value.probe || existing.probe,
       mtu: { ...existing.mtu, ...(value.mtu || {}) },
+      health: value.health !== undefined ? value.health : existing.health,
     });
   }
 }
 
 function emptyHost() {
-  return { peers: [], nodes: [], events: [], commands: [], calls: {}, nic_mtu: 1500, probe: {}, mtu: {} };
+  return { peers: [], nodes: [], events: [], commands: [], calls: {}, nic_mtu: 1500, probe: {}, mtu: {}, health: {} };
 }
 
 function forServer(server) {
@@ -138,6 +145,9 @@ function fail(verb, server) {
 // Which verb a command is, for fault injection and for the "did anything recreate the
 // tunnel?" assertion an MTU test needs.
 function verbOf(command) {
+  if (/gre health-check/.test(command)) return 'health_check';
+  if (/gre repair apply/.test(command)) return 'repair_apply';
+  if (/gre repair preview/.test(command)) return 'repair_preview';
   if (/gre mtu nic analyze/.test(command)) return 'mtu_nic_analyze';
   if (/gre mtu nic list/.test(command)) return 'mtu_nic_list_json';
   if (/gre mtu diagnose/.test(command)) return 'mtu_diagnose';
@@ -165,6 +175,200 @@ function verbOf(command) {
 // The verbs that would rebuild a tunnel rather than adjust a parameter. An MTU change
 // must never appear as one of these.
 const TUNNEL_REBUILD_VERBS = ['peer_edit', 'node_edit', 'peer_add', 'node_add', 'peer_remove', 'node_remove', 'tunnel_rebuild'];
+
+// Everything that writes to a host. A read-only health check must not appear as one of
+// these, which is what the read-only guarantee is asserted against.
+const MUTATING_VERBS = [...TUNNEL_REBUILD_VERBS, 'repair_apply', 'mtu_set', 'mtu_restore'];
+
+// ---------------------------------------------------------------- health state
+//
+// The repair table mirrors the CLI's own: a code maps to the repair it offers, and the
+// repair's safety and risk come from that key. Seeding just { code, severity } is
+// therefore enough to model a real finding.
+const HEALTH_REPAIR_TABLE = {
+  mtu_set: { safe: true, risk: 'low', action: "Set this connection's tunnel MTU from the measured path" },
+  rule_restore: { safe: true, risk: 'low', action: 'Reinstall the missing rule this connection owns' },
+  iface_up: { safe: true, risk: 'low', action: 'Bring the configured tunnel interface up' },
+  peer_apply: { safe: true, risk: 'medium', action: 'Reapply this connection (rebuilds its tunnel and rules)' },
+  mss_clamp: { safe: true, risk: 'low', action: 'Reinstall the TCP MSS clamp for the measured MTU' },
+  endpoint: { safe: false, risk: 'high', action: 'The public endpoint must be corrected on both servers by hand' },
+  wan_mtu: { safe: false, risk: 'high', action: 'A WAN NIC MTU change is not automated: it can sever SSH' },
+  provider: { safe: false, risk: 'high', action: 'Nothing on this host can fix an upstream filter' },
+};
+
+const HEALTH_CODE_REPAIR = {
+  GRE_MODULE_MISSING: 'provider',
+  GRE_ROUTE_LOOP: 'peer_apply',
+  UNDERLAY_UNREACHABLE: 'provider',
+  UNDERLAY_PACKET_LOSS: 'provider',
+  GRE_INTERFACE_MISSING: 'iface_up',
+  GRE_INTERFACE_DOWN: 'iface_up',
+  GRE_LOCAL_ENDPOINT_MISMATCH: 'peer_apply',
+  GRE_REMOTE_ENDPOINT_MISMATCH: 'peer_apply',
+  GRE_KEY_MISMATCH: 'peer_apply',
+  GRE_TUNNEL_ADDRESS_MISSING: 'peer_apply',
+  GRE_ROUTE_MISSING: 'peer_apply',
+  GRE_PROTOCOL47_SUSPECTED_BLOCKED: 'rule_restore',
+  GRE_ONE_WAY_TRAFFIC: 'mtu_set',
+  GRE_INNER_PING_FAILED: 'peer_apply',
+  IP_FORWARD_DISABLED: 'rule_restore',
+  FIREWALL_RULE_MISSING: 'rule_restore',
+  FIREWALL_RULE_CONFLICT: 'endpoint',
+  GRE_MTU_MISMATCH: 'mtu_set',
+  GRE_TCP_MSS_PROBLEM: 'mss_clamp',
+  SERVICE_LISTENER_MISSING: 'endpoint',
+  XUI_INBOUND_MISSING: 'endpoint',
+};
+
+// The check a finding degrades, so a seeded finding is consistent with the check table
+// the Hub renders instead of only appearing in the findings list.
+const HEALTH_CODE_CHECK = {
+  GRE_MODULE_MISSING: 'gre_module',
+  GRE_ROUTE_LOOP: 'no_route_loop',
+  UNDERLAY_UNREACHABLE: 'underlay_ping',
+  UNDERLAY_PACKET_LOSS: 'underlay_ping',
+  GRE_INTERFACE_MISSING: 'interface_exists',
+  GRE_INTERFACE_DOWN: 'interface_up',
+  GRE_LOCAL_ENDPOINT_MISMATCH: 'local_endpoint',
+  GRE_REMOTE_ENDPOINT_MISMATCH: 'remote_endpoint',
+  GRE_KEY_MISMATCH: 'gre_key',
+  GRE_TUNNEL_ADDRESS_MISSING: 'tunnel_address',
+  GRE_SUBNET_MISMATCH: 'tunnel_address',
+  GRE_ROUTE_MISSING: 'inner_route',
+  GRE_PROTOCOL47_SUSPECTED_BLOCKED: 'gre47_local_policy',
+  GRE_ONE_WAY_TRAFFIC: 'inner_ping',
+  GRE_INNER_PING_FAILED: 'inner_ping',
+  IP_FORWARD_DISABLED: 'ip_forward',
+  FIREWALL_RULE_MISSING: 'owned_rules',
+  FIREWALL_RULE_CONFLICT: 'port_conflicts',
+  GRE_MTU_MISMATCH: 'mtu_recommendation',
+  GRE_TCP_MSS_PROBLEM: 'mss_clamp',
+  GRE_PMTUD_BLACKHOLE_SUSPECTED: 'pmtud',
+  SERVICE_LISTENER_MISSING: 'service_layer',
+  XUI_INBOUND_MISSING: 'service_port',
+};
+
+function healthEntry(st, name) {
+  if (!st.health || typeof st.health !== 'object') st.health = {};
+  if (!st.health[name]) st.health[name] = { findings: [], checks: [], completeness: null };
+  const entry = st.health[name];
+  if (!Array.isArray(entry.findings)) entry.findings = [];
+  if (!Array.isArray(entry.checks)) entry.checks = [];
+  return entry;
+}
+
+function healthFinding(raw, serverName) {
+  const repair = raw.repair_key !== undefined ? raw.repair_key : (HEALTH_CODE_REPAIR[raw.code] || '');
+  const table = HEALTH_REPAIR_TABLE[repair] || null;
+  return {
+    code: raw.code,
+    severity: raw.severity || 'warning',
+    server: raw.server || serverName,
+    connection: raw.connection || '',
+    confidence: raw.confidence || 'high',
+    evidence: raw.evidence || `${raw.code} was observed on ${serverName}`,
+    probable_cause: raw.probable_cause || 'the condition this code names was observed',
+    recommended_action: raw.recommended_action || (table ? table.action : ''),
+    safe_repair: raw.safe_repair === undefined ? !!(table && table.safe) : raw.safe_repair === true,
+    risk: raw.risk || (table ? table.risk : 'none'),
+    repair_key: repair,
+  };
+}
+
+// The health check reads the CURRENT state of this host, so a repair that removed a
+// finding is immediately visible here — which is the whole point of the Hub's
+// verification step.
+function healthBuild(st, name, mode, serverName) {
+  const side = sideOf(st, name);
+  if (!side) return null;
+  const entry = healthEntry(st, name);
+  const mtuE = st.mtu[name] || {};
+  const nic = mtuE.nic_mtu === undefined ? (st.nic_mtu || 1500) : mtuE.nic_mtu;
+  const greMtu = mtuE.gre_mtu === undefined ? MTU_DEFAULTS.gre_mtu : mtuE.gre_mtu;
+  const quick = mode === 'quick';
+  const peer = st.peers.find((p) => p.name === name) || null;
+  const mssOn = !(peer && peer.mss_clamp === 'off');
+
+  const checks = [
+    { id: 'control_plane', category: 'A_ssh_and_server', status: 'PASS', detail: `ran on ${serverName}` },
+    { id: 'privilege', category: 'A_ssh_and_server', status: 'PASS', detail: 'running as root' },
+    { id: 'gre_module', category: 'A_ssh_and_server', status: 'PASS', detail: 'ip_gre is loaded' },
+    { id: 'sshd_listening', category: 'A_ssh_and_server', status: quick ? 'SKIPPED' : 'PASS', detail: quick ? 'quick check' : 'sshd is listening' },
+    { id: 'route_to_peer', category: 'B_underlay', status: 'PASS', detail: '198.51.100.1 via 192.0.2.1 dev eth0' },
+    { id: 'no_route_loop', category: 'B_underlay', status: 'PASS', detail: 'the peer route does not use the tunnel' },
+    { id: 'underlay_ping', category: 'B_underlay', status: 'PASS', detail: 'reachable, 4.2 ms average, no loss', evidence: 'loss=0 rtt=4.2' },
+    { id: 'policy_routing', category: 'B_underlay', status: 'PASS', detail: 'only the default routing rules are present' },
+    { id: 'interface_exists', category: 'C_gre_config', status: 'PASS', detail: `gre-${name} is present` },
+    { id: 'interface_up', category: 'C_gre_config', status: 'PASS', detail: `gre-${name} is up` },
+    { id: 'local_endpoint', category: 'C_gre_config', status: 'PASS', detail: '198.51.100.20' },
+    { id: 'remote_endpoint', category: 'C_gre_config', status: 'PASS', detail: '203.0.113.10' },
+    { id: 'gre_key', category: 'C_gre_config', status: 'PASS', detail: `${(peer && peer.key) || 1001}` },
+    { id: 'tunnel_address', category: 'C_gre_config', status: 'PASS', detail: side === 'iran' ? '10.200.1.2/30' : '10.200.1.1/30' },
+    { id: 'inner_route', category: 'C_gre_config', status: quick ? 'SKIPPED' : 'PASS', detail: quick ? 'quick check' : `the peer's tunnel address routes via gre-${name}` },
+    { id: 'gre47_local_policy', category: 'D_gre_protocol47', status: 'PASS', detail: 'the local firewall does not drop this peer\'s GRE' },
+    { id: 'gre47_traffic', category: 'D_gre_protocol47', status: quick ? 'SKIPPED' : 'PASS', detail: quick ? 'quick check' : 'GRE packets were observed on this host' },
+    { id: 'inner_ping', category: 'E_tunnel_connectivity', status: quick ? 'SKIPPED' : 'PASS', detail: quick ? 'quick check' : 'the peer tunnel address replies, 4.6 ms average', evidence: 'loss=0 rtt=4.6' },
+    { id: 'ip_forward', category: 'F_routing_and_firewall', status: 'PASS', detail: 'net.ipv4.ip_forward=1' },
+    { id: 'owned_rules', category: 'F_routing_and_firewall', status: 'PASS', detail: 'every rule this connection owns is installed' },
+    { id: 'port_conflicts', category: 'F_routing_and_firewall', status: 'PASS', detail: 'no other connection claims these ports' },
+    { id: 'underlay_mtu', category: 'G_mtu_and_mss', status: 'PASS', detail: `eth0 mtu ${nic}` },
+    { id: 'tunnel_mtu', category: 'G_mtu_and_mss', status: 'PASS', detail: `gre-${name} mtu ${greMtu}` },
+    { id: 'mtu_recommendation', category: 'G_mtu_and_mss', status: 'PASS', detail: 'the current MTU matches the path' },
+    { id: 'mss_clamp', category: 'G_mtu_and_mss', status: mssOn ? 'PASS' : 'SKIPPED', detail: mssOn ? 'MSS clamped to 1436' : 'MSS clamping is disabled for this connection' },
+    { id: 'pmtud', category: 'G_mtu_and_mss', status: quick ? 'SKIPPED' : 'PASS', detail: quick ? 'quick check' : 'DF probing worked' },
+    { id: 'service_layer', category: 'H_service', status: 'SKIPPED', detail: 'this connection has no panel configured' },
+    { id: 'service_port', category: 'H_service', status: 'SKIPPED', detail: 'no TCP port, or ss is unavailable' },
+  ];
+
+  const merge = (row) => {
+    const at = checks.findIndex((c) => c.id === row.id);
+    if (at === -1) checks.push({ category: 'Z_diagnostic', ...row });
+    else checks[at] = { ...checks[at], ...row };
+  };
+
+  const findings = entry.findings.map((f) => healthFinding({ connection: name, ...f }, serverName));
+
+  // A finding degrades the check it came from, so the counts and the findings agree.
+  for (const finding of findings) {
+    const id = HEALTH_CODE_CHECK[finding.code];
+    if (!id) continue;
+    const at = checks.findIndex((c) => c.id === id);
+    const status = finding.severity === 'critical' ? 'FAIL' : finding.severity === 'warning' ? 'WARN' : 'UNKNOWN';
+    if (at !== -1 && checks[at].status !== 'FAIL') checks[at] = { ...checks[at], status };
+  }
+  for (const override of entry.checks) merge(override);
+
+  const counts = { pass: 0, warn: 0, fail: 0, unknown: 0, skipped: 0, critical_findings: 0 };
+  for (const check of checks) {
+    if (check.status === 'PASS') counts.pass += 1;
+    else if (check.status === 'WARN') counts.warn += 1;
+    else if (check.status === 'FAIL') counts.fail += 1;
+    else if (check.status === 'SKIPPED') counts.skipped += 1;
+    else counts.unknown += 1;
+  }
+  counts.critical_findings = findings.filter((f) => f.severity === 'critical').length;
+
+  let overall = 'HEALTHY';
+  if (counts.fail > 0 || counts.critical_findings > 0) overall = 'BROKEN';
+  else if (counts.warn > 0 || counts.unknown > 0 || findings.length > 0) overall = 'DEGRADED';
+
+  const completeness = entry.completeness || (counts.unknown > 0 ? 'partial' : 'complete');
+
+  return {
+    connection: name,
+    side,
+    server: serverName,
+    mode: quick ? 'quick' : 'full',
+    overall_status: overall,
+    evidence_completeness: completeness,
+    budget_seconds: quick ? 20 : 75,
+    elapsed_seconds: quick ? 2 : 5,
+    summary: counts,
+    checks,
+    findings,
+    tested_at: new Date().toISOString(),
+  };
+}
 
 // ---------------------------------------------------------------- MTU state
 
@@ -400,7 +604,59 @@ const exec = async (server, secret, command, opts = {}) => {
     }));
   }
 
+  // --- health and repair verbs ---------------------------------------------
+  //
+  // The health check is READ-ONLY: it reads state and never writes it. Its exit code
+  // mirrors the CLI's — non-zero only for BROKEN, which is a diagnosis and not a
+  // failure of the command.
+  let h = command.match(/gre health-check (.*)$/);
+  if (h) {
+    if (faulted(server, 'health_check')) return fail('health_check', server);
+    const a = parseArgs(h[1]);
+    const mode = a.quick ? 'quick' : 'full';
+    const result = healthBuild(st, a.name, mode, server.name);
+    if (!result) return { rc: 1, stdout: '', stderr: `No connection named '${a.name}' is configured on this host.` };
+    // An explicit budget is what the host reports it was given.
+    if (a.budget !== undefined) result.budget_seconds = Number(a.budget);
+    return { rc: result.overall_status === 'BROKEN' ? 1 : 0, stdout: `${JSON.stringify(result)}\n`, stderr: '' };
+  }
+  h = command.match(/gre repair preview (.*)$/);
+  if (h) {
+    if (faulted(server, 'repair_preview')) return fail('repair_preview', server);
+    const a = parseArgs(h[1]);
+    const result = healthBuild(st, a.name, 'full', server.name);
+    if (!result) return { rc: 1, stdout: '', stderr: `No connection named '${a.name}' is configured on this host.` };
+    return ok(JSON.stringify({
+      connection: a.name,
+      read_only: true,
+      repairable: result.findings.filter((f) => f.safe_repair),
+    }));
+  }
+
   // --- mutating verbs ------------------------------------------------------
+
+  // `gre repair apply` re-applies this connection's own configuration, so the code it
+  // fixes stops being reported. Removing the finding IS the state change: the checks
+  // are derived from the findings, exactly as they are on a real host.
+  h = command.match(/gre repair apply (.*)$/);
+  if (h) {
+    if (faulted(server, 'repair_apply')) return fail('repair_apply', server);
+    const a = parseArgs(h[1]);
+    const result = healthBuild(st, a.name, 'quick', server.name);
+    if (!result) return { rc: 1, stdout: '', stderr: `No connection named '${a.name}' is configured on this host.` };
+    const finding = result.findings.find((f) => f.code === a.code);
+    if (!finding || !finding.safe_repair) {
+      return { rc: 1, stdout: '', stderr: `No automated repair exists for '${a.code}' on this host.` };
+    }
+    // A repair that ran but changed nothing is exactly the outcome the Hub must not
+    // report as a success, so it has to be injectable.
+    if ((faults().repair_noop || []).includes(server.name)) {
+      return ok(`Repair ${a.code} ran; the condition is unchanged.\n`);
+    }
+    const entry = healthEntry(st, a.name);
+    entry.findings = entry.findings.filter((f) => f.code !== a.code);
+    return ok(`Repaired: ${a.code} is no longer reported for '${a.name}'.\n`);
+  }
 
   // `gre mtu set` adjusts the interface MTU IN PLACE. Nothing in this handler touches
   // peers, nodes or tunnels, which is exactly the property the Hub's MTU flow relies
@@ -505,3 +761,5 @@ module.exports.state = state;
 module.exports.reset = () => state.clear();
 module.exports.verbOf = verbOf;
 module.exports.TUNNEL_REBUILD_VERBS = TUNNEL_REBUILD_VERBS;
+module.exports.MUTATING_VERBS = MUTATING_VERBS;
+module.exports.healthBuild = healthBuild;

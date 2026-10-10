@@ -7,7 +7,7 @@ _gre() {
     COMPREPLY=()
 
     if (( COMP_CWORD == 1 )); then
-        cmds="node iran iran-setup foreign-setup doctor export import watchdog status update purge hub --status --apply --stop --version --help"
+        cmds="node iran iran-setup foreign-setup doctor tunnel mtu health-check repair export import watchdog status update purge hub --status --apply --stop --version --help"
         COMPREPLY=( $(compgen -W "$cmds" -- "$cur") )
         return 0
     fi
@@ -66,6 +66,37 @@ _gre() {
             ;;
         import)
             COMPREPLY=( $(compgen -f -X '!*.tar.gz' -- "$cur") )
+            ;;
+        tunnel)
+            if (( COMP_CWORD == 2 )); then
+                COMPREPLY=( $(compgen -W "diagnose rules" -- "$cur") )
+            elif (( COMP_CWORD == 3 )); then
+                COMPREPLY=( $(compgen -W "--name --json" -- "$cur") )
+            else
+                COMPREPLY=( $(compgen -W "--name --json" -- "$cur") )
+            fi
+            ;;
+        mtu)
+            if (( COMP_CWORD == 2 )); then
+                COMPREPLY=( $(compgen -W "list diagnose recommend auto set restore nic" -- "$cur") )
+            elif (( COMP_CWORD == 3 )); then
+                case "${COMP_WORDS[2]}" in
+                    nic) COMPREPLY=( $(compgen -W "list analyze" -- "$cur") ) ;;
+                    *)   COMPREPLY=( $(compgen -W "--name --json --probe" -- "$cur") ) ;;
+                esac
+            else
+                COMPREPLY=( $(compgen -W "--name --mtu --json --probe --yes" -- "$cur") )
+            fi
+            ;;
+        health-check)
+            COMPREPLY=( $(compgen -W "--name --json --quick --full --budget" -- "$cur") )
+            ;;
+        repair)
+            if (( COMP_CWORD == 2 )); then
+                COMPREPLY=( $(compgen -W "preview apply" -- "$cur") )
+            else
+                COMPREPLY=( $(compgen -W "--name --code --json --yes" -- "$cur") )
+            fi
             ;;
     esac
     return 0

@@ -4,6 +4,100 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The TCP MSS clamp was derived from the wrong MTU.** It used
+  `TCPMSS --clamp-mss-to-pmtu`, which resolves against the ROUTE's MTU — and for a packet
+  leaving through a GRE tunnel that route is the underlay one. It therefore commonly
+  advertised the underlay's MSS (e.g. 1460) inside a tunnel that could only carry a smaller
+  one, which is precisely the broken-PMTU stall the rule exists to prevent. The MSS is now
+  set explicitly from the tunnel's own MTU, the clamp covers the FORWARD path as well as
+  POSTROUTING, and it is re-derived whenever the MTU changes. Deletion is by ownership
+  comment, because the MSS value is part of the rule's specification and changes with the
+  MTU — an exact-spec delete would have left the previous clamp in place.
+- **A FOREIGN tunnel could be built with no local endpoint.** `apply_foreign_node` read
+  `FOREIGN_IP` from the caller's scope instead of resolving it. The value lives in
+  `foreign.conf`, not in a node config, so a truncated or overwritten `foreign.conf` left it
+  empty and produced a tunnel that exists, appears in `gre status`, and can never pass
+  traffic. The function now resolves and validates its own endpoint, and refuses with an
+  actionable message instead of building a broken tunnel. `node_conf_read` replaces a bare
+  `source` of a node config, so a malformed config can no longer leak assignments into the
+  caller.
+- **A rollback could silently fail and still report success.** `edit_rollback` always
+  returned 0 and every caller discarded its result, so a rollback that could not restore the
+  tunnel printed a success message. It now verifies the restored state and reports
+  `ROLLBACK_FAILED` with the commands a human needs.
+- **The Hub rebuilt GRE state from metadata that means something else.** `host_group_id` is
+  a 3x-ui managed-host group id (it is passed to the panel's `deleteHost`), but it was used
+  as the GRE subnet base; and because the orchestrator stores a bare IP in `iran_endpoint`,
+  `JSON.parse` always failed and the fallback was taken every time. A parameter the Hub does
+  not know is now reported as unknown and any change depending on it is refused, rather than
+  a plausible-looking value being written into a live tunnel.
+- **`gre mtu nic analyze` exited non-zero on a high risk**, so a caller read "this NIC is
+  risky to change" as "the command failed". The risk is data; the command now exits 0.
+- **The GRE key could be reported as missing on a correct tunnel.** `ip -d tunnel show` does
+  not reliably print the key, so a keyed tunnel looked unkeyed. The key is now read with its
+  source and a non-live reading is reported as such, not as a fault.
+
+### Added
+
+- **`gre health-check --name NAME [--json] [--quick|--full] [--budget SECONDS]`** — the Full
+  Network Health Check. It walks the layers a GRE connection depends on in the order they
+  can fail: SSH and server, underlay, GRE configuration, protocol 47, tunnel connectivity,
+  routing and firewall, MTU and MSS, and the service layer. Every check reports
+  `PASS`/`WARN`/`FAIL`/`UNKNOWN`/`SKIPPED`, and each problem is recorded as a machine-readable
+  issue code with its severity, confidence, evidence, probable cause and whether a verified
+  repair exists. Read-only: it changes nothing. It does not duplicate `gre doctor` or
+  `gre tunnel diagnose` — those answer "is the manager healthy" and "is this tunnel
+  configured and up"; this answers "why does this connection not work".
+  - Public-IP reachability is recorded as a fact about the underlay and is never treated as
+    evidence that GRE works.
+  - `UNKNOWN` is used for a probe that could not run. It is not a failure and not a success,
+    and a budget expiry is reported as `INSUFFICIENT_EVIDENCE` rather than as a pass.
+  - Absence of captured GRE packets in a short window is reported as unknown, not as the
+    provider blocking traffic.
+- **`gre repair preview --name NAME [--json]`** and
+  **`gre repair apply --name NAME --code CODE [--yes]`** — repairs for the issues this host
+  can fix and verify, grouped by risk. Endpoint changes, WAN MTU changes and upstream
+  filtering are reported with no automated repair. Applying one requires `--yes`, runs
+  through the transactional paths (journal, verification, rollback), and only reports
+  success when a fresh check no longer finds the code.
+- **`gre mtu` — per-connection MTU diagnosis and safe in-place tuning.**
+  `list`, `diagnose --probe`, `recommend`, `auto`, `set --mtu --yes`, `restore`, and the
+  read-only `nic list|analyze` for the physical NIC.
+  - The GRE overhead is computed from the tunnel's own configuration (28 bytes for keyed
+    IPv4 GRE), never assumed.
+  - Path MTU is measured with a bounded DF probe: at most twelve packets, rate-limited, and
+    a timeout is reported as inconclusive rather than as evidence of a smaller path.
+  - Recommendations carry a confidence level and refuse to be applied when the evidence does
+    not support them; the value is floored at the minimum legal MTU for the inner protocol
+    (576 for IPv4, 1280 when the inner path carries IPv6).
+  - `set` changes ONLY the selected connection, in place, with a single `ip link set` — it
+    does not recreate the interface (asserted), it journals the previous value first, and it
+    verifies the result from the kernel. `restore` re-applies the journalled value.
+  - The override is stored per connection and survives a restart, the watchdog, a migration
+    and an edit. An absent override means "no explicit value", so an existing installation is
+    not silently repinned.
+  - A WAN NIC MTU is never changed automatically: `nic analyze` reports the risk and explains
+    that it can sever the SSH session and remove the Hub's ability to recover the host.
+- **The Connections page** shows Iran and Foreign NIC MTU, both GRE MTUs, the verified
+  underlay PMTU, the estimated overhead, the recommended MTU, the MSS clamp state, the last
+  verification and any drift, with actions to analyze, recommend, apply and restore.
+- **`tests/netns-gre.sh`** — real Linux GRE integration tests in network namespaces: key
+  mismatch, wrong local and remote endpoints, a blocked protocol 47, a route loop, Class A
+  versus Class B semantics, multiple tunnels, and MTU changes on a real interface. They skip
+  with a reason when the environment cannot run them, and CI sets `GRE_NETNS_REQUIRE=1` so
+  the Linux runner must actually execute them.
+
+### Notes
+
+- Real acceptance against live servers has **not** been performed for the MTU work or the
+  health check. Everything is verified against the test harness, a stateful fake, and (where
+  the environment allows) real network namespaces. The accompanying report states what
+  remains unverified.
+
 ## [2.17.0] - 2026-10-08
 
 ### Added

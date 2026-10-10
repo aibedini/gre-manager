@@ -112,8 +112,100 @@ check('nic analyze has iface/risk', !!nic.iface && !!nic.risk, JSON.stringify(ni
 check('nic analyze reports applied:false', nic.applied === false);
 check('nic analyze flags the control-plane risk', nic.risk === 'high', String(nic.risk));
 
+console.log('\n=== gre health-check --json ===');
+// The Hub treats a non-zero exit WITH parseable JSON as data (the diagnosis succeeded and
+// found the connection broken), so the runner has to survive a non-zero exit.
+const runAllowFail = (...args) => {
+  try { return { out: run(...args), rc: 0 }; } catch (e) { return { out: String(e.stdout || ''), rc: e.status || 1 }; }
+};
+const hc = runAllowFail('health-check', '--name', 'de1', '--quick', '--json');
+let health;
+try { health = JSON.parse(hc.out); } catch { health = null; }
+check('health-check emits parseable JSON (even when it exits non-zero)', !!health, `rc=${hc.rc} out=${hc.out.slice(0, 120)}`);
+if (health) {
+  for (const f of ['connection', 'side', 'server', 'mode', 'overall_status', 'evidence_completeness',
+    'budget_seconds', 'elapsed_seconds', 'summary', 'checks', 'findings', 'tested_at']) {
+    check(`health-check has ${f}`, Object.prototype.hasOwnProperty.call(health, f), JSON.stringify(health).slice(0, 200));
+  }
+  check('overall_status is the contract set',
+    ['HEALTHY', 'DEGRADED', 'BROKEN'].includes(health.overall_status), String(health.overall_status));
+  check('evidence_completeness is the contract set',
+    ['complete', 'partial'].includes(health.evidence_completeness), String(health.evidence_completeness));
+  check('mode is echoed', health.mode === 'quick', String(health.mode));
+  check('summary has every counter',
+    ['pass', 'warn', 'fail', 'unknown', 'skipped', 'critical_findings'].every((k) => Object.prototype.hasOwnProperty.call(health.summary, k)),
+    JSON.stringify(health.summary));
+  check('checks is a non-empty array', Array.isArray(health.checks) && health.checks.length > 0);
+  check('every check has id/category/status/detail/evidence',
+    health.checks.every((c) => c.id && c.category && c.status && typeof c.detail === 'string' && typeof c.evidence === 'string'));
+  check('every check status is in the contract set',
+    health.checks.every((c) => ['PASS', 'WARN', 'FAIL', 'UNKNOWN', 'SKIPPED'].includes(c.status)),
+    JSON.stringify([...new Set(health.checks.map((c) => c.status))]));
+  check('every category is one the Hub groups by',
+    health.checks.every((c) => /^[A-HZ]_[a-z0-9_]+$/.test(c.category)),
+    JSON.stringify([...new Set(health.checks.map((c) => c.category))]));
+  check('findings is an array', Array.isArray(health.findings));
+  check('every finding carries the fields the Hub renders',
+    health.findings.every((f) => f.code && f.severity && typeof f.evidence === 'string'
+      && typeof f.probable_cause === 'string' && typeof f.recommended_action === 'string'
+      && typeof f.safe_repair === 'boolean' && typeof f.confidence === 'string'),
+    JSON.stringify(health.findings).slice(0, 220));
+  check('every finding severity is in the contract set',
+    health.findings.every((f) => ['critical', 'warning', 'info'].includes(f.severity)),
+    JSON.stringify([...new Set(health.findings.map((f) => f.severity))]));
+  check('a non-zero exit corresponds to BROKEN, not to a crash',
+    hc.rc === 0 || health.overall_status === 'BROKEN', `rc=${hc.rc} status=${health.overall_status}`);
+  check('health-check leaked no secret', !/password|secret|PRIVATE KEY/i.test(hc.out));
+}
+
+console.log('\n=== gre repair preview --json ===');
+const prev = runAllowFail('repair', 'preview', '--name', 'de1', '--json');
+let preview;
+try { preview = JSON.parse(prev.out); } catch { preview = null; }
+check('repair preview emits parseable JSON', !!preview, prev.out.slice(0, 160));
+if (preview) {
+  check('preview marks itself read-only', preview.read_only === true);
+  check('preview names the connection', preview.connection === 'de1');
+  check('preview has a repairable array', Array.isArray(preview.repairable));
+  check('every repairable entry is a finding the Hub can render',
+    preview.repairable.every((f) => f.code && f.safe_repair === true && f.risk && f.recommended_action),
+    JSON.stringify(preview.repairable).slice(0, 200));
+}
+
+console.log('\n=== gre repair apply (the code must actually be repairable) ===');
+// Break the connection so a repairable finding exists, then repair it for real.
+fs.rmSync(path.join(R, 'state', 'tunnels', 'gre-de1'), { force: true });
+fs.rmSync(path.join(R, 'state', 'mtu.gre-de1'), { force: true });
+const hcBroken = runAllowFail('health-check', '--name', 'de1', '--quick', '--json');
+let broken = null;
+try { broken = JSON.parse(hcBroken.out); } catch { /* reported below */ }
+check('a broken connection reports BROKEN', !!broken && broken.overall_status === 'BROKEN',
+  broken ? broken.overall_status : hcBroken.out.slice(0, 120));
+check('the broken connection exits non-zero', hcBroken.rc !== 0, `rc=${hcBroken.rc}`);
+check('the break produced a machine-readable code',
+  !!broken && broken.findings.some((f) => f.code === 'GRE_INTERFACE_MISSING'),
+  broken ? JSON.stringify(broken.findings.map((f) => f.code)) : '');
+check('the finding is offered as a safe repair',
+  !!broken && broken.findings.some((f) => f.code === 'GRE_INTERFACE_MISSING' && f.safe_repair === true));
+
+const applyRes = runAllowFail('repair', 'apply', '--name', 'de1', '--code', 'GRE_INTERFACE_MISSING', '--yes');
+check('repair apply exits 0 when it fixed and verified', applyRes.rc === 0, `rc=${applyRes.rc} ${applyRes.out.slice(0, 160)}`);
+const hcAfter = runAllowFail('health-check', '--name', 'de1', '--quick', '--json');
+let afterRepair = null;
+try { afterRepair = JSON.parse(hcAfter.out); } catch { /* reported below */ }
+check('the repair is confirmed by a fresh check',
+  !!afterRepair && !afterRepair.findings.some((f) => f.code === 'GRE_INTERFACE_MISSING'),
+  afterRepair ? JSON.stringify(afterRepair.findings.map((f) => f.code)) : '');
+check('the connection is no longer BROKEN',
+  !!afterRepair && afterRepair.overall_status !== 'BROKEN',
+  afterRepair ? afterRepair.overall_status : '');
+
+console.log('\n=== gre repair apply refuses what it cannot verify ===');
+const badCode = runAllowFail('repair', 'apply', '--name', 'de1', '--code', 'NOT_A_REAL_CODE', '--yes');
+check('an unknown code is refused', badCode.rc !== 0, `rc=${badCode.rc}`);
+
 console.log('\n=== secrets ===');
-const all = JSON.stringify({ diag, rec, auto, nics, nic });
+const all = JSON.stringify({ diag, rec, auto, nics, nic, health, preview, broken, afterRepair });
 check('no credential material in any payload', !/password|secret|PRIVATE KEY/i.test(all));
 
 fs.rmSync(R, { recursive: true, force: true });

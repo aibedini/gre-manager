@@ -1259,6 +1259,11 @@ module.exports = {
   restoreMtu,
   mtuSummary,
   normalizeSide,
+  // Shared with the health layer on purpose: a payload leaving the hub must be
+  // redacted the same way whatever feature produced it, and a transport failure must
+  // keep its own message rather than become "rc=undefined".
+  sanitize,
+  runVerb,
   // Exported for the tests: the two pieces of the safety logic that are worth
   // exercising directly rather than through a whole transaction.
   verifyValues,

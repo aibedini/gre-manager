@@ -41,6 +41,22 @@ function requireMtu(value) {
   return n;
 }
 
+// A finding code is an identifier, never free text: it is passed to `gre repair apply
+// --code`, so anything not shaped like a code is refused before a command exists.
+function requireCode(value) {
+  if (!value) throw new Error('repair_apply requires code');
+  if (!CODE_RE.test(String(value))) {
+    throw new Error('code must be an uppercase finding code such as GRE_INTERFACE_DOWN');
+  }
+  return String(value);
+}
+
+function optHealthMode(value) {
+  if (value === undefined || value === null || value === '') return '';
+  if (!HEALTH_MODES.includes(value)) throw new Error(`mode must be one of: ${HEALTH_MODES.join(', ')}`);
+  return ` --${value}`;
+}
+
 function optEnum(flag, value, allowed) {
   if (value === undefined || value === null || value === '') return '';
   if (!allowed.includes(value)) throw new Error(`${flag} must be one of: ${allowed.join(', ')}`);
@@ -54,6 +70,12 @@ const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,10}$/;
 // tunnel that black-holes traffic, so this is validated on the Hub side too.
 const MTU_MIN = 576;
 const MTU_MAX = 65535;
+// The two health-check depths the CLI accepts. `--quick` bounds itself at 20s and
+// `--full` at 75s; a budget may widen or narrow that, but never without a bound.
+const HEALTH_MODES = ['quick', 'full'];
+const HEALTH_BUDGET_MIN = 1;
+const HEALTH_BUDGET_MAX = 600;
+const CODE_RE = /^[A-Z][A-Z0-9_]{0,40}$/;
 const SUBNET_BASE_RE = /^\d{1,3}\.\d{1,3}$/;
 const PORT_LIST_RE = /^[0-9,:-]+$/;
 
@@ -222,6 +244,22 @@ const BUILDERS = {
   // Read-only reachability check used to prove an MTU change did not break the
   // tunnel. It exists in the CLI independently of the MTU verbs.
   tunnel_diagnose: (p) => `gre tunnel diagnose --name ${q(requireName(p.name, 'tunnel_diagnose'))} --json`,
+  // Full network health check. Read-only by construction: the CLI's own health-check
+  // verb inspects and reports, and repairing anything is a separate, explicitly named
+  // action below. A budget is passed through because a full pass on a slow host is
+  // bounded by it, and a caller that cannot wait must be able to say so.
+  health_check: (p) =>
+    `gre health-check --name ${q(requireName(p.name, 'health_check'))} --json`
+    + optHealthMode(p.mode)
+    + optIntRange('--budget', p.budget, HEALTH_BUDGET_MIN, HEALTH_BUDGET_MAX),
+  // Read-only: this is the health check's own findings filtered to what this host can
+  // repair, so it changes nothing on the server.
+  repair_preview: (p) => `gre repair preview --name ${q(requireName(p.name, 'repair_preview'))} --json`,
+  // The only repair mutation. `--code` is validated here as well as remotely, and
+  // `--yes` is always appended: without it the CLI would block on a prompt the Hub
+  // cannot answer, and the operation would hang instead of failing.
+  repair_apply: (p) =>
+    `gre repair apply --name ${q(requireName(p.name, 'repair_apply'))} --code ${q(requireCode(p.code))} --yes`,
   export: (p) => `gre export${p.path ? ` ${q(p.path)}` : ''} --yes`,
   purge: (p) => {
     if (p.confirm !== 'PURGE') throw new Error('purge requires confirm: "PURGE"');
@@ -258,4 +296,6 @@ async function runAction(db, server, secret, action, params, sshOpts = {}, prebu
   return { ...result, command };
 }
 
-module.exports = { runAction, buildAction, ACTION_NAMES, sanitizeParams, MTU_MIN, MTU_MAX };
+module.exports = {
+  runAction, buildAction, ACTION_NAMES, sanitizeParams, MTU_MIN, MTU_MAX, HEALTH_MODES, HEALTH_BUDGET_MAX,
+};

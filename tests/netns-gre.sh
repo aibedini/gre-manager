@@ -350,7 +350,136 @@ EOF
 fi
 
 # ==========================================================================
-section "F. teardown"
+section "F. MTU on a real interface"
+
+# Changing an MTU in place must not disturb the tunnel, and must actually take effect.
+# This is the property the harness cannot prove: only the kernel can accept or reject
+# `ip link set mtu`, and only a real interface can show the value change while traffic
+# keeps flowing.
+ip netns exec "$IRAN_NS" ip tunnel del gre-p4 2>/dev/null || true
+ip netns exec "$FOREIGN_NS" ip tunnel del gre-p4 2>/dev/null || true
+ns_gre "$IRAN_NS" gre-p4 "$UNDERLAY_IRAN" "$UNDERLAY_FOREIGN" 1004 "10.201.4.1/30"
+ns_gre "$FOREIGN_NS" gre-p4 "$UNDERLAY_FOREIGN" "$UNDERLAY_IRAN" 1004 "10.201.4.2/30"
+sleep 0.5
+
+if ns_ping "$IRAN_NS" "10.201.4.2"; then
+    ok "mtu: the tunnel works at its default MTU"
+else
+    bad "mtu: the tunnel did not come up at its default MTU"
+fi
+
+mtu_before="$(ip netns exec "$IRAN_NS" cat /sys/class/net/gre-p4/mtu 2>/dev/null)"
+ip netns exec "$IRAN_NS" ip link set dev gre-p4 mtu 1400
+sleep 0.3
+mtu_after="$(ip netns exec "$IRAN_NS" cat /sys/class/net/gre-p4/mtu 2>/dev/null)"
+if [[ "$mtu_after" == "1400" ]]; then
+    ok "mtu: the kernel accepted the new MTU ($mtu_before -> $mtu_after)"
+else
+    bad "mtu: the MTU did not change (wanted 1400, got $mtu_after)"
+fi
+
+# The interface must NOT have been recreated, which is the whole point of in-place tuning.
+if ip netns exec "$IRAN_NS" ip -d tunnel show gre-p4 2>/dev/null | grep -q 'gre-p4'; then
+    ok "mtu: the interface still exists after the change"
+else
+    bad "mtu: the interface disappeared"
+fi
+if ip netns exec "$IRAN_NS" ip -d tunnel show gre-p4 2>/dev/null | grep -q "key 1004"; then
+    ok "mtu: the GRE key survived the change"
+else
+    # Not every kernel prints the key; only fail when it prints one and it is wrong.
+    if ip netns exec "$IRAN_NS" ip -d tunnel show gre-p4 2>/dev/null | grep -q "key"; then
+        bad "mtu: the GRE key changed"
+    else
+        ok "mtu: the key is not reported by this kernel (nothing to compare)"
+    fi
+fi
+if ns_ping "$IRAN_NS" "10.201.4.2"; then
+    ok "mtu: the tunnel still passes traffic after the MTU change"
+else
+    bad "mtu: the MTU change broke connectivity"
+fi
+
+# An MTU below the interface's own address capability is accepted by the kernel, which is
+# exactly why the manager must refuse an illegal value itself rather than rely on the
+# kernel to reject it.
+if ip netns exec "$IRAN_NS" ip link set dev gre-p4 mtu 100 2>/dev/null; then
+    ok "mtu: the kernel accepts a very small MTU, so the manager must validate it (confirmed)"
+    ip netns exec "$IRAN_NS" ip link set dev gre-p4 mtu 1400
+else
+    ok "mtu: the kernel itself refused a sub-legal MTU"
+fi
+
+# Two tunnels with DIFFERENT MTUs must not interfere.
+ip netns exec "$IRAN_NS" ip link set dev gre-p4 mtu 1300
+ip netns exec "$IRAN_NS" ip link set dev gre-p1 mtu 1476
+m4="$(ip netns exec "$IRAN_NS" cat /sys/class/net/gre-p4/mtu 2>/dev/null)"
+m1="$(ip netns exec "$IRAN_NS" cat /sys/class/net/gre-p1/mtu 2>/dev/null)"
+if [[ "$m4" == "1300" && "$m1" == "1476" ]]; then
+    ok "mtu: two tunnels hold different MTUs independently"
+else
+    bad "mtu: MTUs are not per-interface ($m4 / $m1)"
+fi
+
+# ==========================================================================
+section "G. the health check against real kernel state"
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ -f "$REPO/gre-manager.sh" ]]; then
+    links_before="$(ip netns exec "$IRAN_NS" ip -o link show | awk -F': ' '{print $2}' | sort | tr '\n' ' ')"
+    hc_out="$(ip netns exec "$IRAN_NS" bash -c '
+        set -u
+        mkdir -p /tmp/gre-hc-etc/multi-gre/foreigns /tmp/gre-hc-etc/multi-gre/nodes
+        sed -e "s|/etc/multi-gre|/tmp/gre-hc-etc/multi-gre|g" \
+            -e "s|if \[\[ \${EUID:-\$(id -u)} -ne 0 \]\]; then|if false; then|" \
+            '"$REPO"'/gre-manager.sh > /tmp/gre-hc-sut.sh 2>/dev/null
+        cat > /tmp/gre-hc-etc/multi-gre/foreigns/p1.conf <<EOF
+NAME=p1
+FOREIGN_IP='"$UNDERLAY_FOREIGN"'
+IRAN_IP='"$UNDERLAY_IRAN"'
+WAN_IF=lo
+SUBNET_BASE=10.201
+IDX=1
+KEY=2002
+TUN=gre-p1
+TCP_PORTS=3001
+UDP_PORTS=
+MSS_CLAMP=0
+EOF
+        bash /tmp/gre-hc-sut.sh health-check --name p1 --quick --json 2>&1
+    ')"
+    hc_rc=$?
+    if grep -q '"overall_status"' <<< "$hc_out"; then
+        ok "health-check: runs against a real GRE interface and emits the contract JSON"
+    else
+        bad "health-check: did not emit the contract JSON (rc=$hc_rc)"
+    fi
+    if grep -qE '"id":"interface_exists","category":"[^"]+","status":"PASS"' <<< "$hc_out"; then
+        ok "health-check: reports the real interface as present"
+    else
+        bad "health-check: did not report the real interface as present"
+    fi
+    if grep -qE '"id":"tunnel_address","category":"[^"]+","status":"PASS"' <<< "$hc_out"; then
+        ok "health-check: confirms the real tunnel address"
+    else
+        # The address is 10.201.1.1/30 for the iran side of this pair.
+        bad "health-check: did not confirm the tunnel address"
+    fi
+    if grep -qE '"id":"inner_route","category":"[^"]+","status":"PASS"' <<< "$hc_out"; then
+        ok "health-check: confirms the kernel routes the peer's tunnel address over the interface"
+    else
+        bad "health-check: did not confirm the inner route"
+    fi
+    links_after="$(ip netns exec "$IRAN_NS" ip -o link show | awk -F': ' '{print $2}' | sort | tr '\n' ' ')"
+    if [[ "$links_before" == "$links_after" ]]; then
+        ok "health-check: changed nothing in the namespace"
+    else
+        bad "health-check: modified the network state"
+    fi
+fi
+
+# ==========================================================================
+section "H. teardown"
 
 cleanup
 if ip netns list 2>/dev/null | grep -q "$IRAN_NS"; then

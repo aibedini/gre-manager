@@ -411,6 +411,122 @@ kbd {
 
 .conn-table td .badge + .conn-mtu-when { margin-top: 2px; }
 
+/* ---------- full network health check ---------------------------------- */
+/* The diagnostic view follows the MTU panel's shape: a bordered panel on the
+   Connections page, the same table and badge vocabulary, and no new framework. */
+.conn-health {
+  margin-top: 18px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+}
+
+.conn-health-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.conn-health-head h3 { font-size: 14px; margin: 0; }
+.conn-health-verdict { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+
+.health-overall {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  font-size: 13px;
+  border-left: 3px solid var(--border-strong);
+  padding: 8px 0 8px 12px;
+  margin-bottom: 10px;
+}
+
+.health-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  margin-bottom: 12px;
+}
+
+.health-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.health-side {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+}
+
+.health-side h4 { font-size: 13px; margin: 0 0 6px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+
+.health-section { margin-bottom: 16px; }
+
+.health-section h4 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  margin: 0 0 6px;
+}
+
+.health-check-table { font-size: 12.5px; white-space: normal; }
+.health-check-table td:first-child { width: 45%; }
+.health-check-id { font-family: var(--mono); }
+.health-check-detail { color: var(--text-muted); font-size: 11.5px; }
+.health-check-missing { color: var(--text-faint); }
+
+.health-finding {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  margin-bottom: 8px;
+}
+
+.health-finding.sev-critical { border-left-color: var(--red-fg); }
+.health-finding.sev-warning { border-left-color: var(--yellow-fg); }
+.health-finding summary { cursor: pointer; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+.health-finding-code { font-family: var(--mono); font-weight: 600; }
+.health-finding-body { margin-top: 10px; display: grid; gap: 10px; font-size: 12.5px; }
+.health-finding-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.health-not-safe { color: var(--yellow-fg); }
+
+.health-evidence-pre {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  max-height: 260px;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.health-history-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.health-history-row:last-child { border-bottom: none; }
+
+.health-panel-busy { opacity: 0.6; }
+
 /* ---------- edit review ------------------------------------------------ */
 
 .review-grid { overflow-x: auto; }

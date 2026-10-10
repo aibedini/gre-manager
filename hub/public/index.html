@@ -112,6 +112,25 @@
             <div id="conn-mtu-verdict" class="conn-mtu-verdict"></div>
             <div id="conn-mtu-checks" class="conn-mtu-checks"></div>
           </div>
+
+          <!-- Full Network Health Check drill-down for one connection. A connection is a
+               PAIR, so every check is rendered as one row with an Iran and a Foreign
+               column, and the findings are correlated server-side into one code with
+               the sides that reported it. -->
+          <div id="connections-health" class="conn-health hidden">
+            <div class="conn-health-head">
+              <h3 id="conn-health-title">Full network health check</h3>
+              <div id="conn-health-verdict" class="conn-health-verdict"></div>
+              <div style="flex:1"></div>
+              <button class="btn btn-ghost btn-sm" id="btn-conn-health-full">Run Full Check</button>
+              <button class="btn btn-ghost btn-sm" id="btn-conn-health-quick">Run Quick Check</button>
+              <button class="btn btn-ghost btn-sm" id="btn-conn-health-mtu">Analyze MTU</button>
+              <button class="btn btn-ghost btn-sm" id="btn-conn-health-report">Export Diagnostic Report</button>
+              <button class="btn btn-ghost btn-sm" id="btn-conn-health-restore">Restore Previous State</button>
+              <button class="btn btn-ghost btn-sm" id="btn-conn-health-close">Close</button>
+            </div>
+            <div id="conn-health-body" class="conn-health-body"></div>
+          </div>
         </section>
 
         <section id="page-log" class="page hidden">
