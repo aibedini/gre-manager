@@ -1257,6 +1257,29 @@ edit_fail_and_rollback() { # edit_fail_and_rollback SIDE REASON
     return 1
 }
 
+# The GRE key an interface is actually using, and where that answer came from.
+#
+# `ip -d tunnel show` does NOT reliably print the key: for a keyed tunnel the kernel often
+# omits it, so treating "no key in the output" as "the interface carries no key" reports a
+# correct tunnel as a fault. The fallback chain is explicit and the source is returned, so
+# a caller can tell a live reading from a configured one and never presents the latter as
+# proof of what the interface is doing.
+#
+# Echoes: "<key> <source>" where source is live | record | configured | none
+tunnel_key_info() { # tunnel_key_info IFACE [CONFIGURED_KEY]
+    local iface="${1:-}" configured="${2:-}" out="" key=""
+    [[ -n "$iface" ]] || { printf 'none'; return; }
+    out="$(ip -d tunnel show "$iface" 2>/dev/null || true)"
+    key="$(sed -n 's/.*[[:space:]]key[[:space:]]\+\([0-9]\+\).*/\1/p' <<< "$out" | head -n1)"
+    [[ -n "$key" ]] && { printf '%s live' "$key"; return; }
+    if [[ -n "${TEST_ROOT:-}" && -r "${TEST_ROOT}/state/tunnels/${iface}" ]]; then
+        key="$(sed -n 's/.*[[:space:]]key[[:space:]]\+\([0-9]\+\).*/\1/p' "${TEST_ROOT}/state/tunnels/${iface}" | head -n1)"
+        [[ -n "$key" ]] && { printf '%s record' "$key"; return; }
+    fi
+    [[ -n "$configured" ]] && { printf '%s configured' "$configured"; return; }
+    printf 'none'
+}
+
 # Does the connection's own interface exist and carry the expected local address?
 # Deliberately modest: it proves the edit produced a live tunnel, without claiming
 # to prove end-to-end reachability (that is doctor's job, and it needs both ends).
@@ -5377,7 +5400,7 @@ tunnel_diagnose() { # tunnel_diagnose NAME [--json]
     local live_local live_remote live_key
     live_local="$(tunnel_local_endpoint "$TUN")"
     live_remote="$(ip -d tunnel show "$TUN" 2>/dev/null | sed -n 's/.*[[:space:]]remote[[:space:]]\+\([0-9.]\+\)[[:space:]].*/\1/p' | head -n1)"
-    live_key="$(ip -d tunnel show "$TUN" 2>/dev/null | sed -n 's/.*[[:space:]]key[[:space:]]\+\([0-9]\+\).*/\1/p' | head -n1)"
+    local _ki; _ki="$(tunnel_key_info "$TUN" "$KEY")"; live_key="${_ki%% *}"; key_source="${_ki##* }"
 
     # 5 + 6. addressing
     local live_addr
@@ -5630,20 +5653,23 @@ cli_tunnel_rules() { # gre tunnel rules [--json]
 mtu_resolve() { # mtu_resolve NAME
     local name="$1"
     local peerf="$FOREIGNS_DIR/$name.conf" nodef="$NODES_DIR/$name.conf"
-    MTU_SIDE=""; MTU_NAME=""; MTU_PEER_IP=""; MTU_SELF_IP=""
+    MTU_SIDE=""; MTU_FILE=""; MTU_NAME=""; MTU_PEER_IP=""; MTU_SELF_IP=""
     MTU_SUBNET_BASE="$DEFAULT_SUBNET_BASE"; MTU_IDX=""; MTU_KEY=""; MTU_TUN=""
-    MTU_MSS="0"; MTU_OVERRIDE=""
+    MTU_MSS="0"; MTU_OVERRIDE=""; MTU_TCP=""; MTU_UDP=""; MTU_WAN_IF=""
 
     if [[ -f "$peerf" ]]; then
-        MTU_SIDE="iran"
+        MTU_SIDE="iran"; MTU_FILE="$peerf"
         local NAME="" FOREIGN_IP="" IRAN_IP="" WAN_IF="" SUBNET_BASE="$DEFAULT_SUBNET_BASE" \
               IDX="" KEY="" TUN="" TCP_PORTS="" UDP_PORTS="" MSS_CLAMP="0" MTU=""
         load_peer_conf "$peerf" || return 1
         MTU_NAME="$NAME"; MTU_PEER_IP="$FOREIGN_IP"; MTU_SELF_IP="$IRAN_IP"
         MTU_SUBNET_BASE="$SUBNET_BASE"; MTU_IDX="$IDX"; MTU_KEY="$KEY"; MTU_TUN="$TUN"
         MTU_MSS="$MSS_CLAMP"; MTU_OVERRIDE="$MTU"
+        # The port set and WAN interface are what the health check needs to inspect this
+        # connection's own forwarding rules. Read by gre health-check.
+        MTU_TCP="$TCP_PORTS"; MTU_UDP="$UDP_PORTS"; MTU_WAN_IF="$WAN_IF"
     elif [[ -f "$nodef" ]]; then
-        MTU_SIDE="foreign"
+        MTU_SIDE="foreign"; MTU_FILE="$nodef"
         local N_NAME="" N_IRAN_IP="" N_BASE="$DEFAULT_SUBNET_BASE" N_IDX="" N_KEY="" N_TUN="" N_MTU=""
         node_conf_read "$nodef" N_NAME N_IRAN_IP N_BASE N_IDX N_KEY N_TUN N_MTU
         MTU_NAME="$N_NAME"; MTU_PEER_IP="$N_IRAN_IP"; MTU_SELF_IP="$(foreign_local_ip)"
@@ -6452,6 +6478,1043 @@ EOF
     esac
 }
 
+# ============================================================ Full Network Health Check
+#
+# One read-only pass that inspects the layers a GRE connection depends on and reports
+# what is wrong, with the evidence for each conclusion.
+#
+# It does NOT duplicate doctor or tunnel diagnose: those answer "is the manager healthy"
+# and "is this tunnel configured and up". This answers "why does this connection not
+# work", by walking the layers in the order they can fail and collecting ISSUE CODES with
+# evidence, so a caller (the Hub) can correlate both sides and name a root cause.
+#
+# Every check reports PASS / WARN / FAIL / UNKNOWN / SKIPPED, and UNKNOWN is used
+# honestly: a probe that could not run is not a failure and not a success.
+#
+# Read-only. It never changes a rule, an interface or a service. The only repairs it can
+# offer are separate, explicit commands.
+
+# Time budget, so a full pass on a slow or unreachable host cannot hang a caller. Each
+# check is individually short; these bound the total.
+HEALTH_TIMEOUT_PING=3
+HEALTH_BUDGET_SECONDS_FULL=75
+HEALTH_BUDGET_SECONDS_QUICK=20
+
+# Emit one check. Adds to the JSON array and the human output, and counts statuses.
+#   health_add ID CATEGORY STATUS DETAIL [EVIDENCE]
+health_add() {
+    local id="$1" cat="$2" st="$3" detail="$4" evidence="${5:-}"
+    case "$st" in
+        PASS) HEALTH_N_PASS=$(( HEALTH_N_PASS + 1 )) ;;
+        WARN) HEALTH_N_WARN=$(( HEALTH_N_WARN + 1 )) ;;
+        FAIL) HEALTH_N_FAIL=$(( HEALTH_N_FAIL + 1 )) ;;
+        SKIPPED) HEALTH_N_SKIP=$(( HEALTH_N_SKIP + 1 )) ;;
+        *) HEALTH_N_UNKNOWN=$(( HEALTH_N_UNKNOWN + 1 )) ;;
+    esac
+    [[ -n "$HEALTH_CHECKS_JSON" ]] && HEALTH_CHECKS_JSON+=","
+    HEALTH_CHECKS_JSON+="$(printf '{"id":"%s","category":"%s","status":"%s","detail":"%s","evidence":"%s"}' \
+        "$(json_escape "$id")" "$(json_escape "$cat")" "$st" "$(json_escape "$detail")" "$(json_escape "$evidence")")"
+    [[ "$HEALTH_JSON_ONLY" == "1" ]] || printf '  [%-7s] %-22s %s\n' "$st" "$id" "$detail"
+}
+
+# Record a finding: an issue code with severity, evidence, probable cause and whether a
+# safe repair exists. A finding is only ever recorded with the observation behind it.
+#   health_find CODE SEVERITY CONFIDENCE EVIDENCE CAUSE REPAIR_KEY
+health_find() {
+    local code="$1" sev="$2" conf="$3" evidence="$4" cause="$5" repair="${6:-}"
+    local safe="false" action="" risk=""
+    if [[ -n "$repair" ]]; then
+        case "$repair" in
+            mtu_set)      safe="true";  risk="low";    action="Set this connection's tunnel MTU from the measured path" ;;
+            rule_restore) safe="true";  risk="low";    action="Reinstall the missing rule this connection owns" ;;
+            iface_up)     safe="true";  risk="low";    action="Bring the configured tunnel interface up" ;;
+            peer_apply)   safe="true";  risk="medium"; action="Reapply this connection (rebuilds its tunnel and rules)" ;;
+            mss_clamp)    safe="true";  risk="low";    action="Reinstall the TCP MSS clamp for the measured MTU" ;;
+            endpoint)     safe="false"; risk="high";   action="The public endpoint must be corrected on both servers by hand" ;;
+            wan_mtu)      safe="false"; risk="high";   action="A WAN NIC MTU change is not automated: it can sever SSH" ;;
+            provider)     safe="false"; risk="high";   action="Nothing on this host can fix an upstream filter" ;;
+            *)            safe="false"; risk="medium"; action="" ;;
+        esac
+    fi
+    [[ -n "$HEALTH_FINDINGS_JSON" ]] && HEALTH_FINDINGS_JSON+=","
+    HEALTH_FINDINGS_JSON+="$(printf '{"code":"%s","severity":"%s","server":"%s","connection":"%s","confidence":"%s","evidence":"%s","probable_cause":"%s","recommended_action":"%s","safe_repair":%s,"risk":"%s","repair_key":"%s"}' \
+        "$code" "$sev" "$(json_escape "${HEALTH_SERVER:-$(hostname 2>/dev/null || echo local)}")" \
+        "$(json_escape "$HEALTH_NAME")" "$conf" "$(json_escape "$evidence")" "$(json_escape "$cause")" \
+        "$(json_escape "$action")" "$safe" "${risk:-none}" "$repair")"
+    [[ "$HEALTH_JSON_ONLY" == "1" ]] || printf '    -> %s (%s, confidence %s)\n' "$code" "$sev" "$conf"
+    case "$sev" in
+        critical) HEALTH_N_CRITICAL=$(( HEALTH_N_CRITICAL + 1 )) ;;
+    esac
+}
+
+# Has the time budget run out? A caller gets a partial answer with INSUFFICIENT_EVIDENCE
+# rather than a hang.
+health_expired() {
+    local now; now="$(date +%s 2>/dev/null || echo 0)"
+    (( HEALTH_START == 0 )) && return 1
+    (( now - HEALTH_START >= HEALTH_BUDGET ))
+}
+
+# ping with the configured timeout, returning 0/1 without leaking output.
+health_ping() { # health_ping DEST [IFACE]
+    local dest="$1" iface="${2:-}"
+    command -v ping >/dev/null 2>&1 || return 2
+    if [[ -n "$iface" ]]; then
+        ping -c 2 -W "$HEALTH_TIMEOUT_PING" -I "$iface" "$dest" >/dev/null 2>&1
+    else
+        ping -c 2 -W "$HEALTH_TIMEOUT_PING" "$dest" >/dev/null 2>&1
+    fi
+}
+
+# A single RTT/loss sample, parsed from ping's summary. Empty when it cannot be read.
+health_ping_stats() { # health_ping_stats DEST
+    local dest="$1" out
+    command -v ping >/dev/null 2>&1 || { printf ''; return; }
+    out="$(ping -c 3 -W "$HEALTH_TIMEOUT_PING" "$dest" 2>/dev/null || true)"
+    local loss rtt
+    loss="$(sed -n 's/.*, \([0-9]\+\)% packet loss.*/\1/p' <<< "$out" | head -n1)"
+    rtt="$(sed -n 's/.*= [0-9.]*\/\([0-9.]*\)\/.*/\1/p' <<< "$out" | head -n1)"
+    printf '%s %s' "${loss:-}" "${rtt:-}"
+}
+
+# sshd listening? Cheap evidence that the control plane is up.
+health_sshd_listening() {
+    local port="${SSH_PORT:-22}"
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltn 2>/dev/null | grep -qE "[:.]${port}[[:space:]]" && return 0
+    fi
+    return 1
+}
+
+# ------------------------------------------------------------ the check themselves
+#
+# Each returns nothing and reports through health_add/health_find, so a single check can
+# both record what it saw and, when it saw something wrong, say what it implies.
+
+health_check_server() {
+    local cat="A_ssh_and_server"
+    # Am I the host that was asked? If the caller reached this point at all then the
+    # control plane worked; saying so is still worth recording, because a WARN here is
+    # often the real explanation for everything below.
+    if [[ -n "${HEALTH_REMOTE:-}" ]]; then
+        health_add "control_plane" "$cat" "PASS" "ran on ${HEALTH_REMOTE}" ""
+    else
+        health_add "control_plane" "$cat" "PASS" "ran locally on $(hostname 2>/dev/null || echo this host)" ""
+    fi
+
+    if [[ "$(id -u 2>/dev/null || echo 0)" == "0" ]]; then
+        health_add "privilege" "$cat" "PASS" "running as root" ""
+    else
+        health_add "privilege" "$cat" "WARN" "not running as root; some checks will be UNKNOWN" "uid=$(id -u 2>/dev/null)"
+    fi
+
+    local os_name=""
+    if [[ -r /etc/os-release ]]; then
+        os_name="$(sed -n 's/^PRETTY_NAME="\?\(.*\)"\?$/\1/p' /etc/os-release | head -n1)"
+    fi
+    [[ -n "$os_name" ]] || os_name="$(uname -s 2>/dev/null)"
+    health_add "operating_system" "$cat" "PASS" "${os_name:-unknown}" ""
+
+    local kern; kern="$(uname -r 2>/dev/null)"
+    health_add "kernel" "$cat" "PASS" "${kern:-unknown}" ""
+
+    # The GRE module is what makes any of this possible. On a host that is not Linux at
+    # all -- a development machine, or a container with no module support -- the absence
+    # of /sys/module proves nothing, so it is UNKNOWN rather than a fault.
+    if [[ "$(uname -s 2>/dev/null)" != "Linux" ]]; then
+        health_add "gre_module" "$cat" "UNKNOWN" "not a Linux host, so GRE module support cannot be assessed" ""
+    elif [[ -d /sys/module/ip_gre || -d /sys/module/gre ]]; then
+        health_add "gre_module" "$cat" "PASS" "ip_gre is loaded" ""
+    elif modprobe -n gre >/dev/null 2>&1; then
+        health_add "gre_module" "$cat" "WARN" "ip_gre is not loaded but can be" ""
+    else
+        health_add "gre_module" "$cat" "FAIL" "this kernel has no usable GRE support" "no /sys/module/ip_gre"
+        health_find "GRE_MODULE_MISSING" "critical" "high" \
+            "no GRE module is loaded or loadable" \
+            "the kernel cannot create GRE interfaces at all" "provider"
+    fi
+
+    # The manager's own version, so a Hub can flag a mismatched pair.
+    health_add "cli_version" "$cat" "PASS" "gre-manager ${VERSION:-unknown}" ""
+
+    # The watchdog is the mechanism that brings a dead tunnel back.
+    local wd_state="unknown"
+    if [[ -f "$GLOBAL_CONF" ]]; then
+        local dt_enabled=""
+        dt_enabled="$(grep -E '^WATCHDOG_ENABLED=' "$GLOBAL_CONF" 2>/dev/null | head -n1 | cut -d= -f2)"
+        case "$dt_enabled" in
+            1) wd_state="enabled" ;;
+            0) wd_state="disabled" ;;
+        esac
+    fi
+    local timer_active=""
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl is-active multi-gre-watchdog.timer >/dev/null 2>&1 && timer_active="yes"
+    fi
+    if [[ "$wd_state" == "enabled" && "$timer_active" == "yes" ]]; then
+        health_add "watchdog" "$cat" "PASS" "the watchdog timer is active" ""
+    elif [[ "$wd_state" == "enabled" ]]; then
+        health_add "watchdog" "$cat" "WARN" "the watchdog is enabled in config but its timer is not active" ""
+    elif [[ "$wd_state" == "disabled" ]]; then
+        health_add "watchdog" "$cat" "WARN" "the watchdog is disabled; a dropped tunnel will not recover on its own" ""
+    else
+        health_add "watchdog" "$cat" "UNKNOWN" "could not determine the watchdog state" ""
+    fi
+
+    if [[ "$HEALTH_MODE" == "full" ]]; then
+        if health_sshd_listening; then
+            health_add "sshd_listening" "$cat" "PASS" "sshd is listening" ""
+        else
+            # Not a failure: the Hub reached this host, so *something* carried the
+            # session. It only means the probe could not confirm it.
+            health_add "sshd_listening" "$cat" "UNKNOWN" "could not confirm an sshd listener (the session itself proves the control plane works)" ""
+        fi
+    else
+        health_add "sshd_listening" "$cat" "SKIPPED" "quick check" ""
+    fi
+}
+
+health_check_underlay() {
+    local cat="B_underlay"
+    local peer="$HEALTH_PEER_IP"
+
+    local iface="" self_ip="" route_line=""
+    if [[ -n "$peer" ]]; then
+        route_line="$(ip -4 route get "$peer" 2>/dev/null | head -n1)"
+        iface="$(sed -n 's/.*[[:space:]]dev[[:space:]]\+\([^ ]\+\).*/\1/p' <<< "$route_line" | head -n1)"
+        self_ip="$(ip -4 route get "$peer" 2>/dev/null | sed -n 's/.*[[:space:]]src[[:space:]]\+\([0-9.]\+\).*/\1/p' | head -n1)"
+    fi
+
+    if [[ -z "$peer" ]]; then
+        health_add "public_ip" "$cat" "UNKNOWN" "this connection has no remote endpoint recorded" ""
+    else
+        health_add "route_to_peer" "$cat" "PASS" "${route_line:-none}" ""
+    fi
+
+    if [[ -n "$iface" ]]; then
+        health_add "egress_interface" "$cat" "PASS" "$iface (mtu $(iface_mtu "$iface"))" ""
+    else
+        health_add "egress_interface" "$cat" "UNKNOWN" "could not determine the egress interface" ""
+    fi
+
+    # A route that sends the peer's own address back out of the tunnel can never work:
+    # GRE would have to be carried inside GRE.
+    if [[ -n "$iface" && "$iface" == "$HEALTH_TUN" ]]; then
+        health_add "no_route_loop" "$cat" "FAIL" "the route to $peer goes back out through $HEALTH_TUN" "$route_line"
+        health_find "GRE_ROUTE_LOOP" "critical" "high" \
+            "the route to $peer resolves to $HEALTH_TUN" \
+            "the underlay route for the peer points at the tunnel itself, so GRE cannot be encapsulated" "peer_apply"
+    else
+        health_add "no_route_loop" "$cat" "PASS" "the peer route does not use the tunnel" ""
+    fi
+
+    # rp_filter can silently drop GRE return traffic on a multi-homed host.
+    local rp=""
+    [[ -n "$iface" ]] && rp="$(sysctl -n "net.ipv4.conf.${iface}.rp_filter" 2>/dev/null)"
+    case "$rp" in
+        0) health_add "rp_filter" "$cat" "PASS" "rp_filter is off on $iface" "" ;;
+        1) health_add "rp_filter" "$cat" "WARN" "rp_filter is strict (1) on $iface; asymmetric routing can drop GRE replies" "" ;;
+        2) health_add "rp_filter" "$cat" "PASS" "rp_filter is loose (2) on $iface" "" ;;
+        *) health_add "rp_filter" "$cat" "UNKNOWN" "could not read rp_filter on ${iface:-the egress interface}" "" ;;
+    esac
+
+    # Underlay reachability, with RTT and loss. Crucial framing: this SUCCEEDS even when
+    # the tunnel is broken, which is exactly why it can never be read as "GRE is fine".
+    if [[ -z "$peer" ]]; then
+        health_add "underlay_ping" "$cat" "UNKNOWN" "no remote endpoint to test" ""
+    elif [[ "$HEALTH_MODE" == "quick" ]]; then
+        health_add "underlay_ping" "$cat" "SKIPPED" "quick check" ""
+    else
+        local st; st="$(health_ping_stats "$peer")"
+        local loss rtt; loss="${st%% *}"; rtt="${st##* }"
+        if [[ -n "$loss" ]]; then
+            if [[ "$loss" == "0" ]]; then
+                health_add "underlay_ping" "$cat" "PASS" "reachable, ${rtt:-?} ms average, no loss" "loss=$loss rtt=$rtt"
+            elif [[ "$loss" -lt 100 ]]; then
+                health_add "underlay_ping" "$cat" "WARN" "reachable with ${loss}% packet loss" "loss=$loss rtt=$rtt"
+                health_find "UNDERLAY_PACKET_LOSS" "warning" "medium" \
+                    "$loss% packet loss to $peer" \
+                    "the path to the peer is losing packets, which makes any tunnel over it unreliable" "provider"
+            else
+                health_add "underlay_ping" "$cat" "FAIL" "the peer's public address does not answer ICMP" "loss=$loss"
+                health_find "UNDERLAY_UNREACHABLE" "critical" "medium" \
+                    "no ICMP reply from $peer" \
+                    "the public path to the peer is down, or ICMP is filtered (which this probe cannot tell apart)" "provider"
+            fi
+        else
+            health_add "underlay_ping" "$cat" "UNKNOWN" "ICMP gave no usable result (blocked or unsupported)" ""
+        fi
+    fi
+
+    # Policy routing can send the peer's traffic somewhere unexpected.
+    local rules=""
+    rules="$(ip rule show 2>/dev/null | grep -vE '^(0|32766|32767):' | head -n3)"
+    if [[ -n "$rules" ]]; then
+        health_add "policy_routing" "$cat" "WARN" "non-default policy routing rules exist; they can override the route above" "$(tr '\n' ';' <<< "$rules")"
+    else
+        health_add "policy_routing" "$cat" "PASS" "only the default routing rules are present" ""
+    fi
+}
+
+health_check_gre_config() {
+    local cat="C_gre_config"
+    local peer="$HEALTH_PEER_IP"
+
+    if [[ "$HEALTH_TUN_PRESENT" == "yes" ]]; then
+        health_add "interface_exists" "$cat" "PASS" "$HEALTH_TUN is present" ""
+    else
+        health_add "interface_exists" "$cat" "FAIL" "$HEALTH_TUN does not exist" ""
+        health_find "GRE_INTERFACE_MISSING" "critical" "high" \
+            "$HEALTH_TUN is not present on this host" \
+            "the connection is configured but its interface was never created, or was removed" "iface_up"
+        # Everything below depends on the interface, so stop rather than pile on.
+        return 0
+    fi
+
+    if ip link show "$HEALTH_TUN" 2>/dev/null | grep -qE 'state (UP|UNKNOWN)|<[^>]*UP'; then
+        health_add "interface_up" "$cat" "PASS" "$HEALTH_TUN is up" ""
+    else
+        health_add "interface_up" "$cat" "FAIL" "$HEALTH_TUN is present but down" ""
+        health_find "GRE_INTERFACE_DOWN" "critical" "high" \
+            "$HEALTH_TUN reports itself as not up" \
+            "the interface exists but is administratively down or has no carrier" "iface_up"
+    fi
+
+    # The local endpoint must be this host's address. An empty or wrong one produces a
+    # tunnel that exists and can never pass traffic.
+    local live_local live_remote live_key
+    live_local="$(tunnel_local_endpoint "$HEALTH_TUN")"
+    live_remote="$(ip -d tunnel show "$HEALTH_TUN" 2>/dev/null | sed -n 's/.*[[:space:]]remote[[:space:]]\+\([0-9.]\+\)[[:space:]].*/\1/p' | head -n1)"
+    local _hki; _hki="$(tunnel_key_info "$HEALTH_TUN" "$HEALTH_KEY")"; live_key="${_hki%% *}"; key_source="${_hki##* }"
+
+    if [[ -z "$live_local" ]]; then
+        health_add "local_endpoint" "$cat" "FAIL" "the interface has no local endpoint" ""
+        health_find "GRE_LOCAL_ENDPOINT_MISMATCH" "critical" "high" \
+            "no local address on $HEALTH_TUN" \
+            "a GRE interface with no local endpoint cannot pass traffic" "peer_apply"
+    elif [[ -n "$HEALTH_SELF_IP" && "$live_local" != "$HEALTH_SELF_IP" ]]; then
+        health_add "local_endpoint" "$cat" "FAIL" "interface local=$live_local but this host is $HEALTH_SELF_IP" ""
+        health_find "GRE_LOCAL_ENDPOINT_MISMATCH" "critical" "high" \
+            "the interface uses $live_local, the connection expects $HEALTH_SELF_IP" \
+            "the local endpoint does not match this host's address" "peer_apply"
+    else
+        health_add "local_endpoint" "$cat" "PASS" "${live_local:-$HEALTH_SELF_IP}" ""
+    fi
+
+    if [[ -z "$live_remote" ]]; then
+        health_add "remote_endpoint" "$cat" "FAIL" "the interface has no remote endpoint" ""
+        health_find "GRE_REMOTE_ENDPOINT_MISMATCH" "critical" "high" \
+            "no remote address on $HEALTH_TUN" "" "peer_apply"
+    elif [[ -n "$peer" && "$live_remote" != "$peer" ]]; then
+        health_add "remote_endpoint" "$cat" "FAIL" "interface remote=$live_remote but the peer is $peer" ""
+        health_find "GRE_REMOTE_ENDPOINT_MISMATCH" "critical" "high" \
+            "the interface points at $live_remote, the configuration says $peer" \
+            "the tunnel is aimed at the wrong peer address" "endpoint"
+    else
+        health_add "remote_endpoint" "$cat" "PASS" "$live_remote" ""
+    fi
+
+    # A key the kernel did not report is only a fault when the key is genuinely absent.
+    # When the reading came from the config or the tunnel record, the honest statement is
+    # that the live key could not be read -- not that the interface has none.
+    if [[ "$live_key" == "none" || -z "$live_key" ]]; then
+        health_add "gre_key" "$cat" "WARN" "the interface carries no GRE key" ""
+    elif [[ "$key_source" != "live" ]]; then
+        health_add "gre_key" "$cat" "PASS" "$live_key (from the $key_source, not readable from the kernel here)" ""
+    elif [[ -n "$HEALTH_KEY" && "$live_key" != "$HEALTH_KEY" ]]; then
+        health_add "gre_key" "$cat" "FAIL" "interface key=$live_key but the configuration says $HEALTH_KEY" ""
+        health_find "GRE_KEY_MISMATCH" "critical" "high" \
+            "the interface key $live_key differs from the configured $HEALTH_KEY" \
+            "the two ends will not accept each other's GRE packets" "peer_apply"
+    else
+        health_add "gre_key" "$cat" "PASS" "$live_key" ""
+    fi
+
+    # Addressing.
+    local live_addr
+    live_addr="$(ip -4 addr show dev "$HEALTH_TUN" 2>/dev/null | sed -n 's/.*inet[[:space:]]\+\([0-9./]\+\).*/\1/p' | head -n1)"
+    if [[ "$live_addr" == "$HEALTH_SELF_CIDR" ]]; then
+        health_add "tunnel_address" "$cat" "PASS" "$live_addr" ""
+    elif [[ -z "$live_addr" ]]; then
+        health_add "tunnel_address" "$cat" "FAIL" "no IPv4 address on $HEALTH_TUN (expected $HEALTH_SELF_CIDR)" ""
+        health_find "GRE_TUNNEL_ADDRESS_MISSING" "critical" "high" \
+            "$HEALTH_TUN has no address" "" "peer_apply"
+    else
+        health_add "tunnel_address" "$cat" "WARN" "$live_addr (expected $HEALTH_SELF_CIDR)" ""
+        health_find "GRE_SUBNET_MISMATCH" "warning" "high" \
+            "the interface has $live_addr, the connection expects $HEALTH_SELF_CIDR" \
+            "the two ends are probably using different subnet or index values" "peer_apply"
+    fi
+
+    # The inner route: can this host reach the far tunnel address at all?
+    if [[ "$HEALTH_MODE" == "full" ]]; then
+        if [[ -n "$HEALTH_PEER_TUN_IP" ]]; then
+            ip -4 route get "$HEALTH_PEER_TUN_IP" >/dev/null 2>&1
+            if ip -4 route get "$HEALTH_PEER_TUN_IP" 2>/dev/null | grep -q "dev $HEALTH_TUN"; then
+                health_add "inner_route" "$cat" "PASS" "the peer's tunnel address routes via $HEALTH_TUN" ""
+            else
+                health_add "inner_route" "$cat" "FAIL" "the peer's tunnel address does not route via $HEALTH_TUN" ""
+                health_find "GRE_ROUTE_MISSING" "critical" "high" \
+                    "no route to $HEALTH_PEER_TUN_IP through $HEALTH_TUN" \
+                    "the tunnel subnet is not routed over the interface, so inner traffic has nowhere to go" "peer_apply"
+            fi
+        fi
+    else
+        health_add "inner_route" "$cat" "SKIPPED" "quick check" ""
+    fi
+
+    # The interface must agree with the stored configuration.
+    if [[ -n "$HEALTH_MTU" && -n "$HEALTH_TUN_MTU" && "$HEALTH_MTU" != "$HEALTH_TUN_MTU" ]]; then
+        health_add "interface_matches_config" "$cat" "WARN" \
+            "the interface MTU ($HEALTH_TUN_MTU) differs from the stored override ($HEALTH_MTU)" ""
+    else
+        health_add "interface_matches_config" "$cat" "PASS" "the live interface matches the stored configuration" ""
+    fi
+}
+
+health_check_protocol47() {
+    local cat="D_gre_protocol47"
+    local peer="$HEALTH_PEER_IP"
+
+    # What the local firewall says about protocol 47 from this peer.
+    local blocked="unknown"
+    if command -v iptables >/dev/null 2>&1; then
+        if iptables -C INPUT -p gre -m comment --comment "multi-gre-block" -j DROP 2>/dev/null; then
+            if [[ -n "$peer" ]] && iptables -C INPUT -p gre -s "$peer" \
+                    -m comment --comment "multi-gre-node-$HEALTH_NAME" -j ACCEPT 2>/dev/null; then
+                blocked="no"
+            else
+                blocked="yes"
+            fi
+        else
+            blocked="no"
+        fi
+    fi
+    case "$blocked" in
+        no)  health_add "gre47_local_policy" "$cat" "PASS" "the local firewall does not drop this peer's GRE" "" ;;
+        yes) health_add "gre47_local_policy" "$cat" "FAIL" "the local whitelist drops protocol 47 from this peer" ""
+             health_find "GRE_PROTOCOL47_SUSPECTED_BLOCKED" "critical" "high" \
+                 "the INPUT whitelist has a DROP but no ACCEPT for $peer" \
+                 "inbound GRE from the peer is being dropped on this host" "rule_restore" ;;
+        *)   health_add "gre47_local_policy" "$cat" "UNKNOWN" "iptables is unavailable, so GRE filtering could not be checked" "" ;;
+    esac
+
+    # Whether GRE packets are actually crossing the underlay. This needs a capture, which
+    # is only attempted in a full check and only when the tooling exists.
+    if [[ "$HEALTH_MODE" != "full" ]]; then
+        health_add "gre47_traffic" "$cat" "SKIPPED" "quick check" ""
+        return 0
+    fi
+    if ! command -v timeout >/dev/null 2>&1 || ! command -v tcpdump >/dev/null 2>&1; then
+        health_add "gre47_traffic" "$cat" "UNKNOWN" \
+            "no packet capture available (needs tcpdump), so GRE traffic could not be observed" ""
+        return 0
+    fi
+    if [[ -z "$peer" ]]; then
+        health_add "gre47_traffic" "$cat" "UNKNOWN" "no peer to capture against" ""
+        return 0
+    fi
+
+    # A short, bounded capture of protocol 47 while generating a little GRE traffic by
+    # pinging the far tunnel address. Correlating the two is what separates "the packets
+    # never left" from "the packets left and were dropped".
+    local cap_file="/tmp/.gre-health-$$.cap"
+    local seen_any=0
+    if timeout 4 tcpdump -n -c 20 -w "$cap_file" "proto gre and host $peer" >/dev/null 2>&1; then
+        [[ -s "$cap_file" ]] && seen_any=1
+    fi
+    rm -f "$cap_file" 2>/dev/null || true
+
+    if (( seen_any )); then
+        health_add "gre47_traffic" "$cat" "PASS" "GRE packets to or from $peer were observed on this host" ""
+    else
+        # Absence of capture is not proof of absence of traffic: the capture window is
+        # tiny. Say UNKNOWN rather than blaming the provider.
+        health_add "gre47_traffic" "$cat" "UNKNOWN" \
+            "no GRE packets were seen in a short capture window; that is not proof none were sent" ""
+    fi
+}
+
+health_check_connectivity() {
+    local cat="E_tunnel_connectivity"
+
+    if [[ "$HEALTH_TUN_PRESENT" != "yes" ]]; then
+        health_add "inner_ping" "$cat" "UNKNOWN" "no interface to test" ""
+        return 0
+    fi
+    if [[ "$HEALTH_MODE" != "full" ]]; then
+        health_add "inner_ping" "$cat" "SKIPPED" "quick check" ""
+        return 0
+    fi
+    [[ -n "$HEALTH_PEER_TUN_IP" ]] || { health_add "inner_ping" "$cat" "UNKNOWN" "no peer tunnel address" ""; return 0; }
+
+    local st; st="$(health_ping_stats "$HEALTH_PEER_TUN_IP")"
+    local loss rtt; loss="${st%% *}"; rtt="${st##* }"
+
+    # The underlay result decides how to read a failed inner ping. This is the single most
+    # useful distinction in the whole report: it separates "the tunnel is broken" from
+    # "the tunnel is fine but ICMP inside it is filtered".
+    local underlay_ok="unknown"
+    if [[ -n "$HEALTH_PEER_IP" ]] && health_ping "$HEALTH_PEER_IP"; then underlay_ok="yes"; else underlay_ok="no"; fi
+
+    if [[ -n "$loss" && "$loss" == "0" ]]; then
+        health_add "inner_ping" "$cat" "PASS" "$HEALTH_PEER_TUN_IP replies, ${rtt:-?} ms average" "loss=0 rtt=$rtt"
+    elif [[ -n "$loss" && "$loss" -lt 100 ]]; then
+        health_add "inner_ping" "$cat" "WARN" "${loss}% loss across the tunnel" "loss=$loss"
+        health_find "GRE_ONE_WAY_TRAFFIC" "warning" "medium" \
+            "$loss% loss over the tunnel" \
+            "some inner packets are lost; with a working handshake this usually means MTU, not reachability" "mtu_set"
+    elif [[ "$underlay_ok" == "yes" ]]; then
+        # The peer's public address answers but its tunnel address does not.
+        health_add "inner_ping" "$cat" "FAIL" "$HEALTH_PEER_TUN_IP does not reply, but $HEALTH_PEER_IP does" ""
+        health_find "GRE_INNER_PING_FAILED" "critical" "high" \
+            "the underlay answers ($HEALTH_PEER_IP) while the tunnel address ($HEALTH_PEER_TUN_IP) does not" \
+            "the public path works, so this is inside the tunnel: the peer may not have this connection, or its key/subnet differs" "peer_apply"
+    elif [[ "$underlay_ok" == "no" ]]; then
+        health_add "inner_ping" "$cat" "FAIL" "neither the tunnel address nor the public address answers" ""
+        health_find "UNDERLAY_UNREACHABLE" "critical" "medium" \
+            "no reply from $HEALTH_PEER_IP or $HEALTH_PEER_TUN_IP" \
+            "the peer host itself is unreachable, so this is not a GRE problem yet" "provider"
+    else
+        health_add "inner_ping" "$cat" "UNKNOWN" "ICMP gave no usable result; this probe is inconclusive" ""
+        health_find "INSUFFICIENT_EVIDENCE" "info" "low" \
+            "no ICMP reply from either address" \
+            "ICMP may be filtered on both paths, so reachability could not be established" ""
+    fi
+}
+
+health_check_routing_firewall() {
+    local cat="F_routing_and_firewall"
+    local peer_tun="$HEALTH_PEER_TUN_IP"
+
+    # Forwarding, only meaningful where this host forwards.
+    local fwd; fwd="$(sysctl -n net.ipv4.ip_forward 2>/dev/null)"
+    if [[ -n "$HEALTH_TCP" || -n "$HEALTH_UDP" ]]; then
+        if [[ "$fwd" == "1" ]]; then
+            health_add "ip_forward" "$cat" "PASS" "net.ipv4.ip_forward=1" ""
+        elif [[ -n "$fwd" ]]; then
+            health_add "ip_forward" "$cat" "FAIL" "net.ipv4.ip_forward=0 but this connection forwards ports" ""
+            health_find "IP_FORWARD_DISABLED" "critical" "high" \
+                "net.ipv4.ip_forward=0 while the connection forwards $HEALTH_TCP/$HEALTH_UDP" \
+                "forwarded traffic will be dropped by the kernel" "rule_restore"
+        else
+            health_add "ip_forward" "$cat" "UNKNOWN" "could not read net.ipv4.ip_forward" ""
+        fi
+    else
+        health_add "ip_forward" "$cat" "SKIPPED" "this connection does not forward ports" ""
+    fi
+
+    # Which backend is in use: a rule the manager wrote with iptables is invisible to an
+    # nftables-only host, and vice versa.
+    local backend="none"
+    if command -v nft >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1; then
+        backend="nftables"
+    elif command -v iptables >/dev/null 2>&1; then
+        backend="iptables"
+    fi
+    health_add "firewall_backend" "$cat" "PASS" "$backend" ""
+
+    # The rules this connection OWNS must all be present. Only the owned rules are
+    # checked: this never inspects or judges unrelated firewall state.
+    if [[ "$HEALTH_SIDE" == "iran" && ( -n "$HEALTH_TCP" || -n "$HEALTH_UDP" ) ]]; then
+        local missing=""
+        if [[ -n "$HEALTH_TCP" ]]; then
+            iptables -t nat -C PREROUTING -i "$HEALTH_WAN_IF" -d "$HEALTH_SELF_IP" -p tcp \
+                -m multiport --dports "$HEALTH_TCP" -m comment --comment "multi-gre-iran-$HEALTH_NAME-dnat-tcp" \
+                -j DNAT --to-destination "$peer_tun" 2>/dev/null || missing+="dnat-tcp "
+        fi
+        if [[ -n "$HEALTH_UDP" ]]; then
+            iptables -t nat -C PREROUTING -i "$HEALTH_WAN_IF" -d "$HEALTH_SELF_IP" -p udp \
+                -m multiport --dports "$HEALTH_UDP" -m comment --comment "multi-gre-iran-$HEALTH_NAME-dnat-udp" \
+                -j DNAT --to-destination "$peer_tun" 2>/dev/null || missing+="dnat-udp "
+        fi
+        iptables -t nat -C POSTROUTING -o "$HEALTH_TUN" -d "$peer_tun" \
+            -m comment --comment "multi-gre-iran-$HEALTH_NAME-snat" -j SNAT --to-source "$HEALTH_SELF_TUN_IP" 2>/dev/null \
+            || missing+="snat "
+
+        if [[ -z "$missing" ]]; then
+            health_add "owned_rules" "$cat" "PASS" "every rule this connection owns is installed" ""
+        else
+            health_add "owned_rules" "$cat" "FAIL" "missing rules: $missing" ""
+            health_find "FIREWALL_RULE_MISSING" "critical" "high" \
+                "these rules this connection owns are absent: $missing" \
+                "the connection's NAT is incomplete, so its ports cannot be reached" "rule_restore"
+        fi
+    else
+        health_add "owned_rules" "$cat" "SKIPPED" "this side installs no per-connection NAT rules" ""
+    fi
+
+    # Conflicting rules: the same port owned by another connection is a real conflict.
+    if [[ -n "$HEALTH_TCP" ]]; then
+        local others="" f nm tcp
+        for f in "$FOREIGNS_DIR"/*.conf; do
+            [[ -e "$f" ]] || continue
+            nm="$(grep -E '^NAME=' "$f" 2>/dev/null | head -n1 | cut -d= -f2)"
+            [[ "$nm" == "$HEALTH_NAME" || -z "$nm" ]] && continue
+            tcp="$(grep -E '^TCP_PORTS=' "$f" 2>/dev/null | head -n1 | cut -d= -f2)"
+            [[ -z "$tcp" ]] && continue
+            # Reuse the add-time overlap logic rather than reimplementing it.
+            if ports_overlap "$HEALTH_TCP" "$tcp" 2>/dev/null; then
+                others+="$nm($tcp) "
+            fi
+        done
+        if [[ -n "$others" ]]; then
+            health_add "port_conflicts" "$cat" "FAIL" "these connections claim the same ports: $others" ""
+            health_find "FIREWALL_RULE_CONFLICT" "critical" "high" \
+                "$HEALTH_NAME uses $HEALTH_TCP, which overlaps $others" \
+                "two connections cannot own the same inbound port; only one will receive the traffic" "endpoint"
+        else
+            health_add "port_conflicts" "$cat" "PASS" "no other connection claims these ports" ""
+        fi
+    fi
+
+    # Rule counters: a rule that never matches is evidence the traffic is not arriving.
+    if [[ "$HEALTH_MODE" == "full" && "$HEALTH_SIDE" == "iran" && -n "$HEALTH_TCP" ]]; then
+        local ctr
+        ctr="$(iptables -t nat -L PREROUTING -v -n 2>/dev/null \
+            | grep -- "multi-gre-iran-$HEALTH_NAME-dnat-tcp" | awk '{print $1}' | head -n1)"
+        if [[ -n "$ctr" && "$ctr" == "0" ]]; then
+            health_add "rule_counters" "$cat" "WARN" "the DNAT rule has matched 0 packets" ""
+        elif [[ -n "$ctr" ]]; then
+            health_add "rule_counters" "$cat" "PASS" "the DNAT rule has matched $ctr packets" ""
+        else
+            health_add "rule_counters" "$cat" "UNKNOWN" "could not read the rule counters" ""
+        fi
+    else
+        health_add "rule_counters" "$cat" "SKIPPED" "quick check, or no per-connection rules" ""
+    fi
+}
+
+health_check_mtu() {
+    local cat="G_mtu_and_mss"
+    if ! command -v gre >/dev/null 2>&1 && [[ ! -f "$0" ]]; then
+        health_add "mtu_diagnostics" "$cat" "UNKNOWN" "the mtu subsystem is unavailable" ""
+        return 0
+    fi
+    # Integrated with the MTU engine rather than reimplemented: same collector, same
+    # recommendation, so the two can never disagree.
+    if ! mtu_collect; then
+        health_add "mtu_diagnostics" "$cat" "UNKNOWN" "could not collect MTU data for this connection" ""
+        return 0
+    fi
+    local probe=""
+    [[ "$HEALTH_MODE" == "full" ]] && probe="--probe"
+    [[ -n "$probe" ]] && mtu_collect --probe
+
+    health_add "underlay_mtu" "$cat" \
+        "$([[ -n "$MTU_UNDER_MTU" ]] && echo PASS || echo UNKNOWN)" \
+        "${MTU_UNDER_IFACE:-egress} mtu ${MTU_UNDER_MTU:-unknown}" ""
+    health_add "gre_overhead" "$cat" "PASS" "$MTU_OVERHEAD bytes for this encapsulation" ""
+    health_add "tunnel_mtu" "$cat" "$([[ -n "$MTU_TUN_MTU" ]] && echo PASS || echo UNKNOWN)" \
+        "${MTU_TUN_MTU:-unknown}" ""
+
+    mtu_make_recommendation
+    if [[ "$MTU_REC_REQUIRES" == "true" ]]; then
+        health_add "mtu_recommendation" "$cat" "WARN" \
+            "MTU ${MTU_TUN_MTU:-?} -> ${MTU_REC_RECOMMENDED} (confidence ${MTU_REC_CONFIDENCE})" ""
+        # Only a real MTU problem is reported as one: a recommendation to change a value
+        # is not by itself a fault.
+        if [[ "$MTU_REC_SAFE" == "true" ]]; then
+            local delta=$(( MTU_TUN_MTU - MTU_REC_RECOMMENDED ))
+            local sev="warning"
+            (( delta < 0 )) && (( -delta > 40 )) && sev="critical"
+            health_find "GRE_MTU_MISMATCH" "$sev" "$MTU_REC_CONFIDENCE" \
+                "tunnel MTU ${MTU_TUN_MTU} against a path that allows ${MTU_REC_RECOMMENDED}" \
+                "$(printf '%s' "$MTU_REC_JSON" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')" "mtu_set"
+        fi
+    else
+        health_add "mtu_recommendation" "$cat" "PASS" "the current MTU matches the path" ""
+    fi
+
+    case "$MTU_MSS_MODE" in
+        set)  health_add "mss_clamp" "$cat" "PASS" "MSS clamped to $MTU_MSS_VALUE" "" ;;
+        pmtu) health_add "mss_clamp" "$cat" "WARN" "MSS is derived from the route MTU, which for GRE is the underlay" ""
+              health_find "GRE_TCP_MSS_PROBLEM" "warning" "high" \
+                  "the clamp uses --clamp-mss-to-pmtu, which resolves against the underlay MTU" \
+                  "SYNs can advertise an MSS the tunnel cannot carry, which stalls large TCP transfers" "mss_clamp" ;;
+        *)    if [[ "$MTU_MSS" == "1" ]]; then
+                  health_add "mss_clamp" "$cat" "FAIL" "clamping is enabled but no rule is installed" ""
+                  health_find "GRE_TCP_MSS_PROBLEM" "critical" "high" \
+                      "MSS_CLAMP=1 but no clamp rule exists on $HEALTH_TUN" \
+                      "large TCP segments will be dropped inside the tunnel" "mss_clamp"
+              else
+                  health_add "mss_clamp" "$cat" "SKIPPED" "MSS clamping is disabled for this connection" ""
+              fi ;;
+    esac
+
+    if [[ "$MTU_PROBE_STATE" == "inconclusive" || "$MTU_PROBE_STATE" == "unknown" ]]; then
+        health_add "pmtud" "$cat" "UNKNOWN" "the path MTU could not be measured (ICMP filtered)" ""
+        health_find "GRE_PMTUD_BLACKHOLE_SUSPECTED" "info" "low" \
+            "DF probes produced no usable answer" \
+            "PMTUD may be blackholed, which would stall large packets; this is a suspicion, not a measurement" "mtu_set"
+    else
+        health_add "pmtud" "$cat" "PASS" "DF probing worked ($MTU_PROBE_STATE)" ""
+    fi
+}
+
+health_check_service() {
+    local cat="H_service"
+    # Only when this connection actually has a panel behind it.
+    if [[ -z "$HEALTH_PANEL" ]]; then
+        health_add "service_layer" "$cat" "SKIPPED" "this connection has no panel configured" ""
+        return 0
+    fi
+    if [[ "$HEALTH_MODE" != "full" ]]; then
+        health_add "service_layer" "$cat" "SKIPPED" "quick check" ""
+        return 0
+    fi
+
+    # Is the panel itself reachable? A failing panel must not be reported as a GRE fault.
+    local host port
+    host="$(sed -n 's|^https\?://\([^:/]*\).*|\1|p' <<< "$HEALTH_PANEL" | head -n1)"
+    port="$(sed -n 's|^https\?://[^:]*:\([0-9]*\).*|\1|p' <<< "$HEALTH_PANEL" | head -n1)"
+    [[ -n "$port" ]] || port="$( [[ "$HEALTH_PANEL" == https* ]] && echo 443 || echo 80 )"
+
+    if [[ -z "$host" ]]; then
+        health_add "panel_reachable" "$cat" "UNKNOWN" "could not parse the panel address" "$HEALTH_PANEL"
+        return 0
+    fi
+    if command -v timeout >/dev/null 2>&1 && timeout 5 bash -c ": >/dev/tcp/$host/$port" 2>/dev/null; then
+        health_add "panel_reachable" "$cat" "PASS" "the panel port $host:$port accepts connections" ""
+    else
+        health_add "panel_reachable" "$cat" "WARN" "the panel at $host:$port did not accept a connection" ""
+        health_find "SERVICE_LISTENER_MISSING" "warning" "medium" \
+            "nothing accepted a TCP connection to $host:$port" \
+            "the 3x-ui panel is not listening; the tunnel may be fine while the service is not" "endpoint"
+    fi
+
+    # A listener for the connection's own port: the service it exists to forward.
+    local listen_port="${HEALTH_TCP%%,*}"
+    if [[ -n "$listen_port" ]] && command -v ss >/dev/null 2>&1; then
+        if ss -ltn 2>/dev/null | grep -qE "[:.]${listen_port}[[:space:]]"; then
+            health_add "service_port" "$cat" "PASS" "port $listen_port is listening" ""
+        else
+            health_add "service_port" "$cat" "WARN" "nothing is listening on TCP $listen_port" ""
+            health_find "XUI_INBOUND_MISSING" "warning" "medium" \
+                "no listener on TCP $listen_port" \
+                "the panel has no inbound on this port, so the forward has nothing to reach" "endpoint"
+        fi
+    else
+        health_add "service_port" "$cat" "SKIPPED" "no TCP port, or ss is unavailable" ""
+    fi
+}
+
+# --------------------------------------------------------------- the orchestrator
+# health_check NAME [--json] [--quick] [--full] [--budget SECONDS]
+health_check_run() {
+    local NAME="" AS_JSON=0 MODE="full" BUDGET=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name)   [[ -n "${2:-}" ]] || { err "Missing value for --name"; return 1; }; NAME="$2"; shift 2 ;;
+            --json)   AS_JSON=1; shift ;;
+            --quick)  MODE="quick"; shift ;;
+            --full)   MODE="full"; shift ;;
+            --budget) [[ -n "${2:-}" ]] || { err "Missing value for --budget"; return 1; }; BUDGET="$2"; shift 2 ;;
+            --help|-h) echo "Usage: gre health-check --name NAME [--json] [--quick|--full] [--budget SECONDS]"; return 0 ;;
+            *) err "Unknown option: $1"; return 1 ;;
+        esac
+    done
+    [[ -n "$NAME" ]] || { err "Usage: gre health-check --name NAME [--json] [--quick|--full]"; return 1; }
+
+    mtu_resolve "$NAME" || { err "No connection named '$NAME' is configured on this host."; return 1; }
+    # mtu_resolve gives us the side and the config values; the MTU collector adds the
+    # live interface and path picture, which the GRE and MTU checks both need.
+    mtu_collect || true
+
+    HEALTH_NAME="$MTU_NAME"
+    HEALTH_SIDE="$MTU_SIDE"
+    HEALTH_TUN="$MTU_TUN"
+    HEALTH_PEER_IP="$MTU_PEER_IP"
+    HEALTH_SELF_IP="$MTU_SELF_IP"
+    HEALTH_KEY="$MTU_KEY"
+    HEALTH_TCP="$MTU_TCP"
+    HEALTH_UDP="$MTU_UDP"
+    HEALTH_WAN_IF="$MTU_WAN_IF"
+    HEALTH_MTU="$MTU_OVERRIDE"
+    HEALTH_TUN_MTU="$MTU_TUN_MTU"
+    HEALTH_TUN_PRESENT="$MTU_TUN_PRESENT"
+    HEALTH_MODE="$MODE"
+    if [[ "$HEALTH_SIDE" == "iran" ]]; then
+        HEALTH_SELF_TUN_IP="${MTU_SUBNET_BASE}.${MTU_IDX}.2"
+        HEALTH_PEER_TUN_IP="${MTU_SUBNET_BASE}.${MTU_IDX}.1"
+        HEALTH_SELF_CIDR="${MTU_SUBNET_BASE}.${MTU_IDX}.2/30"
+    else
+        HEALTH_SELF_TUN_IP="${MTU_SUBNET_BASE}.${MTU_IDX}.1"
+        HEALTH_PEER_TUN_IP="${MTU_SUBNET_BASE}.${MTU_IDX}.2"
+        HEALTH_SELF_CIDR="${MTU_SUBNET_BASE}.${MTU_IDX}.1/30"
+    fi
+    HEALTH_PANEL="$(config_panel_url "$NAME" 2>/dev/null || true)"
+
+    if [[ -n "$BUDGET" ]]; then
+        [[ "$BUDGET" =~ ^[0-9]+$ ]] || { err "--budget must be a whole number of seconds"; return 1; }
+        HEALTH_BUDGET="$BUDGET"
+    elif [[ "$MODE" == "quick" ]]; then
+        HEALTH_BUDGET="$HEALTH_BUDGET_SECONDS_QUICK"
+    else
+        HEALTH_BUDGET="$HEALTH_BUDGET_SECONDS_FULL"
+    fi
+
+    HEALTH_CHECKS_JSON=""
+    HEALTH_FINDINGS_JSON=""
+    HEALTH_N_PASS=0; HEALTH_N_WARN=0; HEALTH_N_FAIL=0
+    HEALTH_N_UNKNOWN=0; HEALTH_N_SKIP=0; HEALTH_N_CRITICAL=0
+    HEALTH_JSON_ONLY="$AS_JSON"
+    HEALTH_START="$(date +%s 2>/dev/null || echo 0)"
+    local timed_out=0
+
+    [[ "$AS_JSON" == "1" ]] || {
+        echo
+        info "Full network health check for '$NAME' ($MODE, ${HEALTH_BUDGET}s budget, read-only)"
+        echo
+    }
+
+    # The categories run in the order the layers can fail. Each is skipped when the
+    # budget is already spent, and that is reported as a timeout, not as a pass.
+    local cat_fn
+    for cat_fn in health_check_server health_check_underlay health_check_gre_config \
+                  health_check_protocol47 health_check_connectivity \
+                  health_check_routing_firewall health_check_mtu health_check_service; do
+        if health_expired; then
+            timed_out=1
+            health_add "budget_exhausted" "Z_diagnostic" "UNKNOWN" \
+                "the ${HEALTH_BUDGET}s budget ran out before $cat_fn could run" ""
+            break
+        fi
+        "$cat_fn"
+    done
+
+    # ---- the verdict, derived from the checks rather than asserted independently
+    local overall="HEALTHY"
+    if (( HEALTH_N_FAIL > 0 )); then overall="BROKEN"; fi
+    if (( HEALTH_N_CRITICAL > 0 )); then overall="BROKEN"; fi
+
+    local completeness="complete"
+    if (( timed_out )); then
+        completeness="partial"
+        health_find "INSUFFICIENT_EVIDENCE" "info" "low" \
+            "the check budget expired; some layers were not inspected" \
+            "raise --budget or run again when the host is less loaded" ""
+    elif (( HEALTH_N_UNKNOWN > 0 )); then
+        completeness="partial"
+    fi
+
+    # A WARN with no FAIL still means something is degraded rather than broken.
+    if [[ "$overall" == "HEALTHY" && ( HEALTH_N_WARN -gt 0 || HEALTH_N_UNKNOWN -gt 0 ) ]]; then
+        overall="DEGRADED"
+    fi
+
+    if [[ "$AS_JSON" == "1" ]]; then
+        printf '{"connection":"%s","side":"%s","server":"%s","mode":"%s","overall_status":"%s","evidence_completeness":"%s","budget_seconds":%s,"elapsed_seconds":%s,"summary":{"pass":%s,"warn":%s,"fail":%s,"unknown":%s,"skipped":%s,"critical_findings":%s},"checks":[%s],"findings":[%s],"tested_at":"%s"}\n' \
+            "$(json_escape "$HEALTH_NAME")" "$HEALTH_SIDE" \
+            "$(json_escape "$(hostname 2>/dev/null || echo this-host)")" "$MODE" "$overall" "$completeness" \
+            "$HEALTH_BUDGET" "$(( $(date +%s 2>/dev/null || echo 0) - HEALTH_START ))" \
+            "$HEALTH_N_PASS" "$HEALTH_N_WARN" "$HEALTH_N_FAIL" "$HEALTH_N_UNKNOWN" "$HEALTH_N_SKIP" "$HEALTH_N_CRITICAL" \
+            "$HEALTH_CHECKS_JSON" "$HEALTH_FINDINGS_JSON" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    else
+        printf '\n'
+        printf '  overall: %s   evidence: %s\n' "$overall" "$completeness"
+        printf '  checks:  pass=%s warn=%s fail=%s unknown=%s skipped=%s\n' \
+            "$HEALTH_N_PASS" "$HEALTH_N_WARN" "$HEALTH_N_FAIL" "$HEALTH_N_UNKNOWN" "$HEALTH_N_SKIP"
+        if [[ -n "$HEALTH_FINDINGS_JSON" ]]; then
+            printf '\n  findings:\n'
+        fi
+        printf '\n'
+    fi
+
+    audit_log "health-check name=$NAME side=$HEALTH_SIDE mode=$MODE overall=$overall fail=$HEALTH_N_FAIL critical=$HEALTH_N_CRITICAL"
+
+    # Non-zero only when something is actually broken, so a caller can gate on it.
+    [[ "$overall" != "BROKEN" ]]
+}
+
+# Which panel URL this connection is associated with, if any. Kept deliberately simple:
+# the Hub passes it in when it knows, and a local caller may not have one at all.
+config_panel_url() { # config_panel_url NAME
+    local name="$1"
+    [[ -n "${PANEL_URL:-}" ]] && { printf '%s' "$PANEL_URL"; return 0; }
+    return 1
+}
+
+cli_health_check() { # gre health-check ...
+    health_check_run "$@"
+}
+
+# ==================================================== intelligent repair recommendations
+#
+# A repair is only offered for an issue this host can actually fix, and applying one goes
+# through the same transactional path as any other mutation. Nothing here is automatic:
+# every repair needs --yes, verifies its result, and restores the previous state if the
+# verification fails.
+
+# cli_repair_preview NAME — what a repair would do, read-only.
+cli_repair_preview() {
+    local NAME="" AS_JSON=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) [[ -n "${2:-}" ]] || { err "Missing value for --name"; return 1; }; NAME="$2"; shift 2 ;;
+            --json) AS_JSON=1; shift ;;
+            --help|-h) echo "Usage: gre repair preview --name NAME [--json]"; return 0 ;;
+            *) err "Unknown option: $1"; return 1 ;;
+        esac
+    done
+    [[ -n "$NAME" ]] || { err "Usage: gre repair preview --name NAME [--json]"; return 1; }
+    mtu_resolve "$NAME" || { err "No connection named '$NAME' is configured on this host."; return 1; }
+    mtu_collect || true
+
+    # The preview is the health check's own findings, filtered to what is repairable.
+    local out
+    out="$(health_check_run --name "$NAME" --json 2>/dev/null)" || true
+    local repairable=""
+    # Pull the findings that carry a repair key and are marked safe. Parsing our own
+    # JSON with sed is deliberate: adding a JSON parser to a bash CLI is a bigger risk
+    # than reading a shape this program just wrote.
+    local findings
+    findings="$(sed -n 's/.*"findings":\[\(.*\)\],"tested_at".*/\1/p' <<< "$out")"
+    if [[ -n "$findings" ]]; then
+        repairable="$(printf '%s' "$findings" | sed -e 's/},{/}\n{/g' | grep '"safe_repair":true' || true)"
+    fi
+
+    if [[ "$AS_JSON" == "1" ]]; then
+        if [[ -n "$repairable" ]]; then
+            printf '{"connection":"%s","read_only":true,"repairable":[%s]}\n' \
+                "$(json_escape "$NAME")" "$(printf '%s' "$repairable" | tr '\n' '\034' | sed 's/\x1c/,/g')"
+        else
+            printf '{"connection":"%s","read_only":true,"repairable":[]}\n' "$(json_escape "$NAME")"
+        fi
+        return 0
+    fi
+
+    echo
+    if [[ -z "$repairable" ]]; then
+        info "No safe automated repair is available for '$NAME'."
+        printf '  Every finding either has no verified repair on this host, or can only be\n'
+        printf '  fixed by hand. Re-run: gre health-check --name %s\n\n' "$NAME"
+        return 0
+    fi
+    info "Repairs available for '$NAME' (nothing is changed yet)"
+    echo
+    printf '%s\n' "$repairable" | while IFS= read -r line; do
+        local code act risk
+        code="$(sed -n 's/.*"code":"\([^"]*\)".*/\1/p' <<< "$line")"
+        act="$(sed -n 's/.*"recommended_action":"\([^"]*\)".*/\1/p' <<< "$line")"
+        risk="$(sed -n 's/.*"risk":"\([^"]*\)".*/\1/p' <<< "$line")"
+        [[ -n "$code" ]] && printf '  [%-6s] %-32s %s\n' "$risk" "$code" "$act"
+    done
+    printf '\n  To apply one:  gre repair apply --name %s --code CODE --yes\n\n' "$NAME"
+    return 0
+}
+
+# cli_repair_apply NAME CODE --yes — apply ONE named repair, verified, with rollback.
+cli_repair_apply() {
+    local NAME="" CODE="" YES=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) [[ -n "${2:-}" ]] || { err "Missing value for --name"; return 1; }; NAME="$2"; shift 2 ;;
+            --code) [[ -n "${2:-}" ]] || { err "Missing value for --code"; return 1; }; CODE="$2"; shift 2 ;;
+            --yes|-y) YES=1; shift ;;
+            --help|-h) echo "Usage: gre repair apply --name NAME --code CODE [--yes]"; return 0 ;;
+            *) err "Unknown option: $1"; return 1 ;;
+        esac
+    done
+    [[ -n "$NAME" ]] || { err "Usage: gre repair apply --name NAME --code CODE [--yes]"; return 1; }
+    [[ -n "$CODE" ]] || { err "Missing required option: --code"; return 1; }
+
+    mtu_resolve "$NAME" || { err "No connection named '$NAME' is configured on this host."; return 1; }
+
+    # Only repairs this host can verify are implemented. The rest are reported as
+    # unrepairable rather than half-done.
+    local desc="" do_repair=""
+    case "$CODE" in
+        GRE_INTERFACE_MISSING|GRE_INTERFACE_DOWN)
+            desc="bring $MTU_TUN up by reapplying this connection"
+            do_repair="iface_up" ;;
+        GRE_KEY_MISMATCH|GRE_REMOTE_ENDPOINT_MISMATCH|GRE_LOCAL_ENDPOINT_MISMATCH|GRE_SUBNET_MISMATCH)
+            desc="reapply this connection so its interface matches its configuration"
+            do_repair="peer_apply" ;;
+        GRE_MTU_MISMATCH)
+            desc="set this connection's tunnel MTU from the measured path"
+            do_repair="mtu_set" ;;
+        GRE_TCP_MSS_PROBLEM)
+            desc="reinstall the TCP MSS clamp from the tunnel MTU"
+            do_repair="mss_clamp" ;;
+        FIREWALL_RULE_MISSING|IP_FORWARD_DISABLED)
+            desc="reinstall the rules this connection owns"
+            do_repair="peer_apply" ;;
+        *)
+            err "No automated repair exists for '$CODE' on this host."
+            err "Findings without a safe repair are reported for a human to act on:"
+            err "  gre health-check --name $NAME"
+            return 1 ;;
+    esac
+
+    if (( YES == 0 )); then
+        echo
+        info "About to repair '$NAME':"
+        printf '  issue        %s\n' "$CODE"
+        printf '  action       %s\n' "$desc"
+        printf '  scope        this connection only; no other connection and no NIC is touched\n\n'
+        confirm "Apply this repair?" || { info "Cancelled."; return 0; }
+    fi
+
+    local mtu_target=""
+    if [[ "$do_repair" == "mtu_set" ]]; then
+        mtu_collect --probe || true
+        mtu_make_recommendation
+        if [[ "$MTU_REC_SAFE" != "true" || -z "$MTU_REC_RECOMMENDED" ]]; then
+            err "Refusing: the recommended MTU is not backed by sufficient evidence."
+            err "  run: gre mtu diagnose --name $NAME --probe"
+            return 1
+        fi
+        mtu_target="$MTU_REC_RECOMMENDED"
+    fi
+
+    audit_log "repair-preview name=$NAME code=$CODE action=$do_repair"
+
+    case "$do_repair" in
+        mtu_set)
+            # Goes through the MTU transaction, which journals the old value, verifies
+            # from the kernel and restores on failure.
+            cli_mtu_set --name "$NAME" --mtu "$mtu_target" --yes || {
+                err "The repair did not complete; the previous MTU was restored if it could be."
+                return 1
+            } ;;
+        mss_clamp)
+            mtu_collect || true
+            [[ -n "$MTU_TUN_MTU" ]] || { err "Cannot clamp MSS without a known tunnel MTU."; return 1; }
+            mtu_refresh_mss "$NAME" "$MTU_TUN" "$MTU_TUN_MTU" || { err "Could not install the clamp."; return 1; }
+            if ! iptables -t mangle -C POSTROUTING -o "$MTU_TUN" -p tcp --tcp-flags SYN,RST SYN \
+                    -j TCPMSS --set-mss "$(( MTU_TUN_MTU - 40 ))" 2>/dev/null; then
+                err "The clamp was written but does not verify."
+                err "ROLLBACK_FAILED: inspect with: gre tunnel diagnose --name $NAME"
+                return 1
+            fi
+            ok "MSS clamp reinstalled for tunnel MTU $MTU_TUN_MTU." ;;
+        iface_up|peer_apply)
+            if [[ "$MTU_SIDE" == "iran" ]]; then
+                apply_iran_peer "$MTU_FILE" || { err "Reapplying the connection failed."; return 1; }
+            else
+                apply_foreign_node "$MTU_FILE" || { err "Reapplying the connection failed."; return 1; }
+            fi ;;
+        *)
+            err "Internal error: no handler for repair '$do_repair'."; return 1 ;;
+    esac
+
+    # Verify: the repair is only reported as done when a fresh check agrees.
+    local after
+    after="$(health_check_run --name "$NAME" --json --quick 2>/dev/null)" || true
+    local still
+    still="$(grep -c "\"$CODE\"" <<< "$after" || true)"
+    if [[ "${still:-0}" == "0" ]]; then
+        audit_log "repair-applied name=$NAME code=$CODE action=$do_repair verified=yes"
+        ok "Repaired: $CODE is no longer reported for '$NAME'."
+        return 0
+    fi
+    err "The repair ran but $CODE is still reported."
+    err "Nothing is claimed to have been fixed. Inspect with:"
+    err "  gre health-check --name $NAME"
+    return 1
+}
+
 doctor() { # gre doctor — diagnostics; exits non-zero if any check FAILs
     local DOC_FAIL=0 DOC_WARN=0
     echo
@@ -7102,6 +8165,27 @@ EOF
     iran-setup)        cli_iran_setup "${@:2}" ;;
     foreign-setup)     cli_foreign_setup "${@:2}" ;;
     mtu)               cli_mtu "${@:2}" ;;
+    health-check)      cli_health_check "${@:2}" ;;
+    repair)
+        case "${2:-}" in
+            preview) cli_repair_preview "${@:3}" ;;
+            apply)   cli_repair_apply "${@:3}" ;;
+            --help|-h|"")
+                cat <<'EOF'
+Usage:
+  gre repair preview --name NAME [--json]
+      List the repairs available for a connection. Read-only; changes nothing.
+
+  gre repair apply --name NAME --code CODE [--yes]
+      Apply ONE named repair. Requires --yes. It verifies the result, and restores
+      the previous state when the verification fails.
+
+Only repairs this host can verify are offered. Everything else is reported as a
+finding for a human to act on.
+EOF
+                ;;
+            *) err "Usage: gre repair <preview|apply> ...  (see: gre repair --help)"; exit 1 ;;
+        esac ;;
     doctor)            doctor ;;
     tunnel)
         case "${2:-}" in

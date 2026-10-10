@@ -163,10 +163,34 @@ case "$obj" in
     if [[ "$sub" == "show" && "${3:-}" == "default" ]]; then
       echo "default via 192.0.2.1 dev eth0"
     elif [[ "$sub" == "get" ]]; then
-      echo "${3:-1.1.1.1} via 192.0.2.1 dev eth0 src 198.51.100.20"
+      # Model the connected route the kernel installs when an address is added to an
+      # interface. Without this, a query for a tunnel address fell through to the default
+      # route and reported "the tunnel subnet is not routed over the interface", which is
+      # never true on Linux once the address exists.
+      _dst="${3:-1.1.1.1}"
+      _hit=""
+      while read -r _a _d; do
+        [[ -n "$_a" && -n "$_d" ]] || continue
+        _net="${_a%%/*}"
+        case "$_a" in
+          */30) _pfx="${_net%.*}"; [[ "$_dst" == "$_pfx."* ]] && _hit="$_d" ;;
+          */24) _pfx="${_net%.*}"; [[ "$_dst" == "$_pfx."* ]] && _hit="$_d" ;;
+          */32) [[ "$_dst" == "$_net" ]] && _hit="$_d" ;;
+        esac
+        [[ -n "$_hit" ]] && break
+      done < "$ST/addrs"
+      if [[ -n "$_hit" ]]; then
+        echo "$_dst dev $_hit src ${_dst}"
+      else
+        echo "$_dst via 192.0.2.1 dev eth0 src 198.51.100.20"
+      fi
     elif [[ "$sub" == "show" ]]; then
       echo "default via 192.0.2.1 dev eth0"
       echo "192.0.2.0/24 dev eth0 proto kernel scope link src 192.0.2.10"
+      while read -r _a _d; do
+        [[ -n "$_a" && -n "$_d" ]] || continue
+        echo "$_a dev $_d proto kernel scope link"
+      done < "$ST/addrs"
     fi
     exit 0 ;;
 esac
