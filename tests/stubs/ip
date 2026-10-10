@@ -73,7 +73,19 @@ case "$obj" in
           exit 0
         fi
         if [[ -n "${3:-}" ]]; then
-          if [[ "$3" == "lo" || "$3" == "eth0" || -f "$ST/tunnels/$3" ]]; then
+          if [[ "$3" == "lo" ]]; then
+            echo "lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 state UNKNOWN mode DEFAULT"
+            exit 0
+          fi
+          if [[ "$3" == "eth0" ]]; then
+            # The underlay NIC is a real 1500-byte Ethernet, not the tunnel's MTU.
+            # Reporting the tunnel value here would make every MTU computation agree
+            # with whatever the tunnel already had.
+            m="$(cat "$ST/mtu.eth0" 2>/dev/null || echo 1500)"
+            echo "eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu $m state UP mode DEFAULT"
+            exit 0
+          fi
+          if [[ -f "$ST/tunnels/$3" ]]; then
             # Report an MTU so code that reads the live interface MTU has something to
             # read. `link set dev X mtu N` records it, which is what makes an MTU change
             # observable to the next diagnostic (and lets a rollback be verified).
@@ -83,6 +95,19 @@ case "$obj" in
           fi
           exit 1
         fi
+        # No device named: list every interface, as real ip(8) does. Reporting nothing
+        # would make anything that enumerates interfaces silently see an empty host.
+        echo "lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 state UNKNOWN mode DEFAULT"
+        _e="$(cat "$ST/mtu.eth0" 2>/dev/null || echo 1500)"
+        echo "eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu $_e state UP mode DEFAULT"
+        _i=2
+        for t in "$ST/tunnels"/*; do
+          [[ -e "$t" ]] || continue
+          _n="$(basename "$t")"
+          _m="$(cat "$ST/mtu.$_n" 2>/dev/null || echo 1476)"
+          echo "$_i: $_n: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu $_m state UNKNOWN mode DEFAULT"
+          _i=$(( _i + 1 ))
+        done
         exit 0 ;;
       set)
         # `ip link set dev IFACE mtu VALUE [up]` — the manager uses this for an

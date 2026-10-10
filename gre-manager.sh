@@ -1566,25 +1566,162 @@ valid_mtu() { # valid_mtu VALUE — a GRE interface MTU is 576..9000
     (( $1 >= MTU_MIN_INNER && $1 <= MTU_MAX_GRE ))
 }
 
-# The encapsulation overhead of THIS tunnel, derived from its actual configuration.
+# =========================================================== PMTU probing engine
 #
-# Never a fixed constant: IPv4 GRE with a key carries 4 bytes more than one without,
-# and a tunnel that also carries an outer IPv6 header is 20 bytes larger again. Getting
-# this wrong by 4 bytes is exactly what produces an intermittent blackhole, so the
-# value is computed from the tunnel's own flags and endpoints.
+# A bounded DF-probe search for the largest packet that survives a path.
 #
-# Returns the total bytes the encapsulation adds: outer IP + GRE header (+key) + inner IP.
-gre_overhead_bytes() { # gre_overhead_bytes KEY OUTER_IPV [INNER_IPV]
-    local key="${1:-0}" outer_ipv="${2:-4}" inner_ipv="${3:-4}"
+# Design constraints, because this runs against live production links:
+#   - BOUNDED. At most MTU_PROBE_BUDGET probes per direction, then it stops and reports
+#     UNKNOWN rather than continuing to hunt.
+#   - BINARY SEARCH over a coarse grid, not a walk over every size.
+#   - SLOW. A short delay between probes, so the search cannot look like a flood.
+#   - It distinguishes three outcomes, which is the whole point:
+#       ok        the packet made it (or a reply came back)
+#       frag_needed   an ICMP "fragmentation needed" came back -> a hard ceiling
+#       timeout   no reply. NOT proof of an MTU problem: ICMP may be filtered, the path
+#                 may be down, or the far end may simply not answer. Reported as
+#                 inconclusive.
+#
+# It never reports a number it did not measure, and never treats a failed probe as
+# evidence of a smaller path unless a frag-needed message actually arrived.
+
+MTU_PROBE_BUDGET=12
+MTU_PROBE_DELAY_MS=150
+MTU_PROBE_TIMEOUT=3
+# 20 (IPv4) + 8 (ICMP echo) = 28 bytes of header inside the -s payload size.
+MTU_PROBE_HDR=28
+
+mtu_probe_sleep() {
+    [[ "$MTU_PROBE_DELAY_MS" -gt 0 ]] || return 0
+    sleep "$(printf '%s.%03d' "$(( MTU_PROBE_DELAY_MS / 1000 ))" "$(( MTU_PROBE_DELAY_MS % 1000 ))")" 2>/dev/null || true
+}
+
+# Probe one size over a path.
+#
+# `via_iface` is the interface to force as the egress. Passing the tunnel name makes this
+# an INNER path measurement; leaving it empty measures the underlay through whatever the
+# kernel picks. The interface is a real name, never the literal word "tun".
+#
+# Echoes: ok | frag_needed | timeout | nosupport | noip
+mtu_probe_size() { # mtu_probe_size DEST SIZE [EGRESS_IFACE]
+    local dest="$1" size="$2" iface="${3:-}"
+    local out="" rc=0
+    [[ -n "$dest" && -n "$size" ]] || { printf 'noip'; return; }
+    command -v ping >/dev/null 2>&1 || { printf 'nosupport'; return; }
+
+    if [[ -n "$iface" ]]; then
+        out="$(ping -M "do" -s "$size" -c 1 -W "$MTU_PROBE_TIMEOUT" -I "$iface" "$dest" 2>&1)" || rc=$?
+    else
+        out="$(ping -M "do" -s "$size" -c 1 -W "$MTU_PROBE_TIMEOUT" "$dest" 2>&1)" || rc=$?
+    fi
+
+    # A frag-needed message is the only thing that proves a real MTU ceiling.
+    if grep -qiE 'frag needed|fragmentation needed|message too long|packet too big' <<< "$out"; then
+        printf 'frag_needed'; return
+    fi
+    # Blocked or unsupported DF: this host cannot do the measurement at all.
+    if grep -qiE 'not permitted|operation not permitted|invalid option|bad option|unknown option' <<< "$out"; then
+        printf 'nosupport'; return
+    fi
+    (( rc == 0 )) && { printf 'ok'; return; }
+    printf 'timeout'
+}
+
+# Find the largest size that survives, by bounded binary search.
+#
+# Echoes a compact result: "<state> <max_ok> <frag_at> <probes>"
+#   state    ok | frag_needed | inconclusive | unsupported | unknown
+#   max_ok   largest confirmed-ok size, or "-"
+#   frag_at  smallest size that reported frag-needed (as an MTU), or "-"
+mtu_probe_path() { # mtu_probe_path DEST [EGRESS_IFACE] [START_HIGH]
+    local dest="$1" iface="${2:-}" high="${3:-1472}"
+    local lo=$(( MTU_MIN_INNER - MTU_PROBE_HDR )) hi="$high"
+    local probes=0 max_ok="" frag_at="" last=""
+
+    # Seed: does the smallest legal size work at all? If not, this is not an MTU
+    # question — the path is down or ICMP is filtered — so say so instead of narrowing.
+    mtu_probe_sleep
+    last="$(mtu_probe_size "$dest" "$lo" "$iface")"; probes=$(( probes + 1 ))
+    case "$last" in
+        nosupport) printf 'unsupported - - %d' "$probes"; return ;;
+        noip)      printf 'unknown - - %d' "$probes"; return ;;
+        timeout)   printf 'inconclusive - - %d' "$probes"; return ;;
+        frag_needed)
+            # Even the floor is too big, which means the path MTU is below the legal
+            # IPv4 minimum. Report the ceiling; the recommender refuses to go lower.
+            printf 'frag_needed - %d %d' "$(( lo + MTU_PROBE_HDR ))" "$probes"; return ;;
+    esac
+    max_ok="$lo"
+
+    # Is the top of the range already fine? Then there is nothing to search.
+    if (( probes < MTU_PROBE_BUDGET )); then
+        mtu_probe_sleep
+        last="$(mtu_probe_size "$dest" "$hi" "$iface")"; probes=$(( probes + 1 ))
+        case "$last" in
+            ok)          printf 'ok %d - %d' "$hi" "$probes"; return ;;
+            frag_needed) frag_at="$(( hi + MTU_PROBE_HDR ))" ;;
+            timeout)     printf 'inconclusive - - %d' "$probes"; return ;;
+            nosupport)   printf 'unsupported - - %d' "$probes"; return ;;
+        esac
+    fi
+
+    # Binary search between a known-good lo and a known-bad hi.
+    local mid
+    while (( probes < MTU_PROBE_BUDGET && hi - lo > 1 )); do
+        mid=$(( (lo + hi) / 2 ))
+        mtu_probe_sleep
+        last="$(mtu_probe_size "$dest" "$mid" "$iface")"; probes=$(( probes + 1 ))
+        case "$last" in
+            ok)          max_ok="$mid"; lo="$mid" ;;
+            frag_needed) frag_at="$(( mid + MTU_PROBE_HDR ))" ; hi="$mid" ;;
+            timeout)
+                # A timeout narrows nothing: it is not evidence of a smaller MTU. Stop
+                # rather than guessing, and report what was actually confirmed.
+                printf 'inconclusive %d %s %d' "$max_ok" "${frag_at:--}" "$probes"; return ;;
+            nosupport)   printf 'unsupported %s %s %d' "$max_ok" "${frag_at:--}" "$probes"; return ;;
+        esac
+    done
+
+    if [[ -n "$frag_at" ]]; then
+        printf 'frag_needed %s %s %d' "$max_ok" "$frag_at" "$probes"
+    else
+        printf 'ok %s %s %d' "$max_ok" "${frag_at:--}" "$probes"
+    fi
+}
+
+# Does this path answer ICMP at all? Distinguishes "ICMP is filtered" from "the path is
+# broken", which is what stops a filtered probe being reported as a tunnel failure.
+mtu_icmp_available() { # mtu_icmp_available DEST
+    command -v ping >/dev/null 2>&1 || return 1
+    ping -c 2 -W 2 "$1" >/dev/null 2>&1
+}
+
+# The observed route MTU metric for a destination, if one is set.
+mtu_diag_route() { # mtu_diag_route DEST
+    [[ -n "${1:-}" ]] || { printf ''; return; }
+    ip -4 route get "$1" 2>/dev/null | head -n1
+}
+
+# The encapsulation overhead THIS tunnel adds to a packet it carries.
+#
+# This is what has to be subtracted from the underlay's capacity to get the largest inner
+# packet that still fits, so it is the OUTER IPv4 header plus the GRE header (plus the
+# 4-byte key field when a key is configured) — NOT the inner IP header. The inner header
+# is part of the packet the tunnel is carrying, so counting it would understate the
+# tunnel MTU by 20 bytes and silently cost 20 bytes of payload on every connection.
+#
+# Never a fixed constant: a keyed tunnel carries 4 bytes more than an unkeyed one, and an
+# outer IPv6 header is 20 bytes larger again. Getting this wrong by 4 bytes is exactly
+# what produces an intermittent blackhole, so it is computed from the tunnel's own flags.
+gre_overhead_bytes() { # gre_overhead_bytes KEY OUTER_IPV
+    local key="${1:-0}" outer_ipv="${2:-4}"
     local bytes=0
     # Outer IP header
     if [[ "$outer_ipv" == "6" ]]; then bytes=$(( bytes + 40 )); else bytes=$(( bytes + 20 )); fi
-    # GRE header: 4 bytes base, plus an optional 4-byte key/sequence field when a key
-    # is configured. The manager always passes a key, so this is normally +4.
+    # GRE header: 4 bytes base, plus the optional 4-byte key/sequence field. The manager
+    # always passes a key, so this is normally +4.
     bytes=$(( bytes + 4 ))
     [[ -n "$key" && "$key" != "0" ]] && bytes=$(( bytes + 4 ))
-    # Inner IP header
-    if [[ "$inner_ipv" == "6" ]]; then bytes=$(( bytes + 40 )); else bytes=$(( bytes + 20 )); fi
     printf '%s' "$bytes"
 }
 
@@ -5483,6 +5620,835 @@ cli_tunnel_rules() { # gre tunnel rules [--json]
     fi
 }
 
+# ==================================================== per-connection MTU diagnosis
+#
+# Gathers what the recommender needs for ONE connection on THIS host and exposes it as
+# JSON, so the Hub can merge both sides. It sets MTU_* scalars rather than echoing
+# because the same data feeds both the recommendation and the human report.
+
+# Resolve a connection name to the side and files this host holds for it.
+mtu_resolve() { # mtu_resolve NAME
+    local name="$1"
+    local peerf="$FOREIGNS_DIR/$name.conf" nodef="$NODES_DIR/$name.conf"
+    MTU_SIDE=""; MTU_NAME=""; MTU_PEER_IP=""; MTU_SELF_IP=""
+    MTU_SUBNET_BASE="$DEFAULT_SUBNET_BASE"; MTU_IDX=""; MTU_KEY=""; MTU_TUN=""
+    MTU_MSS="0"; MTU_OVERRIDE=""
+
+    if [[ -f "$peerf" ]]; then
+        MTU_SIDE="iran"
+        local NAME="" FOREIGN_IP="" IRAN_IP="" WAN_IF="" SUBNET_BASE="$DEFAULT_SUBNET_BASE" \
+              IDX="" KEY="" TUN="" TCP_PORTS="" UDP_PORTS="" MSS_CLAMP="0" MTU=""
+        load_peer_conf "$peerf" || return 1
+        MTU_NAME="$NAME"; MTU_PEER_IP="$FOREIGN_IP"; MTU_SELF_IP="$IRAN_IP"
+        MTU_SUBNET_BASE="$SUBNET_BASE"; MTU_IDX="$IDX"; MTU_KEY="$KEY"; MTU_TUN="$TUN"
+        MTU_MSS="$MSS_CLAMP"; MTU_OVERRIDE="$MTU"
+    elif [[ -f "$nodef" ]]; then
+        MTU_SIDE="foreign"
+        local N_NAME="" N_IRAN_IP="" N_BASE="$DEFAULT_SUBNET_BASE" N_IDX="" N_KEY="" N_TUN="" N_MTU=""
+        node_conf_read "$nodef" N_NAME N_IRAN_IP N_BASE N_IDX N_KEY N_TUN N_MTU
+        MTU_NAME="$N_NAME"; MTU_PEER_IP="$N_IRAN_IP"; MTU_SELF_IP="$(foreign_local_ip)"
+        MTU_SUBNET_BASE="$N_BASE"; MTU_IDX="$N_IDX"; MTU_KEY="$N_KEY"; MTU_TUN="$N_TUN"
+        MTU_OVERRIDE="$N_MTU"
+        # The FOREIGN side has no per-node NAT or MSS rules; a node config cannot
+        # express them, so the clamp is reported as unavailable rather than "off".
+        MTU_MSS=""
+    else
+        return 1
+    fi
+    [[ -n "$MTU_TUN" ]] || MTU_TUN="gre-$MTU_NAME"
+    return 0
+}
+
+# Collect the MTU picture. Read-only; sends packets only with --probe.
+mtu_collect() { # mtu_collect [--probe]
+    local do_probe="${1:-}"
+    local self_tun_ip
+    if [[ "$MTU_SIDE" == "iran" ]]; then
+        self_tun_ip="${MTU_SUBNET_BASE}.${MTU_IDX}.2"
+    else
+        self_tun_ip="${MTU_SUBNET_BASE}.${MTU_IDX}.1"
+    fi
+
+    local tun_present="no" tun_mtu="" iface_up="unknown"
+    if tun_exists "$MTU_TUN"; then
+        tun_present="yes"
+        tun_mtu="$(iface_mtu "$MTU_TUN")"
+        ip link show "$MTU_TUN" 2>/dev/null | grep -qE 'state (UP|UNKNOWN)|<[^>]*UP' && iface_up="yes"
+    fi
+
+    # The underlay, as the kernel would actually use it for this peer.
+    local under_iface="" under_mtu="" route_line="" route_mtu="" icmp_state="unknown"
+    route_line="$(mtu_diag_route "$MTU_PEER_IP")"
+    under_iface="$(sed -n 's/.*[[:space:]]dev[[:space:]]\+\([^ ]\+\).*/\1/p' <<< "$route_line" | head -n1)"
+    under_mtu="$(iface_mtu "$under_iface")"
+    route_mtu="$(route_mtu_for "$MTU_PEER_IP")"
+
+    # The overhead of THIS encapsulation, from its own flags rather than a constant.
+    local outer_ipv=4
+    [[ "$MTU_PEER_IP" == *:* ]] && outer_ipv=6
+    local overhead; overhead="$(gre_overhead_bytes "$MTU_KEY" "$outer_ipv")"
+
+    # Is ICMP usable here at all? A filtered path makes every probe inconclusive, and
+    # that must never be dressed up as a tunnel or MTU failure.
+    local icmp_ok="no"
+    if mtu_icmp_available "$MTU_PEER_IP"; then icmp_ok="yes"; icmp_state="seen"; fi
+
+    local probe_state="UNKNOWN" probe_max="-" probe_frag="-" probe_n="0"
+    if [[ "$do_probe" == "--probe" ]]; then
+        if [[ "$icmp_ok" == "yes" ]]; then
+            local res; res="$(mtu_probe_path "$MTU_PEER_IP" "" 1472)"
+            local -a parts=(); read -r -a parts <<< "$res"
+            probe_state="${parts[0]:-UNKNOWN}"; probe_max="${parts[1]:--}"
+            probe_frag="${parts[2]:--}"; probe_n="${parts[3]:-0}"
+        else
+            probe_state="unknown"
+        fi
+    fi
+
+    # The verified path capacity, in IP-packet terms: a measurement if there is one, else
+    # the egress interface MTU, and empty rather than invented when neither exists.
+    #
+    # This is the UNDERLAY capacity. The largest inner packet the tunnel can carry is
+    # this minus the encapsulation overhead, which is what the recommender computes.
+    local capacity=""
+    if [[ "$probe_max" != "-" && -n "$probe_max" ]]; then
+        capacity="$(( probe_max + MTU_PROBE_HDR ))"
+    elif [[ -n "$route_mtu" ]]; then
+        capacity="$route_mtu"
+    elif [[ -n "$under_mtu" ]]; then
+        capacity="$under_mtu"
+    fi
+
+    MTU_SELF_TUN_IP="$self_tun_ip"
+    MTU_TUN_PRESENT="$tun_present"; MTU_TUN_MTU="$tun_mtu"
+    MTU_UNDER_IFACE="$under_iface"; MTU_UNDER_MTU="$under_mtu"
+
+    MTU_OVERHEAD="$overhead"
+    MTU_PROBE_STATE="$probe_state"; MTU_PROBE_MAX="$probe_max"; MTU_PROBE_N="$probe_n"
+    MTU_CAPACITY="$capacity"
+
+    # The MSS clamp, as actually installed for this connection.
+    local mss_mode="absent" mss_value="" want_mss=""
+    if [[ "$tun_present" == "yes" && -n "$tun_mtu" ]]; then
+        want_mss=$(( tun_mtu - 40 ))
+        if iptables -t mangle -C POSTROUTING -o "$MTU_TUN" -p tcp --tcp-flags SYN,RST SYN \
+                -m comment --comment "multi-gre-iran-$MTU_NAME-mss" -j TCPMSS --set-mss "$want_mss" 2>/dev/null; then
+            mss_mode="set"; mss_value="$want_mss"
+        elif iptables -t mangle -C POSTROUTING -o "$MTU_TUN" -p tcp --tcp-flags SYN,RST SYN \
+                -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+            mss_mode="pmtu"
+        fi
+    fi
+    MTU_MSS_MODE="$mss_mode"; MTU_MSS_VALUE="$mss_value"
+
+    local checks="" n_pass=0 n_warn=0 n_fail=0 n_unknown=0
+    add_mtu_check() {
+        [[ -n "$checks" ]] && checks+=","
+        checks+="{\"id\":\"$(json_escape "$1")\",\"status\":\"$2\",\"detail\":\"$(json_escape "$3")\"}"
+    }
+    if [[ "$tun_present" == "yes" ]]; then
+        add_mtu_check "interface_exists" "PASS" "$MTU_TUN is present"; n_pass=$((n_pass+1))
+    else
+        add_mtu_check "interface_exists" "FAIL" "$MTU_TUN does not exist"; n_fail=$((n_fail+1))
+    fi
+    if [[ "$iface_up" == "yes" ]]; then add_mtu_check "interface_up" "PASS" "up"; n_pass=$((n_pass+1))
+    elif [[ "$iface_up" == "unknown" ]]; then add_mtu_check "interface_up" "UNKNOWN" "could not read the link state"; n_unknown=$((n_unknown+1))
+    else add_mtu_check "interface_up" "FAIL" "not up"; n_fail=$((n_fail+1)); fi
+
+    if [[ -z "$under_mtu" ]]; then
+        add_mtu_check "underlay_mtu" "UNKNOWN" "could not read the egress interface MTU"; n_unknown=$((n_unknown+1))
+    else
+        add_mtu_check "underlay_mtu" "PASS" "$under_iface mtu $under_mtu"; n_pass=$((n_pass+1))
+    fi
+
+    if [[ -z "$capacity" ]]; then
+        add_mtu_check "path_capacity" "UNKNOWN" "no measurement and no usable default"; n_unknown=$((n_unknown+1))
+    elif [[ "$probe_state" == "ok" || "$probe_state" == "frag_needed" ]]; then
+        add_mtu_check "path_capacity" "PASS" "measured $capacity"; n_pass=$((n_pass+1))
+    else
+        add_mtu_check "path_capacity" "WARN" "assuming $capacity from the interface MTU; not measured"; n_warn=$((n_warn+1))
+    fi
+
+    case "$probe_state" in
+        ok|frag_needed) add_mtu_check "icmp_df_probe" "PASS" "probed in $probe_n packets ($probe_state)"; n_pass=$((n_pass+1)) ;;
+        unsupported)    add_mtu_check "icmp_df_probe" "UNKNOWN" "this host cannot send DF probes"; n_unknown=$((n_unknown+1)) ;;
+        *)              add_mtu_check "icmp_df_probe" "UNKNOWN" "ICMP is filtered or unresponsive, so the path MTU could not be measured (that is not proof of an MTU problem)"; n_unknown=$((n_unknown+1)) ;;
+    esac
+
+    if [[ -n "$tun_mtu" && -n "$capacity" ]]; then
+        local want=$(( capacity - overhead ))
+        (( want < MTU_MIN_INNER )) && want="$MTU_MIN_INNER"
+        if (( tun_mtu > capacity )); then
+            add_mtu_check "gre_mtu_fits_path" "FAIL" "tunnel MTU $tun_mtu exceeds the path capacity $capacity"; n_fail=$((n_fail+1))
+        elif (( tun_mtu > want )); then
+            add_mtu_check "gre_mtu_fits_path" "WARN" "tunnel MTU $tun_mtu is larger than the path allows ($want)"; n_warn=$((n_warn+1))
+        else
+            add_mtu_check "gre_mtu_fits_path" "PASS" "tunnel MTU $tun_mtu fits (path allows $want)"; n_pass=$((n_pass+1))
+        fi
+    else
+        add_mtu_check "gre_mtu_fits_path" "UNKNOWN" "no tunnel MTU or no path capacity"; n_unknown=$((n_unknown+1))
+    fi
+
+    case "$mss_mode" in
+        set)  add_mtu_check "tcp_mss_clamp" "PASS" "MSS set to $mss_value"; n_pass=$((n_pass+1)) ;;
+        pmtu) add_mtu_check "tcp_mss_clamp" "WARN" "MSS is derived from the route MTU, which for a GRE egress is the underlay and can be too large"; n_warn=$((n_warn+1)) ;;
+        *)    if [[ "$MTU_MSS" == "1" ]]; then
+                  add_mtu_check "tcp_mss_clamp" "FAIL" "clamping is enabled for this connection but no rule is installed"; n_fail=$((n_fail+1))
+              elif [[ -z "$MTU_MSS" ]]; then
+                  add_mtu_check "tcp_mss_clamp" "SKIPPED" "not applicable on this side"; n_unknown=$((n_unknown+1))
+              else
+                  add_mtu_check "tcp_mss_clamp" "SKIPPED" "MSS clamping is disabled for this connection"; n_unknown=$((n_unknown+1))
+              fi ;;
+    esac
+
+    MTU_CHECKS_JSON="$checks"
+    MTU_N_PASS="$n_pass"; MTU_N_WARN="$n_warn"; MTU_N_FAIL="$n_fail"; MTU_N_UNKNOWN="$n_unknown"
+
+    MTU_JSON="$(printf '{"name":"%s","side":"%s","tunnel":"%s","generated_at":"%s",' \
+        "$(json_escape "$MTU_NAME")" "$MTU_SIDE" "$(json_escape "$MTU_TUN")" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")"
+    MTU_JSON+="$(printf '"underlay":{"iface":"%s","mtu":%s,"route":"%s","src":"%s","dst":"%s","route_mtu":%s,"icmp_frag_needed":"%s"},' \
+        "$(json_escape "$under_iface")" "${under_mtu:-null}" "$(json_escape "$route_line")" \
+        "$(json_escape "$MTU_SELF_IP")" "$(json_escape "$MTU_PEER_IP")" "${route_mtu:-null}" "$icmp_state")"
+    MTU_JSON+="$(printf '"gre":{"tun":"%s","encap":"gre","key":%s,"flags":[],"outer_ipv":%s,"local":"%s","remote":"%s","mtu":%s,"inner_cidr":"%s/30","overhead":%s},' \
+        "$(json_escape "$MTU_TUN")" "${MTU_KEY:-0}" "$outer_ipv" "$(json_escape "$MTU_SELF_IP")" \
+        "$(json_escape "$MTU_PEER_IP")" "${tun_mtu:-null}" "$self_tun_ip" "$overhead")"
+    MTU_JSON+="$(printf '"pmtu":{"inner_probe":{"state":"%s","max_ok":%s,"frag_needed_at":%s,"probes_sent":%s}},' \
+        "$probe_state" "$([[ "$probe_max" == "-" ]] && echo null || echo "$probe_max")" \
+        "$([[ "$probe_frag" == "-" ]] && echo null || echo "$probe_frag")" "$probe_n")"
+    MTU_JSON+="$(printf '"mss_clamp":{"enabled":%s,"mode":"%s","value":%s,"scoped_to_connection":true},' \
+        "$([[ "$MTU_MSS" == "1" ]] && echo true || echo false)" "$mss_mode" "${mss_value:-null}")"
+    MTU_JSON+="$(printf '"summary":{"pass":%s,"warn":%s,"fail":%s,"unknown":%s},' "$n_pass" "$n_warn" "$n_fail" "$n_unknown")"
+    MTU_JSON+="$(printf '"checks":[%s]}' "$checks")"
+    return 0
+}
+
+# Build a recommendation from the collected data. Read-only.
+mtu_make_recommendation() {
+    local capacity="$MTU_CAPACITY" overhead="$MTU_OVERHEAD" cur="$MTU_TUN_MTU"
+    local confidence="unknown" reason="" recommended="" margin=0 margin_reason="" safe="false"
+    local min_legal="$MTU_MIN_INNER"
+
+    # The inner protocol's own floor. A hard limit: no measurement can justify going
+    # below it, so a "smaller is safer" instinct is capped here.
+    case "${MTU_SELF_TUN_IP:-}" in *:*) min_legal="$MTU_MIN_INNER_V6" ;; esac
+
+    if [[ -z "$capacity" ]]; then
+        reason="No usable path measurement and no interface MTU to fall back on, so no recommendation can be made."
+    else
+        case "$MTU_PROBE_STATE" in
+            ok|frag_needed) confidence="high" ;;
+            inconclusive|unknown)
+                confidence="low"
+                reason="ICMP is filtered or unresponsive, so the path MTU could not be measured. The value below comes from the interface MTU and is a starting point, not a measurement." ;;
+            unsupported)
+                confidence="low"
+                reason="This host cannot send DF probes, so the value below comes from the interface MTU rather than a measurement." ;;
+            *) confidence="medium" ;;
+        esac
+        recommended=$(( capacity - overhead ))
+        if (( recommended < min_legal )); then
+            margin=$(( min_legal - recommended ))
+            recommended="$min_legal"
+            margin_reason="raised to the minimum legal MTU for the inner protocol"
+            confidence="low"
+        fi
+        if [[ -z "$reason" ]]; then
+            local keyed=""
+            [[ -n "${MTU_KEY:-}" && "${MTU_KEY:-0}" != "0" ]] && keyed="keyed "
+            reason="Path capacity $capacity minus $overhead bytes of ${keyed}GRE encapsulation"
+        fi
+    fi
+
+    local requires="false"
+    if [[ -n "$cur" && -n "$recommended" && "$cur" != "$recommended" ]]; then requires="true"; fi
+
+    # A recommendation is only safe to offer when it rests on real evidence AND there is
+    # an interface to change. Asking an operator to apply a guess is how an MTU change
+    # makes things worse.
+    if [[ "$confidence" != "unknown" && -n "$recommended" && "$MTU_TUN_PRESENT" == "yes" && -n "$cur" ]]; then
+        safe="true"
+    fi
+    if [[ "$MTU_TUN_PRESENT" != "yes" ]]; then
+        reason="${reason} The interface does not exist, so there is nothing to tune here."
+        safe="false"
+    fi
+
+    MTU_REC_RECOMMENDED="$recommended"; MTU_REC_CONFIDENCE="$confidence"
+    MTU_REC_SAFE="$safe"; MTU_REC_REQUIRES="$requires"
+
+    MTU_REC_JSON="$(printf '{"connection":"%s","side":"%s","underlay_mtu":%s,"encapsulation_overhead":%s,"current_gre_mtu":%s,"recommended_gre_mtu":%s,"confidence":"%s","requires_change":%s,"reason":"%s","safe_to_apply":%s,"safety_margin":%s,"margin_reason":"%s","min_legal_mtu":%s}' \
+        "$(json_escape "$MTU_NAME")" "$MTU_SIDE" "${capacity:-null}" "$overhead" "${cur:-null}" \
+        "${recommended:-null}" "$confidence" "$requires" "$(json_escape "$reason")" "$safe" \
+        "$margin" "$(json_escape "$margin_reason")" "$min_legal")"
+}
+
+mtu_print_side() {
+    printf '  side            %s (%s)\n' "$MTU_SIDE" "$MTU_TUN"
+    printf '  egress          %s mtu %s\n' "${MTU_UNDER_IFACE:--}" "${MTU_UNDER_MTU:--}"
+    printf '  route mtu       %s\n' "${MTU_ROUTE_MTU:-none}"
+    printf '  gre mtu         %s\n' "${MTU_TUN_MTU:-none}"
+    printf '  overhead        %s bytes\n' "$MTU_OVERHEAD"
+    printf '  path capacity   %s\n' "${MTU_CAPACITY:-unknown}"
+    printf '  df probe        %s (max payload %s, %s packets)\n' "$MTU_PROBE_STATE" "$MTU_PROBE_MAX" "$MTU_PROBE_N"
+    printf '  mss clamp       %s%s\n' "$MTU_MSS_MODE" "$([[ -n "$MTU_MSS_VALUE" ]] && printf ' %s' "$MTU_MSS_VALUE")"
+    printf '  checks          pass=%s warn=%s fail=%s unknown=%s\n' "$MTU_N_PASS" "$MTU_N_WARN" "$MTU_N_FAIL" "$MTU_N_UNKNOWN"
+}
+
+# --------------------------------------------------------------- CLI: gre mtu
+cli_mtu() { # gre mtu <list|diagnose|recommend|set|auto|restore|nic> ...
+    local sub="${1:-}"
+    shift || true
+    case "$sub" in
+        list)      cli_mtu_list "$@" ;;
+        diagnose)  cli_mtu_diagnose "$@" ;;
+        recommend) cli_mtu_recommend "$@" ;;
+        set)       cli_mtu_set "$@" ;;
+        auto)      cli_mtu_auto "$@" ;;
+        restore)   cli_mtu_restore "$@" ;;
+        nic)       cli_mtu_nic "$@" ;;
+        --help|-h|"")
+            cat <<'EOF'
+Usage:
+  gre mtu list [--json]
+      Every configured connection with its tunnel MTU and GRE overhead. Read-only.
+
+  gre mtu diagnose --name NAME [--json] [--probe]
+      Per-connection MTU diagnosis for THIS host: egress interface and MTU, route MTU
+      metric, the GRE overhead of this encapsulation, the tunnel MTU, the TCP MSS clamp
+      state, and (with --probe) a bounded DF path probe. Read-only either way; it never
+      changes an MTU.
+
+  gre mtu recommend --name NAME [--json]
+      A recommendation derived from the measurement, with an explicit confidence. It
+      reports UNKNOWN rather than inventing a value when ICMP is filtered. Read-only.
+
+  gre mtu auto --name NAME [--json]
+      The same recommendation, phrased as an apply-ready command. Applies nothing.
+
+  gre mtu set --name NAME --mtu VALUE [--yes]
+      Change ONLY this connection's tunnel MTU, in place, without recreating the
+      interface. Requires --yes, and verifies from the kernel afterwards.
+
+  gre mtu restore --name NAME [--yes]
+      Restore the MTU recorded before the last change on this host.
+
+  gre mtu nic list [--json]
+  gre mtu nic analyze --name NAME [--json]
+      Advanced: the physical/virtual NIC MTU. Read-only analysis only. Changing a WAN
+      NIC MTU can cut the connection you are managing, so this never applies one.
+
+No MTU command here changes a WAN interface. Nothing is applied without --yes.
+EOF
+            ;;
+        *) err "Usage: gre mtu <list|diagnose|recommend|set|auto|restore|nic> ...  (see: gre mtu --help)"; return 1 ;;
+    esac
+}
+
+# Every configured connection with its MTU picture. Read-only, no probes.
+cli_mtu_list() {
+    local AS_JSON=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) AS_JSON=1; shift ;;
+            --help|-h) echo "Usage: gre mtu list [--json]"; return 0 ;;
+            *) err "Unknown option: $1"; return 1 ;;
+        esac
+    done
+
+    local json_rows="" count=0
+    local -a names=()
+    for conf_file in "$FOREIGNS_DIR"/*.conf "$NODES_DIR"/*.conf; do
+        [[ -e "$conf_file" ]] || continue
+        local nm
+        nm="$(grep -E '^NAME=' "$conf_file" | head -n1 | cut -d= -f2)"
+        [[ -n "$nm" ]] || continue
+        names+=("$nm")
+    done
+
+    local nm
+    for nm in ${names[@]+"${names[@]}"}; do
+        mtu_resolve "$nm" || continue
+        mtu_collect || continue
+        count=$(( count + 1 ))
+        [[ -n "$json_rows" ]] && json_rows+=","
+        json_rows+="$(printf '{"name":"%s","side":"%s","tunnel":"%s","tunnel_mtu":%s,"override":%s,"egress_iface":"%s","egress_mtu":%s,"overhead":%s,"mss_mode":"%s"}' \
+            "$(json_escape "$MTU_NAME")" "$MTU_SIDE" "$(json_escape "$MTU_TUN")" \
+            "${MTU_TUN_MTU:-null}" "${MTU_OVERRIDE:-null}" "$(json_escape "$MTU_UNDER_IFACE")" \
+            "${MTU_UNDER_MTU:-null}" "$MTU_OVERHEAD" "$MTU_MSS_MODE")"
+    done
+
+    if [[ "$AS_JSON" == "1" ]]; then
+        printf '{"count":%s,"connections":[%s]}\n' "$count" "$json_rows"
+    else
+        if (( count == 0 )); then
+            info "No connections are configured on this host."
+            return 0
+        fi
+        printf '\n'
+        printf '%-14s %-8s %-14s %-8s %-9s %-9s %s\n' NAME SIDE TUNNEL GRE-MTU EGRESS EGR-MTU OVERHEAD
+        for nm in ${names[@]+"${names[@]}"}; do
+            mtu_resolve "$nm" || continue
+            mtu_collect || continue
+            printf '%-14s %-8s %-14s %-8s %-9s %-9s %s\n' \
+                "$MTU_NAME" "$MTU_SIDE" "$MTU_TUN" "${MTU_TUN_MTU:--}" \
+                "${MTU_UNDER_IFACE:--}" "${MTU_UNDER_MTU:--}" "$MTU_OVERHEAD"
+        done
+        printf '\n'
+    fi
+    return 0
+}
+
+cli_mtu_diagnose() {
+    local NAME="" AS_JSON=0 PROBE=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) [[ -n "${2:-}" ]] || { err "Missing value for --name"; return 1; }; NAME="$2"; shift 2 ;;
+            --json) AS_JSON=1; shift ;;
+            --probe) PROBE="--probe"; shift ;;
+            --help|-h) echo "Usage: gre mtu diagnose --name NAME [--json] [--probe]"; return 0 ;;
+            *) err "Unknown option: $1"; return 1 ;;
+        esac
+    done
+    [[ -n "$NAME" ]] || { err "Usage: gre mtu diagnose --name NAME [--json] [--probe]"; return 1; }
+
+    mtu_resolve "$NAME" || { err "No connection named '$NAME' is configured on this host."; return 1; }
+    mtu_collect "$PROBE" || { err "Could not collect MTU data for '$NAME'."; return 1; }
+    mtu_make_recommendation
+
+    if [[ "$AS_JSON" == "1" ]]; then
+        # The contract object plus the recommendation, in one document.
+        printf '%s' "${MTU_JSON%\}}"
+        printf ',"recommendation":%s}\n' "$MTU_REC_JSON"
+    else
+        echo
+        info "MTU diagnosis for '$NAME' (read-only)..."
+        echo
+        mtu_print_side
+        printf '\n  checks:\n'
+        # One check per line, pulled from the contract object rather than re-derived, so
+        # the human report and the JSON can never disagree.
+        printf '%s' "$MTU_CHECKS_JSON" | sed -e 's/},{/}\n{/g' -e 's/^\[//' -e 's/\]$//' > "$CONF_DIR/.mtu-checks.tmp"
+        while IFS= read -r _line; do
+            cid="$(sed -n 's/.*"id":"\([^"]*\)".*/\1/p' <<< "$_line")"
+            cst="$(sed -n 's/.*"status":"\([^"]*\)".*/\1/p' <<< "$_line")"
+            cdt="$(sed -n 's/.*"detail":"\([^"]*\)".*/\1/p' <<< "$_line")"
+            [[ -n "$cid" ]] && printf '    [%-7s] %-22s %s\n' "$cst" "$cid" "$cdt"
+        done < "$CONF_DIR/.mtu-checks.tmp"
+        rm -f "$CONF_DIR/.mtu-checks.tmp"
+        printf '\n  recommendation:\n'
+        printf '    %s\n' "$(printf '%s' "$MTU_REC_JSON" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')"
+        printf '    recommended gre mtu: %s (confidence %s)\n' "${MTU_REC_RECOMMENDED:-none}" "$MTU_REC_CONFIDENCE"
+        [[ "$PROBE" == "--probe" ]] || printf '    (run with --probe to measure the path instead of assuming it)\n'
+        printf '\n'
+    fi
+
+    # Non-zero only when a real FAIL was found, so a script can gate on it.
+    (( MTU_N_FAIL == 0 ))
+}
+
+cli_mtu_recommend() {
+    local NAME="" AS_JSON=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) [[ -n "${2:-}" ]] || { err "Missing value for --name"; return 1; }; NAME="$2"; shift 2 ;;
+            --json) AS_JSON=1; shift ;;
+            --help|-h) echo "Usage: gre mtu recommend --name NAME [--json]"; return 0 ;;
+            *) err "Unknown option: $1"; return 1 ;;
+        esac
+    done
+    [[ -n "$NAME" ]] || { err "Usage: gre mtu recommend --name NAME [--json]"; return 1; }
+    mtu_resolve "$NAME" || { err "No connection named '$NAME' is configured on this host."; return 1; }
+    # A recommendation without a measurement is still offered, but labelled low
+    # confidence and not safe to apply on its own.
+    mtu_collect "--probe" || { err "Could not collect MTU data for '$NAME'."; return 1; }
+    mtu_make_recommendation
+
+    if [[ "$AS_JSON" == "1" ]]; then
+        printf '%s\n' "$MTU_REC_JSON"
+    else
+        echo
+        info "MTU recommendation for '$NAME'"
+        echo
+        printf '  current gre mtu   %s\n' "${MTU_TUN_MTU:--}"
+        printf '  path capacity     %s\n' "${MTU_CAPACITY:-unknown}"
+        printf '  overhead          %s bytes\n' "$MTU_OVERHEAD"
+        printf '  recommended       %s\n' "${MTU_REC_RECOMMENDED:-none}"
+        printf '  confidence        %s\n' "$MTU_REC_CONFIDENCE"
+        printf '  safe to apply     %s\n' "$MTU_REC_SAFE"
+        printf '  why               %s\n' "$(printf '%s' "$MTU_REC_JSON" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')"
+        if [[ "$MTU_REC_REQUIRES" == "true" && "$MTU_REC_SAFE" == "true" ]]; then
+            printf '\n  apply it with:\n    gre mtu set --name %s --mtu %s --yes\n' "$NAME" "$MTU_REC_RECOMMENDED"
+        elif [[ "$MTU_REC_SAFE" != "true" ]]; then
+            printf '\n  Not applied automatically: the evidence is not strong enough. Re-run with --probe, or set a value explicitly.\n'
+        fi
+        printf '\n'
+    fi
+    [[ "$MTU_REC_CONFIDENCE" != "unknown" ]]
+}
+
+cli_mtu_auto() {
+    # Deliberately the same read-only recommendation, phrased for an operator. `auto`
+    # does NOT mean "apply": nothing here changes an MTU.
+    local NAME="" AS_JSON=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) [[ -n "${2:-}" ]] || { err "Missing value for --name"; return 1; }; NAME="$2"; shift 2 ;;
+            --json) AS_JSON=1; shift ;;
+            --help|-h) echo "Usage: gre mtu auto --name NAME [--json]  (read-only; applies nothing)"; return 0 ;;
+            *) err "Unknown option: $1"; return 1 ;;
+        esac
+    done
+    [[ -n "$NAME" ]] || { err "Usage: gre mtu auto --name NAME [--json]"; return 1; }
+    mtu_resolve "$NAME" || { err "No connection named '$NAME' is configured on this host."; return 1; }
+    mtu_collect "--probe" || { err "Could not collect MTU data for '$NAME'."; return 1; }
+    mtu_make_recommendation
+
+    if [[ "$AS_JSON" == "1" ]]; then
+        printf '%s' "${MTU_REC_JSON%\}}"
+        printf ',"apply_command":"%s","applied":false}\n' \
+            "$(json_escape "gre mtu set --name $NAME --mtu ${MTU_REC_RECOMMENDED:-} --yes")"
+    else
+        echo
+        if [[ -z "$MTU_REC_RECOMMENDED" ]]; then
+            warn "Not enough evidence to suggest an MTU for '$NAME'."
+            printf '  %s\n\n' "$(printf '%s' "$MTU_REC_JSON" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')"
+            return 1
+        fi
+        info "Suggested MTU for '$NAME': $MTU_REC_RECOMMENDED (confidence $MTU_REC_CONFIDENCE)"
+        printf '  %s\n' "$(printf '%s' "$MTU_REC_JSON" | sed -n 's/.*"reason":"\([^"]*\)".*/\1/p')"
+        if [[ "$MTU_REC_SAFE" == "true" ]]; then
+            printf '\n  This was NOT applied. To apply it:\n    gre mtu set --name %s --mtu %s --yes\n\n' "$NAME" "$MTU_REC_RECOMMENDED"
+        else
+            printf '\n  Not offered for automatic application: %s\n\n' \
+                "$([[ -z "$MTU_CAPACITY" ]] && echo "no usable capacity measurement" || echo "the evidence is not conclusive")"
+        fi
+    fi
+    return 0
+}
+
+# Where the previous MTU is recorded so a change can be undone on this host.
+# One line per connection, so a later change to a different connection cannot clobber it.
+mtu_journal_set() { # mtu_journal_set NAME MTU
+    local f="$CONF_DIR/mtu.journal"
+    mkdir -p "$CONF_DIR"
+    local tmp="$f.tmp"
+    : > "$tmp"
+    if [[ -f "$f" ]]; then
+        grep -vE "^$1	" "$f" >> "$tmp" 2>/dev/null || true
+    fi
+    printf '%s\t%s\t%s\n' "$1" "$2" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$tmp"
+    mv "$tmp" "$f"
+    chmod 600 "$f" 2>/dev/null || true
+}
+
+mtu_journal_get() { # mtu_journal_get NAME -> prints the recorded MTU
+    local f="$CONF_DIR/mtu.journal"
+    [[ -f "$f" ]] || return 1
+    local v
+    v="$(grep -E "^$1	" "$f" 2>/dev/null | tail -n1 | cut -f2)"
+    [[ -n "$v" ]] || return 1
+    printf '%s' "$v"
+}
+
+mtu_journal_forget() { # mtu_journal_forget NAME
+    local f="$CONF_DIR/mtu.journal"
+    [[ -f "$f" ]] || return 0
+    local tmp="$f.tmp"
+    grep -vE "^$1	" "$f" > "$tmp" 2>/dev/null || true
+    mv "$tmp" "$f"
+}
+
+# Persist the connection's MTU into its own config.
+mtu_persist_override() { # mtu_persist_override NAME MTU
+    local name="$1" value="$2" file
+    file="$( [[ -f "$FOREIGNS_DIR/$name.conf" ]] && printf '%s' "$FOREIGNS_DIR/$name.conf" || printf '%s' "$NODES_DIR/$name.conf" )"
+    [[ -f "$file" ]] || { err "No config file for '$name'."; return 1; }
+    local tmp="$file.tmp"
+    grep -vE '^MTU=' "$file" > "$tmp" || true
+    printf 'MTU=%s\n' "$value" >> "$tmp"
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$file"
+    chmod 600 "$file" 2>/dev/null || true
+}
+
+# Change ONE connection's MTU in place. Never recreates the interface, never touches
+# another connection, and never touches a physical NIC.
+cli_mtu_set() {
+    local NAME="" MTU_NEW="" YES=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) [[ -n "${2:-}" ]] || { err "Missing value for --name"; return 1; }; NAME="$2"; shift 2 ;;
+            --mtu)  [[ -n "${2:-}" ]] || { err "Missing value for --mtu"; return 1; }; MTU_NEW="$2"; shift 2 ;;
+            --yes|-y) YES=1; shift ;;
+            --help|-h) echo "Usage: gre mtu set --name NAME --mtu VALUE [--yes]"; return 0 ;;
+            *) err "Unknown option: $1"; return 1 ;;
+        esac
+    done
+    [[ -n "$NAME" ]] || { err "Usage: gre mtu set --name NAME --mtu VALUE [--yes]"; return 1; }
+    [[ -n "$MTU_NEW" ]] || { err "Missing required option: --mtu"; return 1; }
+    valid_mtu "$MTU_NEW" || { err "Invalid MTU '$MTU_NEW': must be 576-9000."; return 1; }
+
+    mtu_resolve "$NAME" || { err "No connection named '$NAME' is configured on this host."; return 1; }
+    mtu_collect || { err "Could not read the current state of '$NAME'."; return 1; }
+
+    if [[ "$MTU_TUN_PRESENT" != "yes" ]]; then
+        err "Tunnel $MTU_TUN does not exist, so there is no MTU to change."
+        err "Bring the connection up first:  gre iran peer apply --name $NAME"
+        return 1
+    fi
+
+    # Refuse a value that cannot work, rather than writing it and letting the operator
+    # discover the blackhole later. The egress MTU is the ceiling the encapsulated
+    # packet has to fit inside.
+    local capacity="$MTU_CAPACITY" overhead="$MTU_OVERHEAD"
+    if [[ -n "$capacity" ]]; then
+        local max_ok=$(( capacity - overhead ))
+        if (( MTU_NEW > max_ok )); then
+            err "Refusing MTU $MTU_NEW: with $overhead bytes of GRE overhead this path allows at most $max_ok."
+            err "  path capacity $capacity ($( [[ "$MTU_PROBE_STATE" == "ok" || "$MTU_PROBE_STATE" == "frag_needed" ]] && echo measured || echo "from the interface MTU, not measured" ))"
+            err "  inspect with:  gre mtu diagnose --name $NAME --probe"
+            return 1
+        fi
+    fi
+    if (( MTU_NEW < MTU_MIN_INNER )); then
+        err "Refusing MTU $MTU_NEW: below the minimum legal IPv4 MTU ($MTU_MIN_INNER)."
+        return 1
+    fi
+
+    local old="$MTU_TUN_MTU"
+    if [[ "$old" == "$MTU_NEW" ]]; then
+        info "Tunnel $MTU_TUN is already at MTU $MTU_NEW — nothing to do."
+        return 0
+    fi
+
+    if (( YES == 0 )); then
+        echo
+        info "About to change ONLY this connection:"
+        printf '  connection   %s (%s)\n' "$MTU_NAME" "$MTU_SIDE"
+        printf '  interface    %s\n' "$MTU_TUN"
+        printf '  mtu          %s -> %s\n' "${old:--}" "$MTU_NEW"
+        printf '  overhead     %s bytes\n' "$overhead"
+        printf '  the interface is NOT recreated; no other connection is touched;\n'
+        printf '  the WAN interface is not touched.\n\n'
+        confirm "Apply MTU $MTU_NEW to $MTU_TUN?" || { info "Cancelled."; return 0; }
+    fi
+
+    # --- record the old value BEFORE the mutation, so a failure can be undone
+    mtu_journal_set "$MTU_NAME" "${old:-}"
+
+    if ! apply_iface_mtu "$MTU_TUN" "$MTU_NEW"; then
+        err "Could not set MTU $MTU_NEW on $MTU_TUN."
+        if [[ -n "$old" ]] && apply_iface_mtu "$MTU_TUN" "$old" >/dev/null 2>&1; then
+            err "Restored the previous MTU $old."
+        else
+            err "ROLLBACK_FAILED: the previous MTU could not be restored."
+        fi
+        return 1
+    fi
+
+    # --- verify from the kernel, not from the command's exit status
+    local now; now="$(iface_mtu "$MTU_TUN")"
+    if [[ "$now" != "$MTU_NEW" ]]; then
+        err "Verification failed: $MTU_TUN reports MTU '$now', not '$MTU_NEW'."
+        if [[ -n "$old" ]] && apply_iface_mtu "$MTU_TUN" "$old" >/dev/null 2>&1; then
+            err "Restored the previous MTU $old."
+        else
+            err "ROLLBACK_FAILED: the previous MTU could not be restored."
+        fi
+        return 1
+    fi
+
+    # Persist so the value survives a restart, a watchdog re-apply and a migration.
+    mtu_persist_override "$MTU_NAME" "$MTU_NEW" || warn "The MTU is applied but could not be written to the config file."
+
+    # Re-write the MSS clamp, since it is derived from the tunnel MTU. Without this the
+    # clamp would keep advertising the MSS of the previous MTU.
+    if [[ "$MTU_SIDE" == "iran" && "$MTU_MSS" == "1" ]]; then
+        mtu_refresh_mss "$MTU_NAME" "$MTU_TUN" "$MTU_NEW" || warn "The MTU changed but the MSS clamp could not be refreshed."
+    fi
+
+    audit_log "mtu-set name=$NAME side=$MTU_SIDE tun=$MTU_TUN from=${old:-none} to=$MTU_NEW"
+    ok "Tunnel $MTU_TUN MTU is now $MTU_NEW (was ${old:-unknown})."
+    if [[ -n "$MTU_CAPACITY" ]]; then
+        info "Verified against a path capacity of $MTU_CAPACITY with $MTU_OVERHEAD bytes of overhead."
+    fi
+    return 0
+}
+
+# Re-derive the connection's MSS clamp from a new tunnel MTU, in place.
+mtu_refresh_mss() { # mtu_refresh_mss NAME TUN MTU
+    local name="$1" tun="$2" mtu="$3"
+    local mss=$(( mtu - 40 ))
+    (( mss >= 536 )) || { warn "MTU $mtu leaves an MSS below the IPv4 minimum; leaving the clamp alone."; return 1; }
+    local comment="multi-gre-iran-$name-mss"
+    ipt_del mangle POSTROUTING -o "$tun" -p tcp --tcp-flags SYN,RST SYN -m comment --comment "$comment*" -j TCPMSS
+    ipt_del mangle FORWARD -o "$tun" -p tcp --tcp-flags SYN,RST SYN -m comment --comment "$comment-fwd*" -j TCPMSS
+    ipt_del mangle POSTROUTING -o "$tun" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    ipt_del mangle FORWARD -o "$tun" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    ipt_add mangle POSTROUTING -o "$tun" -p tcp --tcp-flags SYN,RST SYN \
+        -m comment --comment "$comment" -j TCPMSS --set-mss "$mss"
+    ipt_add mangle FORWARD -o "$tun" -p tcp --tcp-flags SYN,RST SYN \
+        -m comment --comment "$comment-fwd" -j TCPMSS --set-mss "$mss"
+    return 0
+}
+
+cli_mtu_restore() {
+    local NAME="" YES=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) [[ -n "${2:-}" ]] || { err "Missing value for --name"; return 1; }; NAME="$2"; shift 2 ;;
+            --yes|-y) YES=1; shift ;;
+            --help|-h) echo "Usage: gre mtu restore --name NAME [--yes]"; return 0 ;;
+            *) err "Unknown option: $1"; return 1 ;;
+        esac
+    done
+    [[ -n "$NAME" ]] || { err "Usage: gre mtu restore --name NAME [--yes]"; return 1; }
+    mtu_resolve "$NAME" || { err "No connection named '$NAME' is configured on this host."; return 1; }
+
+    local want
+    want="$(mtu_journal_get "$NAME")" || {
+        err "No previous MTU is recorded for '$NAME' on this host."
+        err "A restore is only possible after a change made by 'gre mtu set'."
+        return 1
+    }
+    valid_mtu "$want" || { err "The recorded value '$want' is not a valid MTU; refusing to apply it."; return 1; }
+
+    mtu_collect || { err "Could not read the current state of '$NAME'."; return 1; }
+    [[ "$MTU_TUN_PRESENT" == "yes" ]] || { err "Tunnel $MTU_TUN does not exist."; return 1; }
+
+    if (( YES == 0 )); then
+        printf '\n  connection   %s\n  interface    %s\n  mtu          %s -> %s (recorded)\n\n' \
+            "$MTU_NAME" "$MTU_TUN" "${MTU_TUN_MTU:--}" "$want"
+        confirm "Restore MTU $want on $MTU_TUN?" || { info "Cancelled."; return 0; }
+    fi
+
+    if ! apply_iface_mtu "$MTU_TUN" "$want"; then
+        err "Could not restore MTU $want on $MTU_TUN."
+        return 1
+    fi
+    local now; now="$(iface_mtu "$MTU_TUN")"
+    if [[ "$now" != "$want" ]]; then
+        err "Verification failed after restore: $MTU_TUN reports '$now', not '$want'."
+        return 1
+    fi
+
+    mtu_persist_override "$MTU_NAME" "$want" || warn "MTU restored but could not be written to the config file."
+    if [[ "$MTU_SIDE" == "iran" && "$MTU_MSS" == "1" ]]; then
+        mtu_refresh_mss "$MTU_NAME" "$MTU_TUN" "$want" || warn "The MTU was restored but the MSS clamp could not be refreshed."
+    fi
+    mtu_journal_forget "$MTU_NAME"
+    audit_log "mtu-restore name=$NAME tun=$MTU_TUN to=$want"
+    ok "Tunnel $MTU_TUN MTU restored to $want."
+    return 0
+}
+
+# ------------------------------------------------- advanced: the physical NIC MTU
+#
+# Read-only by design. Changing a WAN NIC MTU can sever the SSH session the operator is
+# using, and with it the Hub's ability to recover the host at all, so this reports and
+# advises rather than applying. An unattended change is refused outright.
+cli_mtu_nic() {
+    local sub="${1:-}"; shift || true
+    case "$sub" in
+        list)
+            local AS_JSON=0
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --json) AS_JSON=1; shift ;;
+                    --help|-h) echo "Usage: gre mtu nic list [--json]"; return 0 ;;
+                    *) err "Unknown option: $1"; return 1 ;;
+                esac
+            done
+            local nic_rows="" count=0
+            # `ip -o link show` prefixes each line with an index, but not every
+            # implementation numbers every line, so the name is taken as "the first
+            # token, minus any index and separator" rather than assuming a number.
+            while read -r dev; do
+                [[ -n "$dev" ]] || continue
+                local m; m="$(iface_mtu "$dev")"
+                [[ -n "$m" ]] || continue
+                count=$(( count + 1 ))
+                local cp="false"
+                iface_carries_control_plane "$dev" && cp="true"
+                [[ -n "$nic_rows" ]] && nic_rows+=","
+                nic_rows+="$(printf '{"iface":"%s","mtu":%s,"carries_control_plane":%s}' \
+                    "$(json_escape "$dev")" "$m" "$cp")"
+            done < <(ip -o link show 2>/dev/null | sed -e 's/^[0-9]\+:[[:space:]]*//' -e 's/:.*//' -e 's/@.*//' | grep -v '^$')
+
+            if [[ "$AS_JSON" == "1" ]]; then
+                printf '{"count":%s,"nics":[%s]}\n' "$count" "$nic_rows"
+            else
+                printf '\n%-16s %-8s %s\n' IFACE MTU CONTROL-PLANE
+                printf '%s' "$nic_rows" | tr '}' '\n' | sed -n 's/.*"iface":"\([^"]*\)","mtu":\([0-9]*\),"carries_control_plane":\([a-z]*\).*/\1 \2 \3/p' \
+                    | while read -r i m c; do printf '%-16s %-8s %s\n' "$i" "$m" "$([[ "$c" == "true" ]] && echo YES || echo no)"; done
+                printf '\n'
+            fi
+            return 0 ;;
+        analyze)
+            local NAME="" AS_JSON=0
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --name) [[ -n "${2:-}" ]] || { err "Missing value for --name"; return 1; }; NAME="$2"; shift 2 ;;
+                    --json) AS_JSON=1; shift ;;
+                    --help|-h) echo "Usage: gre mtu nic analyze --name NAME [--json]"; return 0 ;;
+                    *) err "Unknown option: $1"; return 1 ;;
+                esac
+            done
+            [[ -n "$NAME" ]] || { err "Usage: gre mtu nic analyze --name NAME [--json]"; return 1; }
+            mtu_resolve "$NAME" || { err "No connection named '$NAME' is configured on this host."; return 1; }
+            mtu_collect || { err "Could not read state for '$NAME'."; return 1; }
+
+            local risk="low" reasons="" cp="false"
+            iface_carries_control_plane "$MTU_UNDER_IFACE" && cp="true"
+            add_reason() { [[ -n "$reasons" ]] && reasons+="; "; reasons+="$1"; }
+            if [[ "$cp" == "true" ]]; then
+                risk="high"
+                add_reason "this interface carries the default route, so it almost certainly carries the SSH session and the Hub's access to this host"
+            fi
+            if [[ -n "$MTU_CAPACITY" && -n "$MTU_UNDER_MTU" && "$MTU_CAPACITY" -lt "$MTU_UNDER_MTU" ]]; then
+                [[ "$risk" == "low" ]] && risk="medium"
+                add_reason "the path to the peer measured $MTU_CAPACITY, below the interface MTU $MTU_UNDER_MTU"
+            fi
+            if [[ -z "$MTU_UNDER_MTU" ]]; then
+                add_reason "the egress interface MTU could not be read"
+            fi
+
+            if [[ "$AS_JSON" == "1" ]]; then
+                printf '{"name":"%s","iface":"%s","nic_mtu":%s,"path_capacity":%s,"carries_control_plane":%s,"risk":"%s","reasons":"%s","applied":false}\n' \
+                    "$(json_escape "$MTU_NAME")" "$(json_escape "$MTU_UNDER_IFACE")" \
+                    "${MTU_UNDER_MTU:-null}" "${MTU_CAPACITY:-null}" "$cp" "$risk" "$(json_escape "$reasons")"
+            else
+                echo
+                info "NIC MTU analysis for '$NAME' (read-only; nothing is changed)"
+                echo
+                printf '  egress interface  %s\n' "${MTU_UNDER_IFACE:--}"
+                printf '  NIC MTU           %s\n' "${MTU_UNDER_MTU:--}"
+                printf '  path capacity     %s\n' "${MTU_CAPACITY:-unknown}"
+                printf '  control plane     %s\n' "$([[ "$cp" == "true" ]] && echo "YES - changing this can cut your own session" || echo no)"
+                printf '  risk              %s\n' "$risk"
+                [[ -n "$reasons" ]] && printf '  because           %s\n' "$reasons"
+                printf '\n  This command never changes a NIC MTU. A WAN MTU change can sever SSH,\n'
+                printf '  and with it the Hub ability to recover the host, so it is deliberately\n'
+                printf '  left to you, at the console, with a rollback already scheduled.\n\n'
+            fi
+            [[ "$risk" != "high" ]] ;;
+        --help|-h|"")
+            cat <<'EOF'
+Usage:
+  gre mtu nic list [--json]
+  gre mtu nic analyze --name NAME [--json]
+
+Read-only analysis of the physical or virtual NIC MTU. Neither form changes an MTU.
+
+Changing a WAN NIC MTU can sever the SSH session you are working over and remove the
+Hub's ability to recover the host, so it is never done automatically and is not offered
+as an unattended repair. Do it at the console with an independent rollback armed.
+EOF
+            ;;
+        *) err "Usage: gre mtu nic <list|analyze> ...  (see: gre mtu nic --help)"; return 1 ;;
+    esac
+}
+
 doctor() { # gre doctor — diagnostics; exits non-zero if any check FAILs
     local DOC_FAIL=0 DOC_WARN=0
     echo
@@ -5988,6 +6954,20 @@ Usage:
                           read-only per-connection tunnel health; changes nothing
   gre tunnel rules [--json]
                           print the manager's iptables rules (read-only)
+  gre mtu list [--json]
+                          every connection's tunnel MTU, egress MTU and GRE overhead
+  gre mtu diagnose --name NAME [--json] [--probe]
+                          per-connection MTU diagnosis; read-only, changes nothing
+  gre mtu recommend --name NAME [--json]
+                          evidence-based MTU recommendation with a confidence level
+  gre mtu auto --name NAME [--json]
+                          the same recommendation as an apply-ready command (applies nothing)
+  gre mtu set --name NAME --mtu VALUE [--yes]
+                          change ONE connection's tunnel MTU in place (no rebuild)
+  gre mtu restore --name NAME [--yes]
+                          restore the MTU recorded before the last change
+  gre mtu nic list|analyze
+                          advanced, read-only physical NIC MTU analysis
   gre node list [--json]  list configured Iran nodes (FOREIGN)
   gre node add --name NAME --ip IRAN_IP [--idx N] [--key K] [--subnet-base A.B] [--yes]
                           add an Iran node on FOREIGN (non-interactive)
@@ -6118,6 +7098,7 @@ EOF
         esac ;;
     iran-setup)        cli_iran_setup "${@:2}" ;;
     foreign-setup)     cli_foreign_setup "${@:2}" ;;
+    mtu)               cli_mtu "${@:2}" ;;
     doctor)            doctor ;;
     tunnel)
         case "${2:-}" in
