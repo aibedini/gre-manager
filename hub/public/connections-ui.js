@@ -871,7 +871,7 @@ const HEALTH_VERDICT_CLASS = { HEALTHY: 'green', DEGRADED: 'yellow', BROKEN: 're
 const HEALTH_SEVERITY_CLASS = { critical: 'red', warning: 'yellow', info: 'gray' };
 const HEALTH_RUN_CLASS = { SUCCEEDED: 'green', PARTIAL: 'yellow', FAILED: 'red', REJECTED: 'gray', RUNNING: 'blue' };
 
-function healthState() {
+function connHealthRuns() {
   if (!state.connHealth) state.connHealth = {};
   if (!state.connHealthBusy) state.connHealthBusy = {};
   if (!state.connHealthError) state.connHealthError = {};
@@ -899,7 +899,7 @@ const healthCounts = (summary) => {
 // connection lock, so a second click while one is running comes back as a 409 rather
 // than doubling the load on a suspect host.
 async function runConnectionHealth(id, { mode = 'quick', silent = false } = {}) {
-  healthState();
+  connHealthRuns();
   state.connHealthBusy[id] = true;
   if (!silent) renderHealthPanel(id);
   try {
@@ -918,7 +918,7 @@ async function runConnectionHealth(id, { mode = 'quick', silent = false } = {}) 
 }
 
 async function loadHealthHistory(id, { silent = false } = {}) {
-  healthState();
+  connHealthRuns();
   try {
     const data = await api(`/api/gre-connections/${id}/health-checks`);
     state.connHealthHistory[id] = (data && data.checks) || [];
@@ -932,7 +932,7 @@ async function loadHealthHistory(id, { silent = false } = {}) {
 async function openHealthView(id, { mode = null } = {}) {
   const c = connectionById(id);
   if (!c) { toast('that connection is no longer loaded; refresh first', true); return; }
-  healthState();
+  connHealthRuns();
   state.connHealthOpen = Number(id);
   const host = $('#connections-health');
   const title = $('#conn-health-title');
@@ -1072,7 +1072,7 @@ function bindHealthPanel(scope) {
 }
 
 function renderHealthPanel(id) {
-  healthState();
+  connHealthRuns();
   const body = $('#conn-health-body');
   const verdict = $('#conn-health-verdict');
   if (!body) return;
@@ -1164,7 +1164,7 @@ function renderHealthPanel(id) {
 }
 
 async function openHealthEvidence(id, code) {
-  const run = healthState()[id];
+  const run = connHealthRuns()[id];
   const finding = run && (run.combined.findings || []).find((f) => f.code === code);
   if (!finding) { toast('that finding is no longer in the loaded run', true); return; }
   const relevantCheckIds = (finding.sides || []).flatMap((side) => ((run.combined.per_side[side] || {}).checks || [])
@@ -1314,7 +1314,7 @@ async function openHealthRun(id, checkId) {
 // from a credential: every payload was redacted on the way out of the Hub.
 async function exportHealthReport(id) {
   const c = connectionById(id);
-  const run = healthState()[id] || null;
+  const run = connHealthRuns()[id] || null;
   const history = state.connHealthHistory[id] || await loadHealthHistory(id, { silent: true });
   const report = {
     exported_at: new Date().toISOString(),
@@ -1359,16 +1359,16 @@ function openHealthRestore(id) {
 
 // The panel's own controls. They act on whichever connection the panel is showing,
 // which is why they read the open id at click time rather than binding to one.
-function healthStateOpenId() {
-  healthState();
+function connHealthOpenId() {
+  connHealthRuns();
   return state.connHealthOpen;
 }
 const healthPanelControls = [
-  ['#btn-conn-health-full', () => { const id = healthStateOpenId(); if (id) runConnectionHealth(id, { mode: 'full' }); }],
-  ['#btn-conn-health-quick', () => { const id = healthStateOpenId(); if (id) runConnectionHealth(id, { mode: 'quick' }); }],
-  ['#btn-conn-health-mtu', () => { const id = healthStateOpenId(); if (id) openMtuDetails(id); }],
-  ['#btn-conn-health-report', () => { const id = healthStateOpenId(); if (id) exportHealthReport(id); }],
-  ['#btn-conn-health-restore', () => { const id = healthStateOpenId(); if (id) openHealthRestore(id); }],
+  ['#btn-conn-health-full', () => { const id = connHealthOpenId(); if (id) runConnectionHealth(id, { mode: 'full' }); }],
+  ['#btn-conn-health-quick', () => { const id = connHealthOpenId(); if (id) runConnectionHealth(id, { mode: 'quick' }); }],
+  ['#btn-conn-health-mtu', () => { const id = connHealthOpenId(); if (id) openMtuDetails(id); }],
+  ['#btn-conn-health-report', () => { const id = connHealthOpenId(); if (id) exportHealthReport(id); }],
+  ['#btn-conn-health-restore', () => { const id = connHealthOpenId(); if (id) openHealthRestore(id); }],
   ['#btn-conn-health-close', () => {
     const panel = document.getElementById('connections-health');
     if (panel) panel.classList.add('hidden');

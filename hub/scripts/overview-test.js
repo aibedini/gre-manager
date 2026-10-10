@@ -405,6 +405,74 @@ function main() {
     assert.equal(server.snapshot.error, undefined, 'the stale error must be gone');
   });
 
+  console.log('\nTEST 14 — every dashboard script loads in ONE global scope:');
+
+  // The dashboard loads four classic scripts into one shared global scope, so a
+  // top-level name declared in two of them is a SyntaxError that kills the whole file --
+  // silently, because `node --check` accepts each file on its own and the other tests
+  // load app.js by itself. That is how a duplicate `healthState` (a `const` in app.js
+  // from the ServerTopology destructuring, plus a `function` in connections-ui.js) shipped
+  // a Connections page that could not render at all.
+  const dashboardScripts = ['server-topology.js', 'discovery-response.js', 'app.js', 'connections-ui.js'];
+  // A stub element for every query, so a script's top-level wiring runs rather than
+  // throwing on a null. The point is to reach the END of each file: a collision is a
+  // parse error that stops the file before any of it runs.
+  const stubEl = () => ({
+    style: {}, dataset: {}, classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+    addEventListener() {}, removeEventListener() {}, appendChild() {}, remove() {},
+    querySelector: () => stubEl(), querySelectorAll: () => [],
+    setAttribute() {}, getAttribute: () => null, focus() {}, click() {},
+    innerHTML: '', textContent: '', value: '', disabled: false, hidden: false,
+  });
+  const sharedSandbox = {
+    console, setTimeout, clearTimeout, setInterval, clearInterval,
+    document: {
+      addEventListener() {}, removeEventListener() {},
+      querySelector: () => stubEl(), querySelectorAll: () => [],
+      getElementById: () => stubEl(), createElement: () => stubEl(),
+      body: stubEl(), documentElement: stubEl(),
+    },
+    location: { pathname: '/', href: 'http://localhost/', hash: '', search: '' },
+    navigator: { clipboard: { writeText: () => Promise.resolve() } },
+    fetch: () => new Promise(() => {}),
+    localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    history: { replaceState() {}, pushState() {} },
+    matchMedia: () => ({ matches: false, addEventListener() {} }),
+  };
+  sharedSandbox.window = sharedSandbox;
+  sharedSandbox.globalThis = sharedSandbox;
+  const sharedContext = vm.createContext(sharedSandbox);
+
+  for (const name of dashboardScripts) {
+    const file = path.join(PUBLIC, name);
+    assert(fs.existsSync(file), `${name} exists`);
+    const src = fs.readFileSync(file, 'utf8');
+    let error = null;
+    try {
+      vm.runInContext(src, sharedContext, { filename: name });
+    } catch (e) {
+      error = e;
+    }
+    check(`${name} evaluates without a global-scope collision`, () => {
+      assert.equal(error, null, error ? `${name}: ${error.message}` : '');
+    });
+  }
+
+  // The two globals the dashboard depends on must actually exist afterwards. A file that
+  // threw would leave its export undefined, and every feature it provides would be a
+  // silent no-op -- which is exactly how the Connections page failed.
+  check('window.ServerTopology is exported', () => {
+    assert(sharedSandbox.ServerTopology, 'server-topology.js must publish its namespace');
+  });
+  check('window.ConnectionsUI is exported', () => {
+    assert(sharedSandbox.ConnectionsUI, 'connections-ui.js must publish its namespace');
+    assert.equal(typeof sharedSandbox.ConnectionsUI.load, 'function', 'ConnectionsUI.load must be callable');
+    assert.equal(typeof sharedSandbox.ConnectionsUI.render, 'function', 'ConnectionsUI.render must be callable');
+  });
+  check('window.DiscoveryResponse is exported', () => {
+    assert(sharedSandbox.DiscoveryResponse, 'discovery-response.js must publish its namespace');
+  });
+
   report('overview + discovery regression tests');
 }
 

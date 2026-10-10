@@ -20,6 +20,7 @@
     "test:mtu": "node scripts/mtu-test.js",
     "test:mtu-contract": "node scripts/mtu-contract-test.js",
     "test:health": "node scripts/health-test.js",
+    "test:ui": "node scripts/ui-browser-test.js",
     "test:lifecycle": "node scripts/lifecycle-test.js",
     "test:live-preflight": "node scripts/live-preflight-test.js",
     "test:migration": "node scripts/migration-test.js",

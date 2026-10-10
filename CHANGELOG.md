@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Connections page could not render at all.** `app.js` destructures `healthState`
+  from the `ServerTopology` namespace as a top-level `const`, and `connections-ui.js`
+  declared `function healthState()` with the same name. A `const` and a function declaration
+  cannot coexist in the global scope, so the browser rejected the whole file with
+  `Identifier 'healthState' has already been declared`, `window.ConnectionsUI` was never
+  published, and every feature in it — the connections table, the MTU columns and the health
+  check — was a silent no-op. Neither `node --check` (which checks one file at a time) nor
+  the existing tests (which load `app.js` alone) could see it. The function is now
+  `connHealthRuns`, and `overview-test.js` gained TEST 14, which evaluates all four
+  dashboard scripts in ONE shared context the way the browser does and fails on the exact
+  error above. That test was confirmed to catch the regression by reintroducing it.
 - **The TCP MSS clamp was derived from the wrong MTU.** It used
   `TCPMSS --clamp-mss-to-pmtu`, which resolves against the ROUTE's MTU — and for a packet
   leaving through a GRE tunnel that route is the underlay one. It therefore commonly
@@ -97,6 +108,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   health check. Everything is verified against the test harness, a stateful fake, and (where
   the environment allows) real network namespaces. The accompanying report states what
   remains unverified.
+- **The browser check is opt-in, and it is not optional in spirit.** `npm run test:ui`
+  drives the real Hub in a real Chromium and asserts the Connections table, the MTU columns,
+  the health panel, its empty state, its per-side result table and its close behaviour. It
+  skips with a reason when no Hub is listening, and `UI_REQUIRE=1` turns that skip into a
+  failure. Start a Hub with `bash scripts/boot-hub-for-ui.sh 4123` first. It is deliberately
+  NOT part of `npm test`, because a browser check that silently skips is worse than one that
+  is run on purpose.
+- An earlier assessment that the bash suite leaked gigabytes per run into `/tmp` was
+  **wrong**. Measured directly, a full run uses about 9 MB; the disk exhaustion behind the
+  earlier false failures came from pre-existing Windows temp files, not from the harness.
 
 ## [2.17.0] - 2026-10-08
 
