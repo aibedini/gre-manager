@@ -110,14 +110,31 @@ case "$obj" in
         done
         exit 0 ;;
       set)
-        # `ip link set dev IFACE mtu VALUE [up]` — the manager uses this for an
-        # MTU-only change that must not recreate the interface.
-        _dev=""; _mtu=""; _prev=""
+        # Accept both spellings of the device, because both are valid ip(8):
+        #   ip link set dev IFACE mtu VALUE
+        #   ip link set IFACE mtu VALUE
+        # The manager uses the second form when it recreates a tunnel and the first when
+        # it changes an MTU in place. Recording only one of them made an MTU set during a
+        # recreate invisible to the next diagnostic.
+        _dev=""; _mtu=""; _prev=""; _first=""
         for _a in "$@"; do
+          [[ -z "$_first" ]] && _first="$_a"
           [[ "$_prev" == "dev" ]] && _dev="$_a"
           [[ "$_prev" == "mtu" ]] && _mtu="$_a"
           _prev="$_a"
         done
+        # No explicit "dev": the device is the first positional argument that is not the
+        # subcommand itself, a keyword, or a flag value.
+        if [[ -z "$_dev" ]]; then
+          for _a in "$@"; do
+            case "$_a" in
+              set|link|mtu|up|down|dev|addr|"") continue ;;
+            esac
+            # Skip the value belonging to a keyword we already consumed.
+            [[ "$_a" =~ ^[0-9]+$ ]] && continue
+            _dev="$_a"; break
+          done
+        fi
         if [[ -n "$_dev" && -n "$_mtu" ]]; then
           echo "$_mtu" > "$ST/mtu.$_dev"
         fi

@@ -23,8 +23,13 @@ printf 'DBG add nl1 rc=%s files=%s\n' "$GRE_RC" "$(ls "$R/etc/multi-gre/foreigns
 # ---------------------------------------------------------------- help and list
 gre mtu --help
 assert "mtu --help rc=0" test "$GRE_RC" -eq 0
+# `gre` captures output into GRE_OUT, which a child shell cannot see, so the help text
+# is re-fetched inside the assertion rather than referenced from the parent scope.
 assert "mtu --help documents every subcommand" bash -c \
-    "grep -q 'diagnose' <<< '$GRE_OUT' && grep -q 'recommend' <<< '$GRE_OUT' && grep -q 'restore' <<< '$GRE_OUT'"
+    'TEST_ROOT="'"$R"'" PATH="'"$STUBS"':$PATH" bash "'"$SUT"'" mtu --help 2>&1 | grep -q diagnose \
+     && TEST_ROOT="'"$R"'" PATH="'"$STUBS"':$PATH" bash "'"$SUT"'" mtu --help 2>&1 | grep -q recommend \
+     && TEST_ROOT="'"$R"'" PATH="'"$STUBS"':$PATH" bash "'"$SUT"'" mtu --help 2>&1 | grep -q restore \
+     && TEST_ROOT="'"$R"'" PATH="'"$STUBS"':$PATH" bash "'"$SUT"'" mtu --help 2>&1 | grep -q nic'
 gre mtu list
 assert "mtu list rc=0" test "$GRE_RC" -eq 0
 assert "mtu list shows the connection" grep -q 'de1' <<< "$GRE_OUT"
@@ -127,7 +132,12 @@ assert "set did NOT recreate the interface" test "$tun_record_before" = "$(cat "
 assert "set persisted the override" grep -qx 'MTU=1400' "$R/etc/multi-gre/foreigns/de1.conf"
 assert "set recorded the previous value for restore" grep -q '^de1	1476	' "$R/etc/multi-gre/mtu.journal"
 assert "set refreshed the MSS clamp from the new MTU" grep -q 'set-mss 1360' "$R/state/iptables.mangle"
-assert_not "the old MSS value is gone" grep -q 'set-mss 1436' "$R/state/iptables.mangle"
+# Scoped to THIS connection: the other peer legitimately keeps its own MSS, so a
+# whole-file search for the old value would be a false failure.
+assert_not "de1 no longer advertises the old MSS" bash -c \
+    "grep 'multi-gre-iran-de1-mss' '$R/state/iptables.mangle' | grep -q 'set-mss 1436'"
+assert "the other peer keeps its own MSS" bash -c \
+    "grep 'multi-gre-iran-nl1-mss' '$R/state/iptables.mangle' | grep -q 'set-mss 1436'"
 assert "set touched only its own connection" test -f "$R/etc/multi-gre/foreigns/nl1.conf"
 assert_not "set did not write an override for the other connection" grep -q '^MTU=' "$R/etc/multi-gre/foreigns/nl1.conf"
 assert "set did not change the WAN NIC MTU" test "$(cat "$R/state/mtu.eth0" 2>/dev/null || echo 1500)" = "1500"
@@ -141,7 +151,10 @@ rm -f "$R/state/mtu.gre-de1" "$R/state/tunnels/gre-de1"
 gre --apply >/dev/null 2>&1
 assert "--apply rc=0 after an MTU override" test "$GRE_RC" -eq 0
 assert "the interface is recreated" test -f "$R/state/tunnels/gre-de1"
-assert "the tunnel comes back at the stored 1400" grep -q 'mtu 1400' "$R/state/tunnels/gre-de1"
+# The MTU is applied with `ip link set`, not baked into `ip tunnel add`, so the live
+# interface MTU is what proves persistence — the tunnel-add record never carries it.
+assert "the tunnel comes back at the stored 1400" test "$(cat "$R/state/mtu.gre-de1")" = "1400"
+assert "the tunnel record was rebuilt" grep -q 'gre-de1' "$R/state/tunnels/gre-de1"
 
 # ---------------------------------------------------------------- restore
 gre mtu restore --name de1 --yes
@@ -222,7 +235,10 @@ assert "the endpoints are preserved" bash -c \
 assert "the NAT rules are untouched" test "$nat_before" = "$(md5sum "$R/state/iptables.nat" | cut -d' ' -f1)"
 assert "the connection keeps its own NAT rules" test "$de1_rules_before" = "$(grep -c 'multi-gre-iran-de1' "$R/state/iptables.nat")"
 assert "the other connection's config is untouched" test -f "$R/etc/multi-gre/foreigns/nl1.conf"
-assert "the other connection's interface is untouched" test ! -f "$R/state/mtu.gre-nl1"
+# A `--apply` legitimately rebuilds every connection, so nl1 having an interface MTU is
+# expected. What matters is that de1's change did not leak into nl1's value.
+assert "the other connection did not inherit de1's MTU" test "$(cat "$R/state/mtu.gre-nl1" 2>/dev/null || echo 1476)" = "1476"
+assert_not "the other connection got no MTU override" grep -q '^MTU=' "$R/etc/multi-gre/foreigns/nl1.conf"
 assert "the connection still verifies" bash -c "grep -q 'MTU=1400' '$R/etc/multi-gre/foreigns/de1.conf'"
 gre mtu diagnose --name de1 >/dev/null 2>&1
 assert "diagnose still passes after the change" test "$GRE_RC" -eq 0
