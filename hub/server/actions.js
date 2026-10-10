@@ -27,6 +27,20 @@ function optIntRange(flag, value, min, max) {
   return ` ${flag} ${n}`;
 }
 
+function requireName(value, verb) {
+  if (!value) throw new Error(`${verb} requires name`);
+  if (!NAME_RE.test(String(value))) throw new Error('name must be 1-11 letters, digits, _ or -, starting with a letter or digit');
+  return String(value);
+}
+
+function requireMtu(value) {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < MTU_MIN || n > MTU_MAX) {
+    throw new Error(`mtu must be an integer ${MTU_MIN}-${MTU_MAX}`);
+  }
+  return n;
+}
+
 function optEnum(flag, value, allowed) {
   if (value === undefined || value === null || value === '') return '';
   if (!allowed.includes(value)) throw new Error(`${flag} must be one of: ${allowed.join(', ')}`);
@@ -35,6 +49,11 @@ function optEnum(flag, value, allowed) {
 
 const IPV4_RE = /^(\d{1,3}\.){3}\d{1,3}$/;
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,10}$/;
+// The legal window the CLI accepts for an MTU. Anything outside it is rejected
+// before a command is ever built: a wrong MTU is not a cosmetic error, it is a
+// tunnel that black-holes traffic, so this is validated on the Hub side too.
+const MTU_MIN = 576;
+const MTU_MAX = 65535;
 const SUBNET_BASE_RE = /^\d{1,3}\.\d{1,3}$/;
 const PORT_LIST_RE = /^[0-9,:-]+$/;
 
@@ -186,6 +205,23 @@ const BUILDERS = {
   node_list_json: () => 'gre node list --json',
   status_json: () => 'gre status --json',
   doctor: () => 'gre doctor',
+  // MTU diagnostics. Every verb is explicitly named: MTU handling is the one place
+  // where a "helpful" generic command would let a caller reach a tunnel rebuild, and
+  // an MTU change must never recreate the interface.
+  mtu_list_json: () => 'gre mtu list --json',
+  mtu_diagnose: (p) => `gre mtu diagnose --name ${q(requireName(p.name, 'mtu_diagnose'))} --json`,
+  mtu_recommend: (p) => `gre mtu recommend --name ${q(requireName(p.name, 'mtu_recommend'))} --json`,
+  // The only MTU mutation. `--mtu` is range-checked here as well as remotely, and
+  // `--yes` is always appended: without it the CLI would block on a prompt the Hub
+  // cannot answer, and the operation would hang instead of failing.
+  mtu_set: (p) => `gre mtu set --name ${q(requireName(p.name, 'mtu_set'))} --mtu ${requireMtu(p.mtu)} --yes`,
+  mtu_auto: (p) => `gre mtu auto --name ${q(requireName(p.name, 'mtu_auto'))} --json`,
+  mtu_restore: (p) => `gre mtu restore --name ${q(requireName(p.name, 'mtu_restore'))} --yes`,
+  mtu_nic_list_json: () => 'gre mtu nic list --json',
+  mtu_nic_analyze: (p) => `gre mtu nic analyze --name ${q(requireName(p.name, 'mtu_nic_analyze'))} --json`,
+  // Read-only reachability check used to prove an MTU change did not break the
+  // tunnel. It exists in the CLI independently of the MTU verbs.
+  tunnel_diagnose: (p) => `gre tunnel diagnose --name ${q(requireName(p.name, 'tunnel_diagnose'))} --json`,
   export: (p) => `gre export${p.path ? ` ${q(p.path)}` : ''} --yes`,
   purge: (p) => {
     if (p.confirm !== 'PURGE') throw new Error('purge requires confirm: "PURGE"');
@@ -222,4 +258,4 @@ async function runAction(db, server, secret, action, params, sshOpts = {}, prebu
   return { ...result, command };
 }
 
-module.exports = { runAction, buildAction, ACTION_NAMES, sanitizeParams };
+module.exports = { runAction, buildAction, ACTION_NAMES, sanitizeParams, MTU_MIN, MTU_MAX };

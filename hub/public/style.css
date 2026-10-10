@@ -341,6 +341,76 @@ kbd {
 .conn-name { font-weight: 600; }
 .conn-actions { display: flex; gap: 6px; }
 
+/* ---------- MTU ---------- */
+/* The action cell carries six MTU actions plus the connection actions, so it wraps
+   inside a bounded width instead of stretching the table to one very long line. */
+.conn-mtu-actions {
+  flex-wrap: wrap;
+  max-width: 260px;
+  white-space: normal;
+}
+
+/* A value that only exists in the journal is muted; a live, verified one is not. This
+   is the difference between "the Hub remembers" and "the Hub measured". */
+.conn-mtu-live { font-weight: 600; }
+.conn-mtu-when { font-size: 10.5px; white-space: nowrap; }
+
+.conn-mtu {
+  margin-top: 18px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+}
+
+.conn-mtu-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.conn-mtu-head h3 { font-size: 14px; margin: 0; }
+.conn-mtu-table { font-size: 12.5px; }
+
+.conn-mtu-verdict { margin-top: 12px; font-size: 13px; }
+
+.conn-mtu-verdict,
+.mtu-verdict {
+  display: grid;
+  gap: 6px;
+  border-left: 3px solid var(--border-strong);
+  padding: 8px 0 8px 12px;
+  margin-bottom: 14px;
+}
+
+.mtu-verdict-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+}
+
+.mtu-not-safe { color: var(--yellow-fg); font-size: 12.5px; }
+
+.conn-mtu-checks { margin-top: 14px; }
+
+.mtu-check-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 14px;
+}
+
+.mtu-check-col h4 {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.conn-table td .badge + .conn-mtu-when { margin-top: 2px; }
+
 /* ---------- edit review ------------------------------------------------ */
 
 .review-grid { overflow-x: auto; }

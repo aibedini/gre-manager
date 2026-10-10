@@ -215,7 +215,10 @@ assert "commented DNAT tcp added" nat_has "PREROUTING -i eth0 -d 198.51.100.20 -
 assert "commented SNAT added"     nat_has "POSTROUTING -o gre-de1 -d 10.200.1.1 -m comment --comment multi-gre-iran-de1-snat -j SNAT --to-source 10.200.1.2"
 assert "legacy DNAT removed"      bash -c "! grep -qxF 'PREROUTING -i eth0 -d 198.51.100.20 -p tcp -m multiport --dports 80,443 -j DNAT --to-destination 10.200.1.1' '$R/state/iptables.nat'"
 assert "legacy MSS removed"       bash -c "! grep -qxF 'POSTROUTING -o gre-de1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu' '$R/state/iptables.mangle'"
-assert "commented MSS added"      grep -qxF 'POSTROUTING -o gre-de1 -p tcp --tcp-flags SYN,RST SYN -m comment --comment multi-gre-iran-de1-mss -j TCPMSS --clamp-mss-to-pmtu' "$R/state/iptables.mangle"
+# the MSS is set explicitly from the tunnel MTU (1476 - 40 headers), not from the
+# route PMTU, which for a GRE egress is the underlay's MTU
+assert "commented MSS added"      grep -qxF 'POSTROUTING -o gre-de1 -p tcp --tcp-flags SYN,RST SYN -m comment --comment multi-gre-iran-de1-mss -j TCPMSS --set-mss 1436' "$R/state/iptables.mangle"
+assert "MSS clamp covers the FORWARD path" grep -qxF 'FORWARD -o gre-de1 -p tcp --tcp-flags SYN,RST SYN -m comment --comment multi-gre-iran-de1-mss-fwd -j TCPMSS --set-mss 1436' "$R/state/iptables.mangle"
 # idempotent re-run
 cp "$R/state/iptables.nat" "$R/state/nat.before"
 gre --apply

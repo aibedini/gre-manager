@@ -89,6 +89,29 @@
             </div>
           </div>
           <div id="connections-body"></div>
+
+          <!-- MTU drill-down for one connection. The journal summary is on every table
+               row; this panel is the LIVE, per-side view, so the header names exactly
+               what each side reports. -->
+          <div id="connections-mtu" class="conn-mtu hidden">
+            <div class="conn-mtu-head">
+              <h3 id="conn-mtu-title">MTU analysis</h3>
+              <div class="spacer" style="flex:1"></div>
+              <button class="btn btn-ghost btn-sm" id="btn-conn-mtu-close">Close</button>
+            </div>
+            <div class="conn-table-wrap">
+              <table class="conn-table conn-mtu-table">
+                <thead><tr>
+                  <th>Side</th><th>Server</th><th>NIC MTU</th><th>GRE MTU</th><th>Underlay PMTU</th>
+                  <th>GRE Overhead</th><th>Recommended MTU</th><th>TCP MSS Clamp</th><th>Latest MTU Test</th>
+                  <th>Last Successful Verification</th><th>Drift</th>
+                </tr></thead>
+                <tbody id="conn-mtu-body"><tr><td colspan="11" class="muted">No analysis yet.</td></tr></tbody>
+              </table>
+            </div>
+            <div id="conn-mtu-verdict" class="conn-mtu-verdict"></div>
+            <div id="conn-mtu-checks" class="conn-mtu-checks"></div>
+          </div>
         </section>
 
         <section id="page-log" class="page hidden">

@@ -34,6 +34,104 @@ function connectionStateBadge(value) {
   }
 }
 
+// ----------------------------------------------------------------- MTU columns
+//
+// Two sources on purpose. The list endpoint already carries a JOURNAL-ONLY MTU summary,
+// so every row shows what the Hub last knew without an SSH round trip per row. Live
+// diagnostics land in state.connMtu once the operator asks for them. A value that only
+// exists in the journal is rendered muted with a title, never presented as verified.
+
+function mtuState() {
+  if (!state.connMtu) state.connMtu = {};
+  if (!state.connMtuBusy) state.connMtuBusy = {};
+  if (!state.connMtuError) state.connMtuError = {};
+  return state.connMtu;
+}
+
+const MTU_TEST_CLASS = {
+  SUCCEEDED: 'green', ROLLED_BACK: 'yellow', ROLLBACK_FAILED: 'red', INTERRUPTED: 'red', REJECTED: 'gray', RUNNING: 'blue',
+};
+
+const mtuText = (value) => (value === null || value === undefined || value === '' ? '—' : String(value));
+
+// Journal-only values are styled as unverified so a stale number never reads like a
+// live measurement.
+function mtuCell(value, live, title = '') {
+  const known = value !== null && value !== undefined && value !== '';
+  const cls = known ? (live ? 'conn-mtu-live' : 'muted') : 'muted';
+  const tip = title || (known && !live ? 'the last value the Hub recorded, not a live reading' : '');
+  return `<span class="${cls}"${tip ? ` title="${esc(tip)}"` : ''}>${esc(known ? String(value) : '—')}</span>`;
+}
+
+function mtuDriftBadge(drift, extra = '') {
+  if (!drift) return '<span class="muted">—</span>';
+  const reasons = (drift.reasons || []).join('; ');
+  if (!drift.detected) return '<span class="badge green" title="the two sides and the stored configuration agree">in sync</span>';
+  return `<span class="badge red" title="${esc(reasons || extra)}">DRIFT</span>`;
+}
+
+function mtuTestBadge(last) {
+  if (!last) return '<span class="muted">—</span>';
+  const cls = MTU_TEST_CLASS[last.status] || 'gray';
+  const when = last.at ? timeAgo(last.at) : '';
+  return `<span class="badge ${cls}" title="${esc(`${last.status}${last.stage ? ` at ${last.stage}` : ''} ${last.detail || ''}`.trim())}">${esc(last.status)}</span>`
+    + (when ? `<div class="muted conn-mtu-when">${esc(when)}</div>` : '');
+}
+
+// Merge the journal summary and the live diagnostics into the one shape the table and
+// the detail panel both read.
+function mtuRowView(c) {
+  const live = mtuState()[c.id] || null;
+  const stored = c.mtu || {};
+  const rec = live && live.recommendation ? live.recommendation : null;
+  const side = (name) => (rec && rec.sides && rec.sides[name]) || {};
+  const iran = side('iran');
+  const foreign = side('foreign');
+  return {
+    live,
+    stored,
+    rec,
+    error: state.connMtuError[c.id] || null,
+    busy: !!state.connMtuBusy[c.id],
+    iranNic: iran.ok ? iran.nic_mtu : null,
+    foreignNic: foreign.ok ? foreign.nic_mtu : null,
+    iranGre: iran.ok ? iran.gre_mtu : stored.iran_gre_mtu,
+    foreignGre: foreign.ok ? foreign.gre_mtu : stored.foreign_gre_mtu,
+    underlay: rec ? rec.underlay_mtu : stored.underlay_mtu,
+    overhead: rec ? rec.encapsulation_overhead : stored.encapsulation_overhead,
+    recommended: rec ? rec.recommended_gre_mtu : stored.recommended_gre_mtu,
+    mss: iran.ok ? (iran.mss_clamp && iran.mss_clamp.enabled ? 'on' : 'off') : stored.mss_clamp,
+    usingStored: !live,
+    drift: live ? live.combined.drift : stored.drift,
+    lastTest: stored.last_test || null,
+    lastVerified: stored.last_verified_at || null,
+  };
+}
+
+function connectionById(id) {
+  return (state.connections || []).find((x) => Number(x.id) === Number(id)) || null;
+}
+
+// Load the LIVE diagnostics for one connection. Read-only on the server side, so it is
+// safe to call while an operator is still deciding.
+async function analyzeMtu(id, { silent = false } = {}) {
+  mtuState();
+  state.connMtuBusy[id] = true;
+  if (!silent) renderConnections();
+  try {
+    state.connMtu[id] = await api(`/api/gre-connections/${id}/mtu`);
+    delete state.connMtuError[id];
+    return state.connMtu[id];
+  } catch (err) {
+    state.connMtuError[id] = err.message;
+    if (!silent) toast(`MTU analysis failed: ${err.message}`, true);
+    return null;
+  } finally {
+    state.connMtuBusy[id] = false;
+    renderConnections();
+  }
+}
+
 function renderConnections() {
   const wrap = $('#connections-body');
   if (!wrap) return;
@@ -54,7 +152,10 @@ function renderConnections() {
     return;
   }
 
-  const body = rows.map((c) => `
+  const body = rows.map((c) => {
+    const m = mtuRowView(c);
+    const live = !m.usingStored;
+    return `
     <tr data-id="${c.id}" class="conn-row${c.busy ? ' busy' : ''}">
       <td>
         <div class="conn-name">${esc(c.name || '—')}${c.busy ? ' <span class="badge yellow">BUSY</span>' : ''}</div>
@@ -70,11 +171,29 @@ function renderConnections() {
       <td>${connectionStateBadge(c.iran_state)}</td>
       <td>${connectionStateBadge(c.foreign_state)}</td>
       <td class="muted">${c.last_verified_at ? esc(timeAgo(c.last_verified_at)) : 'never'}</td>
-      <td class="conn-actions">
+      <td>${mtuCell(m.iranNic, live)}</td>
+      <td>${mtuCell(m.foreignNic, live)}</td>
+      <td>${mtuCell(m.iranGre, live)}</td>
+      <td>${mtuCell(m.foreignGre, live)}</td>
+      <td>${mtuCell(m.underlay, live, live ? 'verified underlay path capacity' : 'no live probe yet')}</td>
+      <td>${mtuCell(m.overhead, live)}</td>
+      <td>${mtuCell(m.recommended, live)}</td>
+      <td>${esc(mtuText(m.mss))}${m.busy ? ' <span class="badge blue">…</span>' : ''}</td>
+      <td>${mtuTestBadge(m.lastTest)}</td>
+      <td class="muted">${m.lastVerified ? esc(timeAgo(m.lastVerified)) : 'never'}</td>
+      <td>${mtuDriftBadge(m.drift, m.error || '')}</td>
+      <td class="conn-actions conn-mtu-actions">
+        <button class="btn btn-ghost btn-sm btn-mtu-analyze" data-id="${c.id}">Analyze MTU</button>
+        <button class="btn btn-ghost btn-sm btn-mtu-details" data-id="${c.id}">View Detailed Results</button>
+        <button class="btn btn-ghost btn-sm btn-mtu-recommend" data-id="${c.id}">Recommend MTU</button>
+        <button class="btn btn-ghost btn-sm btn-mtu-apply" data-id="${c.id}">Apply MTU</button>
+        <button class="btn btn-ghost btn-sm btn-mtu-restore" data-id="${c.id}">Restore Previous MTU</button>
+        <button class="btn btn-ghost btn-sm btn-mtu-nic" data-id="${c.id}">Advanced NIC Settings</button>
         <button class="btn btn-ghost btn-sm btn-conn-edit" data-id="${c.id}">Edit</button>
         <button class="btn btn-ghost btn-sm btn-conn-timeline" data-id="${c.id}">Timeline</button>
       </td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
 
   wrap.innerHTML = `
     <div class="conn-table-wrap">
@@ -82,9 +201,21 @@ function renderConnections() {
         <thead><tr>
           <th>Name</th><th>Iran Server</th><th>Foreign Server</th><th>Tunnel</th>
           <th>Subnet</th><th>Key</th><th>TCP</th><th>UDP</th>
-          <th>Iran State</th><th>Foreign State</th><th>Last Verified</th><th></th>
+          <th>Iran State</th><th>Foreign State</th><th>Last Verified</th>
+          <th title="Iran NIC MTU">Iran NIC MTU</th>
+          <th title="Foreign NIC MTU">Foreign NIC MTU</th>
+          <th title="Iran GRE MTU">Iran GRE MTU</th>
+          <th title="Foreign GRE MTU">Foreign GRE MTU</th>
+          <th title="Verified underlay PMTU">Underlay PMTU</th>
+          <th title="Estimated GRE overhead">GRE Overhead</th>
+          <th title="Recommended MTU">Recommended</th>
+          <th title="TCP MSS clamp status">TCP MSS Clamp</th>
+          <th title="Latest MTU test result">Latest MTU Test</th>
+          <th title="Last successful MTU verification">MTU Verified</th>
+          <th title="Drift between the two sides or the stored configuration">MTU Drift</th>
+          <th></th>
         </tr></thead>
-        <tbody>${body || '<tr><td colspan="12" class="muted" style="padding:14px">No connection matches that filter.</td></tr>'}</tbody>
+        <tbody>${body || '<tr><td colspan="23" class="muted" style="padding:14px">No connection matches that filter.</td></tr>'}</tbody>
       </table>
     </div>`;
 
@@ -93,6 +224,24 @@ function renderConnections() {
   });
   $$('.btn-conn-timeline', wrap).forEach((btn) => {
     btn.addEventListener('click', () => openConnectionTimeline(Number(btn.dataset.id)));
+  });
+  $$('.btn-mtu-analyze', wrap).forEach((btn) => {
+    btn.addEventListener('click', () => analyzeMtu(Number(btn.dataset.id)).then(() => toast('MTU diagnostics read from both sides')));
+  });
+  $$('.btn-mtu-details', wrap).forEach((btn) => {
+    btn.addEventListener('click', () => openMtuDetails(Number(btn.dataset.id)));
+  });
+  $$('.btn-mtu-recommend', wrap).forEach((btn) => {
+    btn.addEventListener('click', () => openMtuRecommend(Number(btn.dataset.id)));
+  });
+  $$('.btn-mtu-apply', wrap).forEach((btn) => {
+    btn.addEventListener('click', () => openMtuApply(Number(btn.dataset.id)));
+  });
+  $$('.btn-mtu-restore', wrap).forEach((btn) => {
+    btn.addEventListener('click', () => openMtuRestore(Number(btn.dataset.id)));
+  });
+  $$('.btn-mtu-nic', wrap).forEach((btn) => {
+    btn.addEventListener('click', () => openMtuNic(Number(btn.dataset.id)));
   });
 }
 
@@ -343,5 +492,357 @@ async function openConnectionTimeline(id, live = false) {
   await tick();
 }
 
+// ------------------------------------------------------------------ MTU actions
+
+function mtuProbeText(probe) {
+  if (!probe) return '—';
+  if (probe.state !== 'PASS') return probe.state;
+  return probe.max_ok === null || probe.max_ok === undefined ? 'PASS' : `PASS ${probe.max_ok} B`;
+}
+
+function mtuConfidenceBadge(confidence) {
+  const cls = confidence === 'high' ? 'green' : confidence === 'medium' ? 'yellow' : confidence === 'low' ? 'yellow' : 'gray';
+  return `<span class="badge ${cls}">${esc(String(confidence || 'unknown').toUpperCase())} confidence</span>`;
+}
+
+// "View Detailed Results": the per-side breakdown, rendered into the panel the
+// Connections page owns so the numbers stay on the page they belong to.
+async function openMtuDetails(id) {
+  const c = connectionById(id);
+  if (!c) { toast('that connection is no longer loaded; refresh first', true); return; }
+  const host = $('#connections-mtu');
+  const tbody = $('#conn-mtu-body');
+  if (!host || !tbody) { openMtuDetailsModal(c); return; }
+  host.classList.remove('hidden');
+  $('#conn-mtu-title').textContent = `MTU analysis — ${c.name}`;
+  tbody.innerHTML = '<tr><td colspan="11" class="muted">Reading both sides…</td></tr>';
+  const diag = await analyzeMtu(id, { silent: true });
+  if (!diag) {
+    tbody.innerHTML = `<tr><td colspan="11" class="muted">${esc(state.connMtuError[id] || 'the analysis failed')}</td></tr>`;
+    return;
+  }
+  renderMtuDetail(c, diag, tbody, $('#conn-mtu-verdict'), $('#conn-mtu-checks'));
+}
+
+function mtuDetailRow(key, c, diag) {
+  const rec = (diag && diag.recommendation) || {};
+  const view = (rec.sides && rec.sides[key]) || {};
+  const stored = c.mtu || {};
+  const greMtu = view.ok ? view.gre_mtu : (key === 'iran' ? stored.iran_gre_mtu : stored.foreign_gre_mtu);
+  const mss = view.ok ? (view.mss_clamp && view.mss_clamp.enabled ? 'on' : 'off') : stored.mss_clamp;
+  const outer = view.outer_probe;
+  const inner = view.inner_probe;
+  const probe = outer && outer.state === 'PASS'
+    ? mtuProbeText(outer)
+    : `${mtuProbeText(outer)}<div class="muted conn-mtu-when">inner ${esc(mtuProbeText(inner))}</div>`;
+  return `<tr>
+    <td>${esc(view.label || key)}${view.ok ? '' : ' <span class="badge red">UNREADABLE</span>'}${view.error ? `<div class="muted conn-mtu-when">${esc(view.error)}</div>` : ''}</td>
+    <td>${esc(view.server || '—')}</td>
+    <td>${esc(mtuText(view.ok ? view.nic_mtu : null))}</td>
+    <td>${esc(mtuText(greMtu))}</td>
+    <td>${probe}</td>
+    <td>${esc(mtuText(view.overhead))}</td>
+    <td>${esc(mtuText(rec.recommended_gre_mtu))}</td>
+    <td>${esc(mtuText(mss))}</td>
+    <td>${mtuTestBadge(stored.last_test)}</td>
+    <td class="muted">${stored.last_verified_at ? esc(timeAgo(stored.last_verified_at)) : 'never'}</td>
+    <td>${mtuDriftBadge(diag && diag.combined && diag.combined.drift)}</td>
+  </tr>`;
+}
+
+function mtuVerdictHtml(diag) {
+  const rec = (diag && diag.recommendation) || {};
+  return `
+    <div class="mtu-verdict-line">
+      ${mtuConfidenceBadge(rec.confidence)}
+      <span>Recommended MTU: <strong>${esc(mtuText(rec.recommended_gre_mtu))}</strong>${rec.recommended_gre_mtu ? ' B' : ''}</span>
+      <span>Underlay PMTU: <strong>${esc(mtuText(rec.underlay_mtu))}</strong>${rec.underlay_mtu ? ' B' : ''}</span>
+      <span>Overhead: <strong>${esc(mtuText(rec.encapsulation_overhead))}</strong>${rec.encapsulation_overhead ? ' B' : ''}</span>
+      ${rec.asymmetric ? '<span class="badge yellow" title="the two underlay paths disagree">ASYMMETRIC</span>' : ''}
+    </div>
+    <div class="muted">${esc(rec.reason || '')}</div>
+    <div class="${rec.safe_to_apply ? 'muted' : 'mtu-not-safe'}">${rec.safe_to_apply
+      ? 'Safe to apply: both ends can be verified after the change.'
+      : 'Not safe to apply: the evidence is inconclusive, so the Hub refuses to change the MTU.'}</div>`;
+}
+
+function mtuChecksHtml(key, label, diag) {
+  const data = (diag && diag[key] && diag[key].data) || {};
+  const list = Array.isArray(data.checks) ? data.checks : [];
+  return `<div class="mtu-check-col">
+    <h4>${esc(label)} checks</h4>
+    ${list.length
+      ? `<ul class="preflight-list">${list.map((ch) => `<li class="${ch.status === 'PASS' ? 'ok' : ch.status === 'FAIL' ? 'bad' : ''}">${esc(`${ch.status} ${ch.id}`)} <span class="muted">${esc(ch.detail || '')}</span></li>`).join('')}</ul>`
+      : '<div class="muted">no checks reported</div>'}
+  </div>`;
+}
+
+function renderMtuDetail(c, diag, tbody, verdictEl, checksEl) {
+  tbody.innerHTML = mtuDetailRow('iran', c, diag) + mtuDetailRow('foreign', c, diag);
+  if (verdictEl) verdictEl.innerHTML = mtuVerdictHtml(diag);
+  if (checksEl) checksEl.innerHTML = `<div class="mtu-check-grid">${mtuChecksHtml('iran', 'Iran', diag)}${mtuChecksHtml('foreign', 'Foreign', diag)}</div>`;
+}
+
+// Fallback for a page that does not carry the MTU panel.
+async function openMtuDetailsModal(c) {
+  openModal(`<h2>MTU analysis — ${esc(c.name)}</h2><p class="sub">Reading both sides…</p>`);
+  const diag = await analyzeMtu(c.id, { silent: true });
+  if (!diag) {
+    openModal(`<h2>MTU analysis — ${esc(c.name)}</h2>
+      <div class="form-error">${esc(state.connMtuError[c.id] || 'the analysis failed')}</div>
+      <div class="foot"><button type="button" class="btn modal-cancel">Close</button></div>`);
+    return;
+  }
+  const rec = (diag && diag.recommendation) || {};
+  const view = (key) => (rec.sides && rec.sides[key]) || {};
+  openModal(`
+    <h2>MTU analysis — ${esc(c.name)}</h2>
+    <p class="sub">What each side reports, and what the Hub recommends.</p>
+    <div class="review-grid">
+      <table class="review-table">
+        <thead><tr><th>Side</th><th>NIC MTU</th><th>GRE MTU</th><th>Underlay probe</th><th>Inner probe</th><th>Overhead</th><th>MSS clamp</th></tr></thead>
+        <tbody>${['iran', 'foreign'].map((k) => {
+          const v = view(k);
+          return `<tr>
+            <td>${esc(v.label || k)}${v.ok ? '' : ' <span class="badge red">UNREADABLE</span>'}</td>
+            <td>${esc(mtuText(v.nic_mtu))}</td>
+            <td>${esc(mtuText(v.gre_mtu))}</td>
+            <td>${esc(mtuProbeText(v.outer_probe))}</td>
+            <td>${esc(mtuProbeText(v.inner_probe))}</td>
+            <td>${esc(mtuText(v.overhead))}</td>
+            <td>${esc(v.mss_clamp && v.mss_clamp.enabled ? 'on' : 'off')}</td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>
+    </div>
+    <div class="mtu-verdict">${mtuVerdictHtml(diag)}</div>
+    <div class="foot"><button type="button" class="btn modal-cancel">Close</button></div>`, { wide: true });
+}
+
+async function openMtuRecommend(id) {
+  const c = connectionById(id);
+  if (!c) { toast('that connection is no longer loaded; refresh first', true); return; }
+  openModal(`<h2>Recommend MTU — ${esc(c.name)}</h2><p class="sub">Reading both sides…</p>`);
+  const diag = await analyzeMtu(id, { silent: true });
+  if (!diag) {
+    openModal(`<h2>Recommend MTU — ${esc(c.name)}</h2>
+      <div class="form-error">${esc(state.connMtuError[id] || 'the analysis failed')}</div>
+      <div class="foot"><button type="button" class="btn modal-cancel">Close</button></div>`);
+    return;
+  }
+  const rec = diag.recommendation || {};
+  const sideRows = ['iran', 'foreign'].map((k) => {
+    const v = (rec.sides && rec.sides[k]) || {};
+    return `<tr>
+      <td>${esc(v.label || k)}</td>
+      <td>${esc(mtuText(v.nic_mtu))}</td>
+      <td>${esc(v.capacity === null || v.capacity === undefined ? '—' : `${v.capacity} B`)}</td>
+      <td>${esc(v.capacity_source || '—')}</td>
+      <td>${esc(v.measured ? 'measured' : 'not measured')}</td>
+    </tr>`;
+  }).join('');
+
+  openModal(`
+    <h2>Recommend MTU — ${esc(c.name)}</h2>
+    <p class="sub">Sized from the LOWER of the two verified underlay paths, never an average.</p>
+    <div class="mtu-verdict">${mtuVerdictHtml(diag)}</div>
+    <div class="review-grid">
+      <table class="review-table">
+        <thead><tr><th>Side</th><th>NIC MTU</th><th>Path capacity</th><th>Evidence</th><th>Probe</th></tr></thead>
+        <tbody>${sideRows}</tbody>
+      </table>
+    </div>
+    <div class="section"><h3>Why this value</h3><div class="output-pane">${esc(rec.reason || '')}${rec.margin_reason ? `\n${esc(rec.margin_reason)}` : ''}</div></div>
+    <div class="foot">
+      <button type="button" class="btn btn-ghost modal-cancel">Close</button>
+      <button class="btn" id="mtu-recommend-apply" ${rec.safe_to_apply && rec.recommended_gre_mtu ? '' : 'disabled'}>Apply ${esc(mtuText(rec.recommended_gre_mtu))}${rec.recommended_gre_mtu ? ' B' : ''}</button>
+    </div>`);
+
+  const btn = $('#mtu-recommend-apply');
+  if (btn && rec.safe_to_apply && rec.recommended_gre_mtu) {
+    btn.addEventListener('click', () => { closeModal(); openMtuApply(id, rec.recommended_gre_mtu); });
+  }
+}
+
+// The confirmation screen. Every fact an operator needs BEFORE the click is on it:
+// both current values, the recommendation, what will change, the estimated risk, the
+// verification checks that will run, and the conditions under which the Hub rolls back.
+async function openMtuApply(id, presetTarget = null) {
+  const c = connectionById(id);
+  if (!c) { toast('that connection is no longer loaded; refresh first', true); return; }
+  openModal(`<h2>Apply MTU — ${esc(c.name)}</h2><p class="sub">Reading both sides…</p>`);
+  const diag = await analyzeMtu(id, { silent: true });
+  const rec = diag ? (diag.recommendation || {}) : {};
+  const preset = presetTarget === null || presetTarget === undefined ? rec.recommended_gre_mtu : presetTarget;
+  const plan = diag
+    ? await api(`/api/gre-connections/${id}/mtu/plan`, { method: 'POST', body: { mtu: preset || 0 } }).catch(() => null)
+    : null;
+
+  if (!plan) {
+    openModal(`<h2>Apply MTU — ${esc(c.name)}</h2>
+      <div class="form-error">${esc(state.connMtuError[id] || 'the diagnostics could not be read, so no plan can be shown')}</div>
+      <div class="foot"><button type="button" class="btn modal-cancel">Close</button></div>`);
+    return;
+  }
+
+  const riskClass = plan.risk.level === 'high' ? 'bad' : plan.risk.level === 'medium' ? '' : 'ok';
+  openModal(`
+    <h2>Apply MTU — ${esc(c.name)}</h2>
+    <p class="sub">This changes the interface MTU only. The GRE interface is NOT recreated, so the peer, key, addressing and rules stay as they are.</p>
+
+    <div class="review-grid">
+      <table class="review-table">
+        <thead><tr><th>Field</th><th>Current</th><th>New</th></tr></thead>
+        <tbody>
+          <tr><td>Current Iran GRE MTU</td><td>${esc(mtuText(plan.current.iran))}</td><td>${esc(mtuText(plan.target))}</td></tr>
+          <tr><td>Current Foreign GRE MTU</td><td>${esc(mtuText(plan.current.foreign))}</td><td>${esc(mtuText(plan.target))}</td></tr>
+          <tr><td>Recommended MTU</td><td colspan="2">${esc(mtuText(plan.recommended_mtu))}${plan.recommended_mtu ? ' B' : ''} — ${mtuConfidenceBadge(plan.confidence)}</td></tr>
+          <tr><td>Underlay PMTU / overhead</td><td colspan="2">${esc(mtuText(plan.underlay_mtu))} B − ${esc(mtuText(plan.encapsulation_overhead))} B</td></tr>
+          <tr><td>Minimum legal MTU</td><td colspan="2">${esc(mtuText(plan.min_legal_mtu))} B</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section"><h3>What will change</h3><ul class="impact-list">${(plan.what_changes || []).map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>
+    <div class="section"><h3>Estimated risk — ${esc(plan.risk.level)}</h3><ul class="impact-list">${(plan.risk.reasons || []).map((x) => `<li class="${riskClass}">${esc(x)}</li>`).join('')}</ul></div>
+    <div class="section"><h3>Verification checks</h3><ul class="preflight-list">${(plan.verification_checks || []).map((x) => `<li class="ok">${esc(x.description || x.id)}</li>`).join('')}</ul></div>
+    <div class="section"><h3>Rollback conditions</h3><ul class="impact-list">${(plan.rollback_conditions || []).map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>
+
+    <div class="field"><label for="mtu-target">MTU to apply</label><input id="mtu-target" inputmode="numeric" value="${esc(plan.target === null ? '' : String(plan.target))}" /></div>
+    <div class="form-error" id="mtu-error">${plan.can_apply ? '' : esc(plan.blocked_reason || 'this change cannot be applied')}</div>
+    <div class="foot">
+      <button type="button" class="btn btn-ghost modal-cancel">Cancel</button>
+      <button class="btn" id="mtu-confirm">I understand — apply the MTU change</button>
+    </div>`);
+
+  const confirm = $('#mtu-confirm');
+  if (!confirm) return;
+  confirm.addEventListener('click', async () => {
+    const err = $('#mtu-error');
+    const target = Number($('#mtu-target').value);
+    err.textContent = '';
+    if (!Number.isInteger(target)) { err.textContent = 'the MTU must be a whole number'; return; }
+    confirm.disabled = true;
+    confirm.textContent = 'Applying…';
+    closeModal();
+    openConnectionTimeline(c.id, true);
+    try {
+      const result = await api(`/api/gre-connections/${c.id}/mtu`, { method: 'PUT', body: { mtu: target, confirm: true } });
+      toast(`MTU ${target} applied to both sides and verified (reachability ${result.connectivity.state})`);
+      await loadConnections();
+      await analyzeMtu(c.id, { silent: true });
+    } catch (e) {
+      // A failed or rolled-back change must say which, and how to recover.
+      if (e.data && e.data.rollback === 'FAILED' && e.data.manual_recovery) {
+        openManualRecovery({ error: e.message, manual_recovery: e.data.manual_recovery });
+      } else {
+        toast(`${e.message}${e.data && e.data.rollback === 'CLEAN' ? ' (the previous MTU was restored)' : ''}`, true);
+      }
+      await loadConnections();
+    }
+  });
+}
+
+async function openMtuRestore(id) {
+  const c = connectionById(id);
+  if (!c) { toast('that connection is no longer loaded; refresh first', true); return; }
+  openModal(`<h2>Restore previous MTU — ${esc(c.name)}</h2><p class="sub">Loading the MTU operations…</p>`);
+  const detail = await api(`/api/gre-connections/${id}`).catch(() => null);
+  const ops = ((detail && detail.recent_operations) || []).filter((o) => o.kind === 'MTU_CHANGE');
+  const rows = ops.map((o) => {
+    const canRestore = ['SUCCEEDED', 'ROLLBACK_FAILED', 'INTERRUPTED'].includes(o.status);
+    return `<tr>
+      <td>${esc(timeAgo(o.created_at))}</td>
+      <td><span class="badge ${MTU_TEST_CLASS[o.status] || 'gray'}">${esc(o.status)}</span></td>
+      <td class="muted">${esc(o.current_stage || '')}</td>
+      <td class="muted">${esc(String(o.operation_id).slice(0, 8))}…</td>
+      <td><button class="btn btn-ghost btn-sm mtu-restore-op" data-op="${esc(o.operation_id)}" ${canRestore ? '' : 'disabled'}>Restore Previous MTU</button></td>
+    </tr>`;
+  }).join('');
+
+  openModal(`
+    <h2>Restore previous MTU — ${esc(c.name)}</h2>
+    <p class="sub">A restore re-applies the MTU that operation recorded before it changed anything, through the same verified transaction.</p>
+    ${ops.length
+      ? `<div class="review-grid"><table class="review-table">
+           <thead><tr><th>When</th><th>Status</th><th>Stage</th><th>Operation</th><th></th></tr></thead>
+           <tbody>${rows}</tbody>
+         </table></div>`
+      : '<div class="empty">No MTU operation has been run on this connection yet.</div>'}
+    <div class="form-error" id="mtu-restore-error"></div>
+    <div class="foot"><button type="button" class="btn modal-cancel">Close</button></div>`);
+
+  $$('.mtu-restore-op').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const err = $('#mtu-restore-error');
+      err.textContent = '';
+      btn.disabled = true;
+      btn.textContent = 'Restoring…';
+      try {
+        const result = await api(`/api/gre-connections/${c.id}/mtu/restore`, { method: 'POST', body: { operation_id: btn.dataset.op } });
+        closeModal();
+        toast(`Previous MTU restored (${result.applied.iran_mtu} / ${result.applied.foreign_mtu} B) and verified`);
+        await loadConnections();
+        await analyzeMtu(c.id, { silent: true });
+      } catch (e) {
+        if (e.data && e.data.rollback === 'FAILED' && e.data.manual_recovery) {
+          openManualRecovery({ error: e.message, manual_recovery: e.data.manual_recovery });
+        } else {
+          err.textContent = e.message;
+        }
+        btn.disabled = false;
+        btn.textContent = 'Restore Previous MTU';
+      }
+    });
+  });
+}
+
+// Advanced NIC Settings: the read-only WAN NIC risk analysis for both sides.
+async function openMtuNic(id) {
+  const c = connectionById(id);
+  if (!c) { toast('that connection is no longer loaded; refresh first', true); return; }
+  openModal(`<h2>Advanced NIC settings — ${esc(c.name)}</h2><p class="sub">Reading the WAN interfaces on both sides…</p>`);
+  let data;
+  try {
+    data = await api(`/api/gre-connections/${id}/mtu/nic`);
+  } catch (err) {
+    openModal(`<h2>Advanced NIC settings — ${esc(c.name)}</h2>
+      <div class="form-error">${esc(err.message)}</div>
+      <div class="foot"><button type="button" class="btn modal-cancel">Close</button></div>`);
+    return;
+  }
+  const side = (key, label) => {
+    const s = data[key] || {};
+    const d = s.data || {};
+    const nics = Array.isArray(d.nics) ? d.nics : [];
+    const checks = Array.isArray(d.checks) ? d.checks : [];
+    const risk = (data.combined && data.combined.risk_by_side && data.combined.risk_by_side[key]) || (d.risk || null);
+    return `<div class="section">
+      <h3>${esc(label)} — ${s.ok ? `<span class="badge ${risk === 'high' ? 'red' : risk === 'medium' ? 'yellow' : 'green'}">${esc(String(risk || 'unknown').toUpperCase())} RISK</span>` : '<span class="badge red">UNREADABLE</span>'}</h3>
+      ${s.ok ? '' : `<div class="form-error">${esc(s.error || 'could not be read')}</div>`}
+      ${nics.length ? `<table class="review-table"><thead><tr><th>Interface</th><th>Role</th><th>MTU</th><th>Up</th><th>Risk</th><th>Notes</th></tr></thead>
+        <tbody>${nics.map((n) => `<tr><td>${esc(n.iface || '—')}</td><td>${esc(n.role || (n.wan ? 'wan' : '—'))}</td><td>${esc(mtuText(n.mtu))}</td><td>${n.up === false ? 'no' : 'yes'}</td><td>${esc(String(n.risk || '—'))}</td><td class="muted">${esc((n.notes || []).join('; '))}</td></tr>`).join('')}</tbody></table>` : '<div class="muted">no NIC data reported</div>'}
+      ${checks.length ? `<ul class="preflight-list">${checks.map((ch) => `<li class="${ch.status === 'PASS' ? 'ok' : ch.status === 'FAIL' ? 'bad' : ''}">${esc(`${ch.status} ${ch.id}`)} <span class="muted">${esc(ch.detail || '')}</span></li>`).join('')}</ul>` : ''}
+    </div>`;
+  };
+  openModal(`
+    <h2>Advanced NIC settings — ${esc(c.name)}</h2>
+    <p class="sub">Read-only WAN NIC analysis. Nothing here changes an interface; the Hub only reads what the CLI reports.</p>
+    <div class="mtu-verdict-line"><span>Overall WAN risk: <strong>${esc(String((data.combined && data.combined.overall_risk) || 'unknown').toUpperCase())}</strong></span></div>
+    ${side('iran', 'Iran')}
+    ${side('foreign', 'Foreign')}
+    <div class="foot"><button type="button" class="btn modal-cancel">Close</button></div>`, { wide: true });
+}
+
+// The Connections page owns the MTU drill-down panel, so its close control is bound
+// here rather than left to the page shell.
+const mtuPanelClose = document.getElementById('btn-conn-mtu-close');
+if (mtuPanelClose) {
+  mtuPanelClose.addEventListener('click', () => {
+    const panel = document.getElementById('connections-mtu');
+    if (panel) panel.classList.add('hidden');
+  });
+}
+
 // The page controls in app.js reach the renderer through this namespace.
-window.ConnectionsUI = { load: loadConnections, render: renderConnections };
+window.ConnectionsUI = { load: loadConnections, render: renderConnections, analyzeMtu, openMtuDetails };

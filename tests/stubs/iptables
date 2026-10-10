@@ -16,9 +16,41 @@ op="${args[0]:-}"
 rule="${args[*]:1}"
 
 case "$op" in
-  -C) grep -qxF "$rule" "$f" ;;
+  -C)
+    # A comment given as a pattern must match for -C too, not just for -D: the manager's
+    # ipt_del loops on `-C` before deleting, so a -C that only compared exactly would
+    # make a pattern delete unreachable. Anything without a trailing '*' in the comment
+    # stays an exact comparison.
+    if [[ "$rule" == *'--comment '*\** ]]; then
+      pat="${rule%%\**}"
+      while IFS= read -r l; do
+        [[ "$l" == "$pat"* ]] && exit 0
+      done < "$f"
+      exit 1
+    fi
+    grep -qxF "$rule" "$f" ;;
   -A) grep -qxF "$rule" "$f" || echo "$rule" >> "$f"; exit 0 ;;
   -D)
+    # Real iptables accepts an ownership comment as a PATTERN, which is how a rule whose
+    # other parameters change — a TCPMSS value that follows the tunnel MTU — is found and
+    # replaced. A pattern spec deletes every matching rule in one call, which is what
+    # keeps ipt_del's `while -C` loop from spinning.
+    if [[ "$rule" == *'--comment '*\** ]]; then
+      pat="${rule%%\**}"
+      removed=0
+      : > "$f.tmp"
+      while IFS= read -r l; do
+        [[ -z "$l" ]] && continue
+        if [[ "$l" == "$pat"* ]]; then
+          removed=1
+        else
+          printf '%s\n' "$l" >> "$f.tmp"
+        fi
+      done < "$f"
+      mv "$f.tmp" "$f"
+      [[ "$removed" == "1" ]] && exit 0
+      exit 1
+    fi
     if grep -qxF "$rule" "$f"; then
       grep -vxF "$rule" "$f" > "$f.tmp" || true
       mv "$f.tmp" "$f"

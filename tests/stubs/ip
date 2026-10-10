@@ -65,17 +65,38 @@ case "$obj" in
           i=2
           for t in "$ST/tunnels"/*; do
             [[ -e "$t" ]] || continue
-            echo "$i: $(basename "$t"): <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1476"
+            _n="$(basename "$t")"
+            _m="$(cat "$ST/mtu.$_n" 2>/dev/null || echo 1476)"
+            echo "$i: $_n: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu $_m"
             i=$((i+1))
           done
           exit 0
         fi
         if [[ -n "${3:-}" ]]; then
-          [[ "$3" == "lo" || "$3" == "eth0" || -f "$ST/tunnels/$3" ]] && exit 0
+          if [[ "$3" == "lo" || "$3" == "eth0" || -f "$ST/tunnels/$3" ]]; then
+            # Report an MTU so code that reads the live interface MTU has something to
+            # read. `link set dev X mtu N` records it, which is what makes an MTU change
+            # observable to the next diagnostic (and lets a rollback be verified).
+            m="$(cat "$ST/mtu.$3" 2>/dev/null || echo 1476)"
+            echo "$3: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu $m state UNKNOWN mode DEFAULT"
+            exit 0
+          fi
           exit 1
         fi
         exit 0 ;;
-      set) exit 0 ;;
+      set)
+        # `ip link set dev IFACE mtu VALUE [up]` — the manager uses this for an
+        # MTU-only change that must not recreate the interface.
+        _dev=""; _mtu=""; _prev=""
+        for _a in "$@"; do
+          [[ "$_prev" == "dev" ]] && _dev="$_a"
+          [[ "$_prev" == "mtu" ]] && _mtu="$_a"
+          _prev="$_a"
+        done
+        if [[ -n "$_dev" && -n "$_mtu" ]]; then
+          echo "$_mtu" > "$ST/mtu.$_dev"
+        fi
+        exit 0 ;;
     esac ;;
   addr)
     case "$sub" in

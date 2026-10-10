@@ -83,7 +83,7 @@ TUN_MTU=1476
 
 # Fields allowed in a v2 peer conf (foreigns/<name>.conf); used by the
 # validate-then-source loader. Never add free-form fields without validating.
-PEER_CONF_FIELDS_RE='NAME|FOREIGN_IP|IRAN_IP|WAN_IF|SUBNET_BASE|IDX|KEY|TUN|TCP_PORTS|UDP_PORTS|MSS_CLAMP'
+PEER_CONF_FIELDS_RE='NAME|FOREIGN_IP|IRAN_IP|WAN_IF|SUBNET_BASE|IDX|KEY|TUN|TCP_PORTS|UDP_PORTS|MSS_CLAMP|MTU|NIC_MTU'
 OVERLAP_DESC=""   # filled by port_lists_overlap on success
 
 # ---------------------------------------------------------------- colors/log
@@ -383,13 +383,16 @@ EOF
 load_peer_conf() { # load_peer_conf FILE
     local f="$1"
     NAME=""; FOREIGN_IP=""; IRAN_IP=""; WAN_IF=""; SUBNET_BASE="$DEFAULT_SUBNET_BASE"
-    IDX=""; KEY=""; TUN=""; TCP_PORTS=""; UDP_PORTS=""; MSS_CLAMP="0"
+    IDX=""; KEY=""; TUN=""; TCP_PORTS=""; UDP_PORTS=""; MSS_CLAMP="0"; MTU=""; NIC_MTU=""
     if ! validate_conf_file "$f" "$PEER_CONF_FIELDS_RE"; then
         err "Invalid or unsafe peer config: $f (unknown field or unsafe value)"
         return 1
     fi
     source "$f"
     [[ -z "$TUN" && -n "$NAME" ]] && TUN="gre-$NAME"
+    # An absent MTU stays empty, meaning "no explicit override". It is never defaulted
+    # here, so a connection written before this feature keeps whatever MTU its
+    # interface already has instead of being silently moved onto a new value.
     validate_peer_values "quiet" || { err "Peer config $f contains invalid values."; return 1; }
     return 0
 }
@@ -398,6 +401,10 @@ load_peer_conf() { # load_peer_conf FILE
 # the status (caller prints one error), otherwise it explains the problem.
 validate_peer_values() { # validate_peer_values ["quiet"]
     local quiet="${1:-}" e=0
+    # MTU and NIC_MTU are optional fields introduced with the MTU feature. Callers that
+    # predate it do not declare them, so they are defaulted here rather than assumed to
+    # exist — under `set -u` an undeclared MTU would abort the whole command.
+    local MTU="${MTU:-}" NIC_MTU="${NIC_MTU:-}"
     valid_ip "$IRAN_IP"          || { [[ -z "$quiet" ]] && err "Invalid Iran IP: '$IRAN_IP'"; e=1; }
     valid_ip "$FOREIGN_IP"       || { [[ -z "$quiet" ]] && err "Invalid foreign IP: '$FOREIGN_IP'"; e=1; }
     valid_name "$NAME"           || { [[ -z "$quiet" ]] && err "Invalid peer name: '$NAME' (use 1-11 letters, digits, '_' or '-'; start with a letter or digit)"; e=1; }
@@ -410,6 +417,12 @@ validate_peer_values() { # validate_peer_values ["quiet"]
     valid_port_list "$UDP_PORTS" || { [[ -z "$quiet" ]] && err "Invalid UDP port list: '$UDP_PORTS'"; e=1; }
     [[ "$MSS_CLAMP" == "0" || "$MSS_CLAMP" == "1" ]] \
                                  || { [[ -z "$quiet" ]] && err "Invalid MSS_CLAMP: '$MSS_CLAMP' (0|1)"; e=1; }
+    # MTU is optional: an empty value means "this connection has no explicit override",
+    # which is how every configuration written before this feature keeps working.
+    [[ -z "$MTU" ]] || valid_mtu "$MTU" \
+                                 || { [[ -z "$quiet" ]] && err "Invalid MTU: '$MTU' (576-9000 for a GRE interface)"; e=1; }
+    [[ -z "$NIC_MTU" ]] || valid_mtu "$NIC_MTU" \
+                                 || { [[ -z "$quiet" ]] && err "Invalid NIC_MTU: '$NIC_MTU'"; e=1; }
     [[ -n "$TUN" && ${#TUN} -le 15 ]] \
                                  || { [[ -z "$quiet" ]] && err "Invalid tunnel name: '$TUN'"; e=1; }
     (( e == 0 ))
@@ -603,6 +616,8 @@ TUN=$TUN
 TCP_PORTS=$TCP_PORTS
 UDP_PORTS=$UDP_PORTS
 MSS_CLAMP=$MSS_CLAMP
+${MTU:+MTU=$MTU}
+${NIC_MTU:+NIC_MTU=$NIC_MTU}
 EOF
         chmod 600 "$tmp"
         mv "$tmp" "$peerf" || { err "Could not install $peerf"; rm -f "$tmp"; return 1; }
@@ -765,7 +780,7 @@ plan_is_tunnel_field() {
 
 plan_is_rule_field() {
     case "$1" in
-        TCP_PORTS|UDP_PORTS|MSS_CLAMP) return 0 ;;
+        TCP_PORTS|UDP_PORTS|MSS_CLAMP|MTU) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -789,6 +804,10 @@ plan_request_from_current() { # plan_request_from_current (uses EDIT_OLD_*)
     PLAN_REQ_TCP_PORTS="$EDIT_OLD_TCP"
     PLAN_REQ_UDP_PORTS="$EDIT_OLD_UDP"
     PLAN_REQ_MSS_CLAMP="${EDIT_OLD_MSS:-0}"
+    # An empty MTU means "no explicit override yet". Seeding it from the current
+    # effective MTU would silently rewrite every existing configuration the first time
+    # any unrelated field was edited, so an unset override stays unset.
+    PLAN_REQ_MTU="${EDIT_OLD_MTU:-}"
 }
 
 # Compare the requested state against the current one and classify the change.
@@ -803,7 +822,7 @@ plan_request_from_current() { # plan_request_from_current (uses EDIT_OLD_*)
 plan_edit() {
     plan_reset
     local field
-    for field in NAME FOREIGN_IP IRAN_IP WAN_IF SUBNET_BASE IDX KEY TUN TCP_PORTS UDP_PORTS MSS_CLAMP; do
+    for field in NAME FOREIGN_IP IRAN_IP WAN_IF SUBNET_BASE IDX KEY TUN TCP_PORTS UDP_PORTS MSS_CLAMP MTU; do
         local cur="" req=""
         case "$field" in
             NAME)        cur="$EDIT_OLD_NAME";        req="$PLAN_REQ_NAME" ;;
@@ -817,6 +836,7 @@ plan_edit() {
             TCP_PORTS)   cur="$EDIT_OLD_TCP";         req="$PLAN_REQ_TCP_PORTS" ;;
             UDP_PORTS)   cur="$EDIT_OLD_UDP";         req="$PLAN_REQ_UDP_PORTS" ;;
             MSS_CLAMP)   cur="${EDIT_OLD_MSS:-0}";    req="$PLAN_REQ_MSS_CLAMP" ;;
+            MTU)         cur="${EDIT_OLD_MTU:-}";     req="${PLAN_REQ_MTU:-}" ;;
         esac
         if [[ "$cur" != "$req" ]]; then
             plan_field_changed "$field"
@@ -854,6 +874,7 @@ plan_impact_lines() {
             TCP_PORTS) printf '%s\n' "NAT TCP rules will change" ;;
             UDP_PORTS) printf '%s\n' "NAT UDP rules will change" ;;
             MSS_CLAMP) printf '%s\n' "MSS clamping will change" ;;
+            MTU)       printf '%s\n' "Tunnel MTU will change in place (the interface is not rebuilt)" ;;
             IRAN_IP|FOREIGN_IP) printf '%s\n' "Endpoint addressing will change" ;;
             NAME)      printf '%s\n' "Connection renamed (config file, tunnel and rule comments)" ;;
             SUBNET_BASE|IDX) printf '%s\n' "Tunnel subnet will change" ;;
@@ -908,8 +929,22 @@ peer_rules_remove() { # peer_rules_remove NAME TUN IRAN_IP WAN_IF SELF_IP PEER_I
     fi
     ipt_del nat POSTROUTING -o "$TUN" -d "$PEER_IP" \
         -m comment --comment "multi-gre-iran-$NAME-snat" -j SNAT --to-source "$SELF_IP"
+    # The MSS rules are deleted by OWNERSHIP COMMENT rather than by full specification.
+    #
+    # The installed rule carries the MSS value inside its specification, and that value
+    # changes with the tunnel MTU. Deleting by exact spec would therefore miss the rule
+    # written for a previous MTU and leave two clamps on the same interface — the second
+    # one overriding the first with a value that no longer matches the tunnel. The
+    # comment already identifies the connection, and an MSS clamp is per-connection, so
+    # removing every rule this connection owns is both sufficient and complete.
+    local comment="multi-gre-iran-$NAME-mss"
     ipt_del mangle POSTROUTING -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
-        -m comment --comment "multi-gre-iran-$NAME-mss" -j TCPMSS --clamp-mss-to-pmtu
+        -m comment --comment "$comment*" -j TCPMSS
+    ipt_del mangle FORWARD -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
+        -m comment --comment "$comment-fwd*" -j TCPMSS
+    # Legacy forms: v1.0.0 wrote the rule with no comment at all, in POSTROUTING only.
+    ipt_del mangle POSTROUTING -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
+        -j TCPMSS --clamp-mss-to-pmtu
     return 0
 }
 
@@ -920,9 +955,10 @@ peer_rules_remove() { # peer_rules_remove NAME TUN IRAN_IP WAN_IF SELF_IP PEER_I
 # the decomposition as well invited a positional-parameter mistake ("$10" expands
 # as "$1" followed by "0"), and a silently shifted argument list here means rules
 # installed against the wrong peer address.
-peer_rules_install() { # peer_rules_install NAME TUN IRAN_IP WAN_IF SELF_IP PEER_IP TCP UDP MSS
+peer_rules_install() { # peer_rules_install NAME TUN IRAN_IP WAN_IF SELF_IP PEER_IP TCP UDP MSS [MTU]
     local NAME="$1" TUN="$2" IRAN_IP="$3" WAN_IF="$4" SELF_IP="$5" PEER_IP="$6" \
           TCP_PORTS="$7" UDP_PORTS="$8" MSS_CLAMP="$9"
+    local MTU="${10:-}"
 
     if [[ -n "$TCP_PORTS" ]]; then
         ipt_del nat PREROUTING -i "$WAN_IF" -d "$IRAN_IP" -p tcp -m multiport --dports "$TCP_PORTS" \
@@ -941,11 +977,59 @@ peer_rules_install() { # peer_rules_install NAME TUN IRAN_IP WAN_IF SELF_IP PEER
         ipt_add nat POSTROUTING -o "$TUN" -d "$PEER_IP" \
             -m comment --comment "multi-gre-iran-$NAME-snat" -j SNAT --to-source "$SELF_IP"
     fi
-    if [[ "${MSS_CLAMP:-0}" == "1" ]]; then
-        ipt_del mangle POSTROUTING -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
-            -j TCPMSS --clamp-mss-to-pmtu
-        ipt_add mangle POSTROUTING -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
-            -m comment --comment "multi-gre-iran-$NAME-mss" -j TCPMSS --clamp-mss-to-pmtu
+
+    # --- TCP MSS clamping
+    #
+    # This used to be `--clamp-mss-to-pmtu`. That target derives the MSS from the
+    # ROUTE's MTU, and for a packet leaving through a GRE tunnel the route is the
+    # underlay one, so it commonly computes an MSS for the underlay (e.g. 1460) rather
+    # than for the tunnel (e.g. 1436). The result is a SYN advertising an MSS the tunnel
+    # cannot carry, which is precisely the broken-PMTU stall the rule was meant to
+    # prevent. The tunnel's own MTU is known here, so the MSS is set EXPLICITLY from it.
+    #
+    # 40 = 20-byte IPv4 header + 20-byte TCP header.
+    #
+    # When no MTU was passed (a connection with no stored override, which is every
+    # connection created before this feature), the LIVE interface MTU is used instead of
+    # falling back to the unreliable pmtu-derived clamp. The interface is already up at
+    # this point, so its MTU is known even when the config has no explicit value.
+    local eff_mtu="$MTU"
+    [[ -n "$eff_mtu" ]] || eff_mtu="$(iface_mtu "$TUN")"
+    if [[ "${MSS_CLAMP:-0}" == "1" && -n "$eff_mtu" ]]; then
+        local mss=$(( eff_mtu - 40 ))
+        if (( mss < 536 )); then
+            warn "[$NAME] tunnel MTU $eff_mtu leaves an MSS below the IPv4 minimum; not clamping."
+        else
+            # Remove any previous clamp for THIS connection before writing the new one.
+            # Deletion is by ownership comment rather than by full specification, because
+            # the MSS value is part of the spec and changes with the tunnel MTU: an
+            # exact-spec delete would leave the rule written for the previous MTU in
+            # place, and two clamps on one interface means the older one can win.
+            ipt_del mangle POSTROUTING -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
+                -m comment --comment "multi-gre-iran-$NAME-mss*" -j TCPMSS
+            # The FORWARD clamp covers forwarded traffic, which is where a PMTUD stall
+            # actually bites and which is not guaranteed to traverse the POSTROUTING
+            # hook of the ingress path just covered.
+            ipt_del mangle FORWARD -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
+                -m comment --comment "multi-gre-iran-$NAME-mss-fwd*" -j TCPMSS
+            # Legacy v1.0.0 wrote the clamp with no ownership comment at all, so a
+            # comment pattern can never match it. It is removed by its exact
+            # specification instead, in both chains.
+            ipt_del mangle POSTROUTING -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
+                -j TCPMSS --clamp-mss-to-pmtu
+            ipt_del mangle FORWARD -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
+                -j TCPMSS --clamp-mss-to-pmtu
+            ipt_add mangle POSTROUTING -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
+                -m comment --comment "multi-gre-iran-$NAME-mss" -j TCPMSS --set-mss "$mss"
+            ipt_add mangle FORWARD -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
+                -m comment --comment "multi-gre-iran-$NAME-mss-fwd" -j TCPMSS --set-mss "$mss"
+            ok "[$NAME] TCP MSS clamped to $mss (tunnel MTU $eff_mtu)"
+        fi
+    elif [[ "${MSS_CLAMP:-0}" == "1" ]]; then
+        # No MTU could be determined at all. Rather than writing a clamp derived from the
+        # underlay's MTU (which is the defect this replaced), leave the existing rule set
+        # alone and say what is missing.
+        warn "[$NAME] tunnel MTU is unknown, so the MSS clamp was not written. Set one explicitly: gre mtu set --name $NAME --mtu VALUE"
     fi
     return 0
 }
@@ -1069,22 +1153,25 @@ edit_snapshot_current() { # edit_snapshot_current SIDE NAME (sets EDIT_OLD_*)
     # without re-reading a file we may already have overwritten.
     EDIT_OLD_NAME=""; EDIT_OLD_FOREIGN_IP=""; EDIT_OLD_IRAN_IP=""; EDIT_OLD_WAN_IF=""
     EDIT_OLD_SUBNET_BASE="$DEFAULT_SUBNET_BASE"; EDIT_OLD_IDX=""; EDIT_OLD_KEY=""
-    EDIT_OLD_TUN=""; EDIT_OLD_TCP=""; EDIT_OLD_UDP=""; EDIT_OLD_MSS="0"
+    EDIT_OLD_TUN=""; EDIT_OLD_TCP=""; EDIT_OLD_UDP=""; EDIT_OLD_MSS="0"; EDIT_OLD_MTU=""
     if (( EDIT_OLD_EXISTED )); then
         if [[ "$side" == "iran" ]]; then
             local NAME="" FOREIGN_IP="" IRAN_IP="" WAN_IF="" SUBNET_BASE="$DEFAULT_SUBNET_BASE" \
-                  IDX="" KEY="" TUN="" TCP_PORTS="" UDP_PORTS="" MSS_CLAMP="0"
+                  IDX="" KEY="" TUN="" TCP_PORTS="" UDP_PORTS="" MSS_CLAMP="0" MTU=""
             load_peer_conf "$file" || return 1
             EDIT_OLD_NAME="$NAME"; EDIT_OLD_FOREIGN_IP="$FOREIGN_IP"; EDIT_OLD_IRAN_IP="$IRAN_IP"
             EDIT_OLD_WAN_IF="$WAN_IF"; EDIT_OLD_SUBNET_BASE="$SUBNET_BASE"; EDIT_OLD_IDX="$IDX"
             EDIT_OLD_KEY="$KEY"; EDIT_OLD_TUN="$TUN"; EDIT_OLD_TCP="$TCP_PORTS"
             EDIT_OLD_UDP="$UDP_PORTS"; EDIT_OLD_MSS="$MSS_CLAMP"
+            # The MTU override, as stored. Empty means "no override", which is what
+            # every configuration written before this feature looks like.
+            EDIT_OLD_MTU="$MTU"
         else
-            local NAME="" IRAN_IP="" SUBNET_BASE="$DEFAULT_SUBNET_BASE" IDX="" KEY="" TUN=""
-            node_conf_read "$file" NAME IRAN_IP SUBNET_BASE IDX KEY TUN
+            local NAME="" IRAN_IP="" SUBNET_BASE="$DEFAULT_SUBNET_BASE" IDX="" KEY="" TUN="" MTU=""
+            node_conf_read "$file" NAME IRAN_IP SUBNET_BASE IDX KEY TUN MTU
             EDIT_OLD_NAME="$NAME"; EDIT_OLD_IRAN_IP="$IRAN_IP"; EDIT_OLD_SUBNET_BASE="$SUBNET_BASE"
             EDIT_OLD_IDX="$IDX"; EDIT_OLD_KEY="$KEY"; EDIT_OLD_TUN="$TUN"
-            EDIT_OLD_MSS="0"
+            EDIT_OLD_MSS="0"; EDIT_OLD_MTU="$MTU"
             # This host's own endpoint is not stored in a node config, so capture it
             # rather than reading a caller's global at rollback time. The live
             # interface is the most truthful source; foreign.conf is the fallback.
@@ -1124,18 +1211,18 @@ edit_rollback() { # edit_rollback SIDE
     if (( EDIT_OLD_EXISTED )); then
         if [[ "$side" == "iran" ]]; then
             create_tunnel "$EDIT_OLD_TUN" "$EDIT_OLD_IRAN_IP" "$EDIT_OLD_FOREIGN_IP" \
-                "$EDIT_OLD_KEY" "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.2/30" >/dev/null 2>&1 || true
+                "$EDIT_OLD_KEY" "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.2/30" "${EDIT_OLD_MTU:-$TUN_MTU}" >/dev/null 2>&1 || true
             peer_rules_remove "$EDIT_OLD_NAME" "$EDIT_OLD_TUN" "$EDIT_OLD_IRAN_IP" "$EDIT_OLD_WAN_IF" \
                 "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.2" "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.1" \
-                "$EDIT_OLD_TCP" "$EDIT_OLD_UDP" "$EDIT_OLD_MSS" \
+                "$EDIT_OLD_TCP" "$EDIT_OLD_UDP" "$EDIT_OLD_MSS" "${EDIT_OLD_MTU:-$TUN_MTU}" \
                 >/dev/null 2>&1 || true
             peer_rules_install "$EDIT_OLD_NAME" "$EDIT_OLD_TUN" "$EDIT_OLD_IRAN_IP" "$EDIT_OLD_WAN_IF" \
                 "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.2" "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.1" \
-                "$EDIT_OLD_TCP" "$EDIT_OLD_UDP" "$EDIT_OLD_MSS" \
+                "$EDIT_OLD_TCP" "$EDIT_OLD_UDP" "$EDIT_OLD_MSS" "${EDIT_OLD_MTU:-$TUN_MTU}" \
                 >/dev/null 2>&1 || true
         else
             create_tunnel "$EDIT_OLD_TUN" "${EDIT_OLD_FOREIGN_IP:-$(foreign_local_ip)}" "$EDIT_OLD_IRAN_IP" "$EDIT_OLD_KEY" \
-                "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.1/30" >/dev/null 2>&1 || true
+                "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.1/30" "${EDIT_OLD_MTU:-$TUN_MTU}" >/dev/null 2>&1 || true
             # A rollback that silently fails is worse than no rollback: the operator
             # believes the old connection is back when there is no tunnel at all.
             if ! edit_verify_tunnel "$EDIT_OLD_TUN" "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.1/30" >/dev/null 2>&1; then
@@ -1225,7 +1312,7 @@ edit_connection_txn() { # edit_connection_txn SIDE CURRENT_NAME
     # plan_request_from_current guarantees every PLAN_REQ_* holds a value, so these
     # are plain reads rather than a chain of fallbacks.
     local NAME="" FOREIGN_IP="" IRAN_IP="" WAN_IF="" SUBNET_BASE="$DEFAULT_SUBNET_BASE" \
-          IDX="" KEY="" TUN="" TCP_PORTS="" UDP_PORTS="" MSS_CLAMP="0"
+          IDX="" KEY="" TUN="" TCP_PORTS="" UDP_PORTS="" MSS_CLAMP="0" MTU=""
     if [[ "$side" == "iran" ]]; then
         NAME="$PLAN_REQ_NAME"
         FOREIGN_IP="$PLAN_REQ_FOREIGN_IP"
@@ -1238,6 +1325,7 @@ edit_connection_txn() { # edit_connection_txn SIDE CURRENT_NAME
         TCP_PORTS="$PLAN_REQ_TCP_PORTS"
         UDP_PORTS="$PLAN_REQ_UDP_PORTS"
         MSS_CLAMP="$PLAN_REQ_MSS_CLAMP"
+        MTU="${PLAN_REQ_MTU:-}"
     else
         NAME="$PLAN_REQ_NAME"
         IRAN_IP="$PLAN_REQ_IRAN_IP"
@@ -1247,13 +1335,14 @@ edit_connection_txn() { # edit_connection_txn SIDE CURRENT_NAME
         TUN="gre-$NAME"
         WAN_IF="$EDIT_OLD_WAN_IF"
         FOREIGN_IP="$PLAN_REQ_FOREIGN_IP"
+        MTU="${PLAN_REQ_MTU:-}"
     fi
 
     # Record the requested state for rollback to clean up after.
     EDIT_NEW_NAME="$NAME"; EDIT_NEW_FOREIGN_IP="$FOREIGN_IP"; EDIT_NEW_IRAN_IP="$IRAN_IP"
     EDIT_NEW_WAN_IF="$WAN_IF"; EDIT_NEW_SUBNET_BASE="$SUBNET_BASE"; EDIT_NEW_IDX="$IDX"
     EDIT_NEW_KEY="$KEY"; EDIT_NEW_TUN="$TUN"; EDIT_NEW_TCP="$TCP_PORTS"
-    EDIT_NEW_UDP="$UDP_PORTS"; EDIT_NEW_MSS="$MSS_CLAMP"
+    EDIT_NEW_UDP="$UDP_PORTS"; EDIT_NEW_MSS="$MSS_CLAMP"; EDIT_NEW_MTU="$MTU"
 
     if [[ "$side" == "iran" ]]; then
         validate_peer_values || { edit_txn_commit; return 1; }
@@ -1318,11 +1407,15 @@ edit_connection_txn() { # edit_connection_txn SIDE CURRENT_NAME
         # CLASS A: the tunnel is not touched at all. Old rules out, new rules in,
         # and the interface keeps running throughout.
         if [[ "$PLAN_CLASS" == "A" ]]; then
+            # A rule-only change must not recreate the interface, so the MTU is applied
+            # to the EXISTING device. This is the only path that changes MTU without a
+            # rebuild, and it is the reason an MTU edit is safe on a live tunnel.
+            apply_iface_mtu "$EDIT_OLD_TUN" "$PLAN_REQ_MTU"
             peer_rules_remove "$EDIT_OLD_NAME" "$EDIT_OLD_TUN" "$EDIT_OLD_IRAN_IP" "$EDIT_OLD_WAN_IF" \
                 "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.2" "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.1" \
                 "$EDIT_OLD_TCP" "$EDIT_OLD_UDP" "$EDIT_OLD_MSS"
             peer_rules_install "$NAME" "$EDIT_OLD_TUN" "$IRAN_IP" "$WAN_IF" \
-                "${SUBNET_BASE}.${IDX}.2" "${SUBNET_BASE}.${IDX}.1" "$TCP_PORTS" "$UDP_PORTS" "$MSS_CLAMP"
+                "${SUBNET_BASE}.${IDX}.2" "${SUBNET_BASE}.${IDX}.1" "$TCP_PORTS" "$UDP_PORTS" "$MSS_CLAMP" "$PLAN_REQ_MTU"
             if ! edit_verify_tunnel "$EDIT_OLD_TUN" "${SUBNET_BASE}.${IDX}.2/30"; then
                 edit_fail_and_rollback "$side" "the rule-only update left the tunnel unverified"
                 return 1
@@ -1332,14 +1425,14 @@ edit_connection_txn() { # edit_connection_txn SIDE CURRENT_NAME
             # not inherit a stale DNAT pointing at the old peer address.
             peer_rules_remove "$EDIT_OLD_NAME" "$EDIT_OLD_TUN" "$EDIT_OLD_IRAN_IP" "$EDIT_OLD_WAN_IF" \
                 "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.2" "${EDIT_OLD_SUBNET_BASE}.${EDIT_OLD_IDX}.1" \
-                "$EDIT_OLD_TCP" "$EDIT_OLD_UDP" "$EDIT_OLD_MSS"
-            if ! create_tunnel "$TUN" "$IRAN_IP" "$FOREIGN_IP" "$KEY" "${SUBNET_BASE}.${IDX}.2/30"; then
+                "$EDIT_OLD_TCP" "$EDIT_OLD_UDP" "$EDIT_OLD_MSS" "${EDIT_OLD_MTU:-$TUN_MTU}"
+            if ! create_tunnel "$TUN" "$IRAN_IP" "$FOREIGN_IP" "$KEY" "${SUBNET_BASE}.${IDX}.2/30" "${PLAN_REQ_MTU:-$TUN_MTU}"; then
                 edit_fail_and_rollback "$side" "the tunnel could not be recreated"
                 return 1
             fi
             enable_ip_forward
             peer_rules_install "$NAME" "$TUN" "$IRAN_IP" "$WAN_IF" \
-                "${SUBNET_BASE}.${IDX}.2" "${SUBNET_BASE}.${IDX}.1" "$TCP_PORTS" "$UDP_PORTS" "$MSS_CLAMP"
+                "${SUBNET_BASE}.${IDX}.2" "${SUBNET_BASE}.${IDX}.1" "$TCP_PORTS" "$UDP_PORTS" "$MSS_CLAMP" "${PLAN_REQ_MTU:-$TUN_MTU}"
             if ! edit_verify_tunnel "$TUN" "${SUBNET_BASE}.${IDX}.2/30"; then
                 edit_fail_and_rollback "$side" "the rebuilt tunnel could not be verified"
                 return 1
@@ -1347,7 +1440,7 @@ edit_connection_txn() { # edit_connection_txn SIDE CURRENT_NAME
         fi
     else
         # FOREIGN side: no per-node NAT rules, so a rebuild is the whole change.
-        if ! create_tunnel "$TUN" "${EDIT_NEW_FOREIGN_IP:-$(foreign_local_ip)}" "$IRAN_IP" "$KEY" "${SUBNET_BASE}.${IDX}.1/30"; then
+        if ! create_tunnel "$TUN" "${EDIT_NEW_FOREIGN_IP:-$(foreign_local_ip)}" "$IRAN_IP" "$KEY" "${SUBNET_BASE}.${IDX}.1/30" "${PLAN_REQ_MTU:-$TUN_MTU}"; then
             edit_fail_and_rollback "$side" "the tunnel could not be recreated"
             return 1
         fi
@@ -1373,6 +1466,8 @@ TUN=$TUN
 TCP_PORTS=$TCP_PORTS
 UDP_PORTS=$UDP_PORTS
 MSS_CLAMP=$MSS_CLAMP
+${MTU:+MTU=$MTU}
+${NIC_MTU:+NIC_MTU=$NIC_MTU}
 EOF
         chmod 600 "$newfile"
         write_iran_manifest
@@ -1386,6 +1481,7 @@ SUBNET_BASE=$SUBNET_BASE
 IDX=$IDX
 KEY=$KEY
 TUN=$TUN
+${MTU:+MTU=$MTU}
 EOF
         chmod 600 "$newfile"
     fi
@@ -1451,16 +1547,108 @@ progress_bar() { # progress_bar "label" percent
 # ------------------------------------------------------------- ip/iptables helpers
 tun_exists() { ip link show "$1" >/dev/null 2>&1; }
 
-create_tunnel() { # name local_ip remote_ip key addr/mask
+# --------------------------------------------------------------- MTU helpers
+#
+# MTU_MIN_INNER is the smallest IPv4 MTU any host must accept (RFC 791). A GRE MTU
+# below it would be illegal for the inner protocol, so recommendations are clamped
+# here rather than being allowed to follow a bad measurement down.
+MTU_MIN_INNER=576
+# When the inner path carries IPv6, the floor is 1280 (RFC 8200), because IPv6 has no
+# router fragmentation at all. The `gre mtu recommend` engine reads it.
+# shellcheck disable=SC2034  # read by gre mtu recommend
+MTU_MIN_INNER_V6=1280
+# A GRE interface MTU above the underlay's is meaningless: the encapsulated packet
+# would not fit, so it is capped rather than recommended.
+MTU_MAX_GRE=9000
+
+valid_mtu() { # valid_mtu VALUE — a GRE interface MTU is 576..9000
+    [[ "${1:-}" =~ ^[0-9]+$ ]] || return 1
+    (( $1 >= MTU_MIN_INNER && $1 <= MTU_MAX_GRE ))
+}
+
+# The encapsulation overhead of THIS tunnel, derived from its actual configuration.
+#
+# Never a fixed constant: IPv4 GRE with a key carries 4 bytes more than one without,
+# and a tunnel that also carries an outer IPv6 header is 20 bytes larger again. Getting
+# this wrong by 4 bytes is exactly what produces an intermittent blackhole, so the
+# value is computed from the tunnel's own flags and endpoints.
+#
+# Returns the total bytes the encapsulation adds: outer IP + GRE header (+key) + inner IP.
+gre_overhead_bytes() { # gre_overhead_bytes KEY OUTER_IPV [INNER_IPV]
+    local key="${1:-0}" outer_ipv="${2:-4}" inner_ipv="${3:-4}"
+    local bytes=0
+    # Outer IP header
+    if [[ "$outer_ipv" == "6" ]]; then bytes=$(( bytes + 40 )); else bytes=$(( bytes + 20 )); fi
+    # GRE header: 4 bytes base, plus an optional 4-byte key/sequence field when a key
+    # is configured. The manager always passes a key, so this is normally +4.
+    bytes=$(( bytes + 4 ))
+    [[ -n "$key" && "$key" != "0" ]] && bytes=$(( bytes + 4 ))
+    # Inner IP header
+    if [[ "$inner_ipv" == "6" ]]; then bytes=$(( bytes + 40 )); else bytes=$(( bytes + 20 )); fi
+    printf '%s' "$bytes"
+}
+
+# The MTU actually in effect for an interface, from the kernel.
+#
+# ip(8) is preferred over sysfs: it is the same source the operator sees, it works for
+# every link type, and it does not depend on /sys being readable in the environment the
+# manager happens to run in.
+iface_mtu() { # iface_mtu IFACE
+    local iface="${1:-}" mtu=""
+    [[ -n "$iface" ]] || { printf ''; return; }
+    mtu="$(ip -o link show dev "$iface" 2>/dev/null | sed -n 's/.*[[:space:]]mtu[[:space:]]\+\([0-9]\+\).*/\1/p' | head -n1)"
+    if [[ -z "$mtu" ]]; then
+        mtu="$(ip -o link show "$iface" 2>/dev/null | sed -n 's/.*[[:space:]]mtu[[:space:]]\+\([0-9]\+\).*/\1/p' | head -n1)"
+    fi
+    if [[ -z "$mtu" ]]; then
+        mtu="$(cat "/sys/class/net/${iface}/mtu" 2>/dev/null)"
+    fi
+    printf '%s' "$mtu"
+}
+
+# The MTU of the interface the kernel would actually use to reach a destination,
+# which is the underlay capacity that matters — not the default route's.
+underlay_egress_mtu() { # underlay_egress_mtu DEST
+    local dest="${1:-}" iface="" mtu=""
+    [[ -n "$dest" ]] || { printf ''; return; }
+    iface="$(ip -4 route get "$dest" 2>/dev/null | sed -n 's/.*[[:space:]]dev[[:space:]]\+\([^ ]\+\).*/\1/p' | head -n1)"
+    [[ -n "$iface" ]] || { printf ''; return; }
+    mtu="$(iface_mtu "$iface")"
+    printf '%s' "$mtu"
+}
+
+# The route MTU metric, when one is set. A non-empty value here overrides the device
+# MTU for this path and is a common cause of "the NIC says 1500 but the path is 1400".
+route_mtu_for() { # route_mtu_for DEST
+    local dest="${1:-}"
+    [[ -n "$dest" ]] || { printf ''; return; }
+    ip -4 route get "$dest" 2>/dev/null | sed -n 's/.*[[:space:]]mtu[[:space:]]\+\([0-9]\+\).*/\1/p' | head -n1
+}
+
+# Is this the interface that carries the control plane (the SSH session / the Hub)?
+# Used to refuse automatic changes that could strand the operator.
+iface_carries_control_plane() { # iface_carries_control_plane IFACE
+    local iface="${1:-}" out=""
+    [[ -n "$iface" ]] || return 1
+    # The interface holding the default route is the one a remote operator reached us
+    # through, in every topology this manager supports.
+    out="$(ip -4 route show default 2>/dev/null | sed -n 's/.*[[:space:]]dev[[:space:]]\+\([^ ]\+\).*/\1/p' | head -n1)"
+    [[ "$out" == "$iface" ]]
+}
+
+create_tunnel() { # create_tunnel NAME LOCAL_IP REMOTE_IP KEY ADDR [MTU]
     local name="$1" local_ip="$2" remote_ip="$3" key="$4" addr="$5"
+    # MTU is per-connection. The default is only a fallback for a connection that has
+    # never had one set, so existing deployments keep the exact behaviour they had.
+    local mtu="${6:-$TUN_MTU}"
     if tun_exists "$name"; then
         ip link set "$name" down 2>/dev/null || true
         ip tunnel del "$name" 2>/dev/null || true
     fi
     ip tunnel add "$name" mode gre local "$local_ip" remote "$remote_ip" key "$key" ttl 255 || return 1
     ip addr add "$addr" dev "$name" || return 1
-    ip link set "$name" mtu "$TUN_MTU" up || return 1
-    ok "Tunnel $name is up ($addr, key $key)"
+    ip link set "$name" mtu "$mtu" up || return 1
+    ok "Tunnel $name is up ($addr, key $key, mtu $mtu)"
 }
 
 delete_tunnel() { # name
@@ -1509,22 +1697,58 @@ enable_ip_forward() {
 # Wraps `source` in a subshell so a malformed or hostile config file cannot leak
 # unrelated assignments into the caller. Only the known fields are copied back.
 # The caller must declare the targets (NAME, IRAN_IP, ...) before calling.
-node_conf_read() { # node_conf_read FILE NAME_VAR IRAN_IP_VAR SUBNET_BASE_VAR IDX_VAR KEY_VAR TUN_VAR
+node_conf_read() { # node_conf_read FILE NAME_VAR IRAN_IP_VAR SUBNET_BASE_VAR IDX_VAR KEY_VAR TUN_VAR [MTU_VAR]
     local f="$1"
     local -n _name="$2" _iran="$3" _base="$4" _idx="$5" _key="$6" _tun="$7"
+    local _mtu_name="${8:-}"
     local -a vals=()
     if [[ -f "$f" ]]; then
         mapfile -t vals < <(
             # shellcheck disable=SC1090  # this host's own config file
             source "$f" >/dev/null 2>&1
-            printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
+            printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
                 "${NAME:-}" "${IRAN_IP:-}" "${SUBNET_BASE:-$DEFAULT_SUBNET_BASE}" \
-                "${IDX:-}" "${KEY:-}" "${TUN:-}"
+                "${IDX:-}" "${KEY:-}" "${TUN:-}" "${MTU:-}"
         )
     fi
     _name="${vals[0]:-}"; _iran="${vals[1]:-}"
     _base="${vals[2]:-$DEFAULT_SUBNET_BASE}"
     _idx="${vals[3]:-}"; _key="${vals[4]:-}"; _tun="${vals[5]:-}"
+    if [[ -n "$_mtu_name" ]]; then
+        local -n _mtu="$_mtu_name"
+        _mtu="${vals[6]:-}"
+    fi
+}
+
+# Change an existing interface's MTU without recreating it.
+#
+# This is the operation an MTU edit uses. Rebuilding the interface would also work,
+# but it would drop the tunnel and every rule pointing at it, so an MTU-only change
+# deliberately does the minimum: one `ip link set` on the device that is already up.
+# Routing, NAT, the GRE key and the endpoints are all left untouched.
+#
+# Returns 0 when the interface ends up at the requested MTU, so a caller can verify
+# rather than assume.
+apply_iface_mtu() { # apply_iface_mtu IFACE MTU
+    local iface="${1:-}" mtu="${2:-}"
+    [[ -n "$iface" ]] || { err "apply_iface_mtu: no interface given"; return 1; }
+    tun_exists "$iface" || { err "Interface $iface does not exist."; return 1; }
+    if [[ -z "$mtu" ]]; then
+        info "Interface $iface: no MTU requested, leaving it alone."
+        return 0
+    fi
+    valid_mtu "$mtu" || { err "Refusing to set an illegal MTU on $iface: '$mtu'"; return 1; }
+    if [[ "$(iface_mtu "$iface")" == "$mtu" ]]; then
+        info "Interface $iface is already at MTU $mtu."
+        return 0
+    fi
+    ip link set dev "$iface" mtu "$mtu" || { err "Could not set MTU $mtu on $iface."; return 1; }
+    # Confirm from the kernel rather than trusting the command's exit status.
+    if [[ "$(iface_mtu "$iface")" != "$mtu" ]]; then
+        err "MTU on $iface did not take effect (wanted $mtu, found '$(iface_mtu "$iface")')."
+        return 1
+    fi
+    ok "Interface $iface MTU set to $mtu."
 }
 
 # This host's public IP, for use as the GRE local endpoint.
@@ -1555,8 +1779,8 @@ tunnel_local_endpoint() { # tunnel_local_endpoint IFACE
 
 apply_foreign_node() { # apply_foreign_node NODE_CONF_FILE [LOCAL_IP]
     local f="$1" local_ip="${2:-}"
-    local NAME="" IRAN_IP="" SUBNET_BASE="$DEFAULT_SUBNET_BASE" IDX="" KEY="" TUN=""
-    node_conf_read "$f" NAME IRAN_IP SUBNET_BASE IDX KEY TUN
+    local NAME="" IRAN_IP="" SUBNET_BASE="$DEFAULT_SUBNET_BASE" IDX="" KEY="" TUN="" MTU=""
+    node_conf_read "$f" NAME IRAN_IP SUBNET_BASE IDX KEY TUN MTU
 
     # The local endpoint is this host's own IP. It is resolved HERE rather than
     # inherited from the caller, so applying one node config on its own is
@@ -1579,7 +1803,7 @@ apply_foreign_node() { # apply_foreign_node NODE_CONF_FILE [LOCAL_IP]
         return 1
     fi
 
-    create_tunnel "$TUN" "$local_ip" "$IRAN_IP" "$KEY" "${SUBNET_BASE}.${IDX}.1/30"
+    create_tunnel "$TUN" "$local_ip" "$IRAN_IP" "$KEY" "${SUBNET_BASE}.${IDX}.1/30" "${MTU:-$TUN_MTU}"
 }
 
 # Distinct subnet bases used by the foreign-side nodes (default base included).
@@ -1639,12 +1863,12 @@ apply_foreign() {
 apply_iran_peer() { # apply_iran_peer PEER_CONF_FILE
     local f="$1"
     local NAME="" FOREIGN_IP="" IRAN_IP="" WAN_IF="" SUBNET_BASE="$DEFAULT_SUBNET_BASE" \
-          IDX="" KEY="" TUN="" TCP_PORTS="" UDP_PORTS="" MSS_CLAMP="0"
+          IDX="" KEY="" TUN="" TCP_PORTS="" UDP_PORTS="" MSS_CLAMP="0" MTU=""
     load_peer_conf "$f" || return 1
     local peer="${SUBNET_BASE}.${IDX}.1"
     local self="${SUBNET_BASE}.${IDX}.2"
 
-    create_tunnel "$TUN" "$IRAN_IP" "$FOREIGN_IP" "$KEY" "${self}/30" || return 1
+    create_tunnel "$TUN" "$IRAN_IP" "$FOREIGN_IP" "$KEY" "${self}/30" "${MTU:-$TUN_MTU}" || return 1
     enable_ip_forward
 
     if [[ -n "$TCP_PORTS" ]]; then
@@ -1668,13 +1892,13 @@ apply_iran_peer() { # apply_iran_peer PEER_CONF_FILE
     fi
 
     # --- TCP MSS clamping on the tunnel (avoids broken-PMTU stalls)
-    if [[ "${MSS_CLAMP:-0}" == "1" ]]; then
-        ipt_del mangle POSTROUTING -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
-            -j TCPMSS --clamp-mss-to-pmtu
-        ipt_add mangle POSTROUTING -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
-            -m comment --comment "multi-gre-iran-$NAME-mss" -j TCPMSS --clamp-mss-to-pmtu
-        ok "[$NAME] TCP MSS clamping enabled on $TUN"
-    fi
+    #
+    # Delegated to peer_rules_install rather than duplicated here. The two copies had
+    # already drifted (this one knew nothing about the tunnel MTU), and a second,
+    # subtly different MSS rule is exactly how a clamp ends up applied twice or not at
+    # all depending on which path brought the peer up.
+    peer_rules_install "$NAME" "$TUN" "$IRAN_IP" "$WAN_IF" "$self" "$peer" \
+        "$TCP_PORTS" "$UDP_PORTS" "$MSS_CLAMP" "${MTU:-$TUN_MTU}"
     return 0
 }
 
@@ -2039,6 +2263,8 @@ TUN=$TUN
 TCP_PORTS=$TCP_PORTS
 UDP_PORTS=$UDP_PORTS
 MSS_CLAMP=$MSS_CLAMP
+${MTU:+MTU=$MTU}
+${NIC_MTU:+NIC_MTU=$NIC_MTU}
 EOF
     chmod 600 "$f"
     write_iran_manifest
@@ -4876,12 +5102,31 @@ doctor_peer_snat() { # uses TCP_PORTS/UDP_PORTS/TUN/peer/self
 
 doctor_peer_mss() {
     [[ "${MSS_CLAMP:-0}" == "1" ]] || return 0
-    if iptables -t mangle -C POSTROUTING -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
-        -m comment --comment "multi-gre-iran-$NAME-mss" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
-        d_pass "[$NAME] TCP MSS clamping rule on $TUN is present"
+    # The current form sets the MSS EXPLICITLY from the tunnel's MTU. Derive it the same
+    # way peer_rules_install does, so doctor looks for exactly the rule a correct apply
+    # would have written.
+    #
+    # The LIVE interface MTU is preferred over the stored one, because a connection with
+    # no explicit override has an empty MTU in its config while its interface is at the
+    # default. Trusting the config only would make doctor fail every such connection.
+    local want_mtu="${MTU:-}" want_mss=""
+    [[ -n "$want_mtu" ]] || want_mtu="$(iface_mtu "$TUN")"
+    [[ -n "$want_mtu" ]] && want_mss=$(( want_mtu - 40 ))
+    if [[ -n "$want_mss" ]] && (( want_mss >= 536 )) && \
+       iptables -t mangle -C POSTROUTING -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
+        -m comment --comment "multi-gre-iran-$NAME-mss" -j TCPMSS --set-mss "$want_mss" 2>/dev/null; then
+        d_pass "[$NAME] TCP MSS clamped to $want_mss for tunnel MTU $want_mtu"
+        if iptables -t mangle -C FORWARD -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
+            -m comment --comment "multi-gre-iran-$NAME-mss-fwd" -j TCPMSS --set-mss "$want_mss" 2>/dev/null; then
+            d_pass "[$NAME] TCP MSS clamp is also on the FORWARD path"
+        else
+            d_warn "[$NAME] TCP MSS clamp is missing on the FORWARD path (forwarded traffic can still stall; fix: gre iran peer apply --name $NAME)"
+        fi
     elif iptables -t mangle -C POSTROUTING -o "$TUN" -p tcp --tcp-flags SYN,RST SYN \
-        -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
-        d_warn "[$NAME] TCP MSS clamping rule on $TUN uses the legacy un-commented style (fix: gre iran peer apply --name $NAME)"
+            -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+        # The old rule is not a failure: it is simply less reliable, because the MSS is
+        # derived from the route MTU (the underlay) rather than the tunnel's own MTU.
+        d_warn "[$NAME] TCP MSS is derived from the PMTU, which for a GRE egress is the underlay MTU and can advertise an MSS the tunnel cannot carry (fix: gre iran peer apply --name $NAME)"
     else
         d_fail "[$NAME] TCP MSS clamping rule on $TUN is missing (fix: gre iran peer apply --name $NAME)"
     fi

@@ -853,6 +853,15 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     if (!actions.ACTION_NAMES.includes(action)) {
       return res.status(400).json({ error: `unknown action (allowed: ${actions.ACTION_NAMES.join(', ')})` });
     }
+    // An MTU change is one two-sided transaction: it backs up the previous values,
+    // writes both ends and verifies the interfaces and reachability. A bare per-server
+    // run would skip all of that, so it is refused here by name rather than offered as
+    // a shortcut that looks equivalent.
+    if (action === 'mtu_set' || action === 'mtu_restore') {
+      return res.status(400).json({
+        error: `${action} changes a live tunnel MTU and must go through the connection MTU flow (PUT /api/gre-connections/:id/mtu)`,
+      });
+    }
     try {
       // Validate every action before doing network preflight work.
       const command = actions.buildAction(action, params || {});
@@ -1425,6 +1434,7 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
   // iptables handling, which is what makes its rollback the CLI's real rollback.
 
   const connections = require('./connections');
+  const connectionMtu = require('./connection-mtu');
 
   // Only these fields may be edited. Anything else in the body is dropped rather
   // than passed through, so a client cannot smuggle an unexpected key into the
@@ -1507,7 +1517,14 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     res.json(fresh.map((row) => {
       const view = connections.project(db, row);
       const busy = locks.find((l) => l.key === `connection:${row.connection_uuid}`);
-      return { ...view, busy: !!busy, busy_since: busy ? busy.since : null };
+      return {
+        ...view,
+        busy: !!busy,
+        busy_since: busy ? busy.since : null,
+        // Journal-only, so the table can show what the Hub last knew without an SSH
+        // round trip per row.
+        mtu: connectionMtu.mtuSummary(db, row),
+      };
     }));
   });
 
@@ -1518,6 +1535,7 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
     res.json({
       ...connections.project(db, row),
       current: connections.currentState(db, row),
+      mtu: connectionMtu.mtuSummary(db, row),
       recent_operations: ops.map((o) => ({
         operation_id: o.operation_id, kind: o.kind, status: o.status,
         current_stage: o.current_stage, rollback_state: o.rollback_state,
@@ -1710,6 +1728,120 @@ function createRouter(db, cryptKey, dataDir, transport = {}) {
         rollback: err.rollback || null, manual_recovery: err.manual_recovery || null,
       });
     }
+  }));
+
+  // ================================================================ MTU
+  //
+  // MTU work is two-sided by nature: a tunnel is only as large as its smaller underlay
+  // path, so a one-sided answer is not an answer. These endpoints drive the CLI's own
+  // `gre mtu` verbs over SSH; the Hub never touches an interface itself.
+  //
+  // The GET endpoints and the plan are READ-ONLY: they take no lock and write nothing,
+  // so the UI can call them while an operator is still deciding. Only the PUT and the
+  // restore mutate, and both go through the journaled transaction in connection-mtu.js.
+
+  const resolveServerFor = (id) => getServer(id);
+
+  authed.get('/gre-connections/:id/mtu', wrap(async (req, res) => {
+    const row = connectionRow(req.params.id);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    const diagnostics = await connectionMtu.diagnoseBothSides({ db, row, remote: remoteFor, resolveServer: resolveServerFor });
+    res.json({
+      ...diagnostics,
+      recommendation: connectionMtu.recommend({ iran: diagnostics.iran, foreign: diagnostics.foreign }),
+      last: connectionMtu.mtuSummary(db, row),
+    });
+  }));
+
+  // Read-only plan for a target MTU. It READS the servers because naming the current
+  // MTU of both sides is the whole point of a plan; it creates no operation and holds
+  // no lock, so a refused or abandoned plan leaves nothing behind.
+  authed.post('/gre-connections/:id/mtu/plan', wrap(async (req, res) => {
+    const row = connectionRow(req.params.id);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    const target = (req.body || {}).mtu;
+    const diagnostics = await connectionMtu.diagnoseBothSides({ db, row, remote: remoteFor, resolveServer: resolveServerFor });
+    const plan = connectionMtu.planMtuChange({ db, row, target, diagnostics });
+    res.json({ ...plan, diagnostics });
+  }));
+
+  authed.put('/gre-connections/:id/mtu', wrap(async (req, res) => {
+    const row = connectionRow(req.params.id);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    const body = req.body || {};
+    // Explicit confirmation is required here as well as in the UI: an MTU change on a
+    // live tunnel must never be the result of a stray request.
+    if (body.confirm !== true) {
+      return res.status(400).json({ error: 'an MTU change requires confirm: true' });
+    }
+    const target = Number(body.mtu);
+    if (!Number.isInteger(target) || target < actions.MTU_MIN || target > actions.MTU_MAX) {
+      return res.status(400).json({ error: `mtu must be an integer ${actions.MTU_MIN}-${actions.MTU_MAX}` });
+    }
+    if (routeOrchestrator.running && routeOrchestrator.running.has(row.id)) {
+      return res.status(409).json({ error: 'this connection is provisioning right now' });
+    }
+
+    const iran = getServer(row.iran_server_id);
+    const auditTarget = { connection_id: row.connection_uuid, name: row.name, target };
+    try {
+      const result = await connectionMtu.applyMtu({
+        db, row, target, confirm: true, emit: emitEvent(row.id), remote: remoteFor, resolveServer: resolveServerFor,
+      });
+      auditEvent(row.iran_server_id, iran ? iran.name : 'hub', 'gre_connection_mtu_change',
+        { ...auditTarget, operation_id: result.operation_id }, 0,
+        `MTU ${target} applied to both sides and verified (connectivity ${result.connectivity.state})`);
+      const fresh = connections.getRoute(db, row.id);
+      res.json({ ...result, connection: connections.project(db, fresh), mtu: connectionMtu.mtuSummary(db, fresh) });
+    } catch (err) {
+      if (err.hostkey_mismatch) return hostKeyMismatchResponse(res, row.iran_server_id, err.presented_fp);
+      auditEvent(row.iran_server_id, iran ? iran.name : 'hub', 'gre_connection_mtu_change_failed',
+        { ...auditTarget, operation_id: err.operation_id }, 1, err.message);
+      res.status(err.status || 500).json({
+        error: err.message,
+        operation_id: err.operation_id || null,
+        rollback: err.rollback || null,
+        manual_recovery: err.manual_recovery || null,
+        previous: err.previous || null,
+        recommendation: err.recommendation || null,
+      });
+    }
+  }));
+
+  // Undo an MTU change by re-applying the values its journal entry recorded, through
+  // the same verified transaction as the original change.
+  authed.post('/gre-connections/:id/mtu/restore', wrap(async (req, res) => {
+    const row = connectionRow(req.params.id);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    const operationId = (req.body || {}).operation_id;
+    if (!operationId) return res.status(400).json({ error: 'operation_id is required' });
+    const iran = getServer(row.iran_server_id);
+    try {
+      const result = await connectionMtu.restoreMtu({
+        db, row, operationId, emit: emitEvent(row.id), remote: remoteFor, resolveServer: resolveServerFor,
+      });
+      auditEvent(row.iran_server_id, iran ? iran.name : 'hub', 'gre_connection_mtu_restore',
+        { connection_id: row.connection_uuid, name: row.name, operation_id: operationId }, 0,
+        'the previous MTU was restored on both sides and verified');
+      const fresh = connections.getRoute(db, row.id);
+      res.json({ ...result, connection: connections.project(db, fresh), mtu: connectionMtu.mtuSummary(db, fresh) });
+    } catch (err) {
+      auditEvent(row.iran_server_id, iran ? iran.name : 'hub', 'gre_connection_mtu_restore_failed',
+        { connection_id: row.connection_uuid, name: row.name, operation_id: operationId }, 1, err.message);
+      res.status(err.status || 500).json({
+        error: err.message,
+        operation_id: err.operation_id || null,
+        rollback: err.rollback || null,
+        manual_recovery: err.manual_recovery || null,
+      });
+    }
+  }));
+
+  // Read-only WAN NIC risk analysis for both sides.
+  authed.get('/gre-connections/:id/mtu/nic', wrap(async (req, res) => {
+    const row = connectionRow(req.params.id);
+    if (!row) return res.status(404).json({ error: 'not found' });
+    res.json(await connectionMtu.analyzeNicBothSides({ db, row, remote: remoteFor, resolveServer: resolveServerFor }));
   }));
 
   // Test-only: the scripted SSH transport's own state, so a test can assert on

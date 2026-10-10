@@ -42,12 +42,21 @@ assert "edit ports: other peer config untouched" test "$(grep -E '^TCP_PORTS=' "
 assert "edit ports: other peer rule untouched" nat_has "PREROUTING -i eth0 -d 198.51.100.20 -p tcp -m multiport --dports 8443 -m comment --comment multi-gre-iran-nl1-dnat-tcp -j DNAT --to-destination 10.201.1.1"
 
 # ---------------------------------------------------------------- MSS
+# Plant a legacy v1.0.0-style rule (no comment, pmtu-derived) so this also proves an
+# upgrade cleans up the old form instead of leaving two clamps on the interface.
+# Written directly, as run.sh does for its migration fixture.
+echo 'POSTROUTING -o gre-de1 -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu' >> "$R/state/iptables.mangle"
+assert "edit mss fixture: legacy rule present" grep -q 'clamp-mss-to-pmtu' "$R/state/iptables.mangle"
+
 gre iran peer edit --name de1 --mss-clamp off --yes
 assert "edit mss off: rc=0" test "$GRE_RC" -eq 0
 assert "edit mss off: config updated" grep -q '^MSS_CLAMP=0' "$R/etc/multi-gre/foreigns/de1.conf"
 assert "edit mss off: mangle rule removed" bash -c "! grep -q 'multi-gre-iran-de1-mss' '$R/state/iptables.mangle'"
+assert "edit mss off: the legacy pmtu rule is cleaned up too" bash -c "! grep -q 'clamp-mss-to-pmtu' '$R/state/iptables.mangle'"
 gre iran peer edit --name de1 --mss-clamp on --yes
 assert "edit mss on: mangle rule restored" grep -q 'multi-gre-iran-de1-mss' "$R/state/iptables.mangle"
+assert "edit mss on: the clamp is an explicit MSS, not the route PMTU" grep -q 'set-mss 1436' "$R/state/iptables.mangle"
+assert_not "edit mss on: the unreliable pmtu-derived clamp is not used" grep -q 'clamp-mss-to-pmtu' "$R/state/iptables.mangle"
 
 # ---------------------------------------------------------------- class B
 gre iran peer edit --name de1 --key 4321 --yes
