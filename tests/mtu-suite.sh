@@ -179,9 +179,16 @@ assert "nic list marks the control-plane interface" grep -qE 'eth0 +1500 +YES' <
 gre mtu nic list --json
 json_valid "nic list --json is valid JSON"
 gre mtu nic analyze --name de1
-assert_not "nic analyze flags the control-plane interface as high risk" test "$GRE_RC" -eq 0
+# A successful read-only analysis exits 0 even when the risk is high: the risk is data,
+# not a failure, and a non-zero exit would make a caller read "risky to change" as "the
+# command failed".
+assert "nic analyze succeeds and reports the risk" test "$GRE_RC" -eq 0
 assert "nic analyze names the risk" grep -qi 'risk *high' <<< "$GRE_OUT"
 assert "nic analyze explains the SSH hazard" grep -qi 'SSH' <<< "$GRE_OUT"
+gre mtu nic analyze --name de1 --json
+json_valid "nic analyze --json is valid JSON"
+assert "nic analyze --json reports risk as data" grep -q '"risk":"high"' <<< "$GRE_OUT"
+assert "nic analyze --json reports applied:false" grep -q '"applied":false' <<< "$GRE_OUT"
 nic_before="$(md5sum "$R/state/mtu.eth0" 2>/dev/null | cut -d' ' -f1)"
 gre mtu nic analyze --name de1 >/dev/null 2>&1
 assert "nic analyze never changes the NIC MTU" \

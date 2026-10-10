@@ -6431,7 +6431,10 @@ cli_mtu_nic() {
                 printf '  and with it the Hub ability to recover the host, so it is deliberately\n'
                 printf '  left to you, at the console, with a rollback already scheduled.\n\n'
             fi
-            [[ "$risk" != "high" ]] ;;
+            # A successful read-only analysis exits 0 even when the risk is high. The
+            # risk is DATA, not a failure: a non-zero exit would make a caller (the Hub,
+            # or a script) treat "this NIC is risky to change" as "the command failed".
+            return 0 ;;
         --help|-h|"")
             cat <<'EOF'
 Usage:
