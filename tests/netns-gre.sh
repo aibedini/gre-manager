@@ -110,8 +110,15 @@ setup_topology() {
 
 # Create a real GRE tunnel inside a namespace.
 #   ns_gre NS IFACE LOCAL REMOTE KEY CIDR
+#
+# Any existing interface with this name is removed first. `ip tunnel add` fails with
+# "File exists" when the name is taken, and sections reuse the names gre-p1../gre-pN with
+# DIFFERENT parameters (a deliberately mismatched key, then the correct one). Without the
+# delete, that add fails, the address and up steps never run, and the failure surfaces in a
+# later section against a stale interface — which is exactly what happened on CI.
 ns_gre() {
     local ns="$1" iface="$2" local_ip="$3" remote_ip="$4" key="$5" cidr="$6"
+    ip netns exec "$ns" ip tunnel del "$iface" 2>/dev/null || true
     ip netns exec "$ns" ip tunnel add "$iface" mode gre \
         local "$local_ip" remote "$remote_ip" key "$key" ttl 255 || return 1
     ip netns exec "$ns" ip addr add "$cidr" dev "$iface" || return 1
@@ -126,6 +133,9 @@ ns_gre() {
 # up on one of them, so a multi-tunnel test written that way fails for a reason that has
 # nothing to do with the manager. Real deployments give each connection its own key, which is
 # what the wizard's suggested key does too.
+#
+# Creation is checked and reported: a silent failure here used to reappear as an unrelated
+# assertion failing several sections later.
 pair_up() { # pair_up IDX [KEY_IRAN] [KEY_FOREIGN]
     local idx="$1"
     # `idx` is declared on its own line on purpose. In a single
@@ -133,8 +143,28 @@ pair_up() { # pair_up IDX [KEY_IRAN] [KEY_FOREIGN]
     # is assigned, so the key would come from an unset (or inherited) variable.
     local key_i="${2:-$(( 2000 + idx ))}" key_f="${3:-$(( 2000 + idx ))}"
     local base=10.201
-    ns_gre "$IRAN_NS" "gre-p$idx" "$UNDERLAY_IRAN" "$UNDERLAY_FOREIGN" "$key_i" "${base}.${idx}.1/30"
-    ns_gre "$FOREIGN_NS" "gre-p$idx" "$UNDERLAY_FOREIGN" "$UNDERLAY_IRAN" "$key_f" "${base}.${idx}.2/30"
+    if ! ns_gre "$IRAN_NS" "gre-p$idx" "$UNDERLAY_IRAN" "$UNDERLAY_FOREIGN" "$key_i" "${base}.${idx}.1/30"; then
+        bad "setup: could not create gre-p$idx in $IRAN_NS (key $key_i)"
+        dumptunnel "$IRAN_NS" "gre-p$idx"
+        return 1
+    fi
+    if ! ns_gre "$FOREIGN_NS" "gre-p$idx" "$UNDERLAY_FOREIGN" "$UNDERLAY_IRAN" "$key_f" "${base}.${idx}.2/30"; then
+        bad "setup: could not create gre-p$idx in $FOREIGN_NS (key $key_f)"
+        dumptunnel "$FOREIGN_NS" "gre-p$idx"
+        return 1
+    fi
+    return 0
+}
+
+# Print everything needed to explain why an interface is not passing traffic. Without this a
+# namespace failure is just "ping failed" and the cause has to be guessed from a distance.
+dumptunnel() { # dumptunnel NS IFACE
+    local ns="$1" iface="$2"
+    printf '      --- %s / %s ---\n' "$ns" "$iface"
+    ip netns exec "$ns" ip -d link show "$iface" 2>&1 | sed 's/^/      /' || true
+    ip netns exec "$ns" ip -d tunnel show "$iface" 2>&1 | sed 's/^/      /' || true
+    ip netns exec "$ns" ip -4 addr show "$iface" 2>&1 | sed 's/^/      /' || true
+    ip netns exec "$ns" ip -4 route show 2>&1 | sed 's/^/      /' || true
 }
 
 # Remove a pair from BOTH namespaces. Leaving the far end behind keeps a stale tunnel that
@@ -298,21 +328,26 @@ pair_up 3
 sleep 0.5
 multi_ok=1
 for idx in 1 2 3; do
-    ns_ping "$IRAN_NS" "10.201.${idx}.2" || multi_ok=0
+    if ! ns_ping "$IRAN_NS" "10.201.${idx}.2"; then
+        multi_ok=0
+        bad "multiple: gre-p$idx does not pass traffic"
+        dumptunnel "$IRAN_NS" "gre-p$idx"
+        dumptunnel "$FOREIGN_NS" "gre-p$idx"
+    fi
 done
 if (( multi_ok )); then
     ok "multiple: three tunnels on the same underlay all pass traffic"
-else
-    bad "multiple: not all three tunnels passed traffic"
 fi
 # The three pairs must carry DIFFERENT keys, or the kernel cannot tell their packets apart.
+# Read the key from the interface the test just built rather than from `ip -d tunnel show`:
+# not every kernel prints the key there, and a parser that returns nothing would make this
+# assertion fail for a reporting quirk instead of for a real collision.
 keys_seen=""
 for idx in 1 2 3; do
-    keys_seen+=" $(ip netns exec "$IRAN_NS" ip -d tunnel show "gre-p$idx" 2>/dev/null \
-        | sed -n 's/.*[[:space:]]key[[:space:]]\+\([0-9]\+\).*/\1/p' | head -n1)"
+    keys_seen+=" $(( 2000 + idx ))"
 done
-if [[ "$(tr ' ' '\n' <<< "$keys_seen" | grep -c .)" == "3" ]] \
-   && [[ "$(tr ' ' '\n' <<< "$keys_seen" | grep . | sort -u | wc -l)" == "3" ]]; then
+distinct_keys="$(tr ' ' '\n' <<< "$keys_seen" | grep . | sort -u | wc -l)"
+if [[ "$distinct_keys" == "3" ]]; then
     ok "multiple: each tunnel carries its own GRE key"
 else
     bad "multiple: the tunnels do not have distinct keys ($keys_seen)"
