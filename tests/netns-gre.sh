@@ -175,19 +175,12 @@ pair_down() { # pair_down IDX
     ip netns exec "$FOREIGN_NS" ip tunnel del "gre-p$idx" 2>/dev/null || true
 }
 
-# Rebuild both namespaces from scratch and bring up a single clean pair. Sections that need a
-# predictable starting point use setup_topology + pair_up directly; this exists for the case
-# where only one pair is wanted on a guaranteed-empty namespace.
-#
 # Deleting a GRE tunnel by name is not always enough. On the CI runner `ip tunnel del gre-p2`
 # left the device behind — the kernel logged `add tunnel "gre0" failed: File exists` and the
 # next add for gre-p2 failed with the same message, so gre-p2 never existed while a stale
-# interface squatted the name. A section that needs a predictable starting point destroys the
-# namespaces instead of trying to repair them in place.
-fresh_pair() { # fresh_pair IDX [KEY_IRAN] [KEY_FOREIGN]
-    setup_topology
-    pair_up "$@"
-}
+# interface squatted the name. A section that needs a predictable starting point therefore
+# calls setup_topology again rather than trying to repair the namespaces in place, which is
+# what section D does.
 
 ns_ping() { # ns_ping NS TARGET
     ip netns exec "$1" ping -c 2 -W 2 "$2" >/dev/null 2>&1
