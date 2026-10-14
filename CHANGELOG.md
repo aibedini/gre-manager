@@ -4,6 +4,18 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.18.1] - 2026-10-14
+
+### Fixed
+
+- **The v2.18.0 release never published.** Its release run failed in the "Verify the hub
+  tarball contents" gate, before any artifact was created, because the gate was told to
+  expect `tests/interactive-suite.sh` inside `gre-hub.tar.gz` — but that archive is built
+  with `tar czf gre-hub.tar.gz hub/`, so it contains only the `hub/` tree and can never
+  contain a `tests/` path. The entry is removed. This is a workflow-only correction:
+  no shipped code changed, and v2.18.1 is identical to v2.18.0 apart from the version
+  strings and this note. The v2.18.0 tag is left exactly where it is.
+
 ## [2.18.0] - 2026-10-14
 
 ### Fixed
