@@ -118,12 +118,31 @@ ns_gre() {
     ip netns exec "$ns" ip link set "$iface" up || return 1
 }
 
-# Bring up a matched pair on subnet index N, returning nothing.
+# Bring up a matched pair on subnet index N.
+#
+# The GRE key defaults to one derived from the index, NOT a single shared value. Two tunnels
+# with the same key on the same underlay and the same endpoints are indistinguishable to the
+# kernel: it accepts the inbound packet on more than one interface and the inner traffic ends
+# up on one of them, so a multi-tunnel test written that way fails for a reason that has
+# nothing to do with the manager. Real deployments give each connection its own key, which is
+# what the wizard's suggested key does too.
 pair_up() { # pair_up IDX [KEY_IRAN] [KEY_FOREIGN]
-    local idx="$1" key_i="${2:-1001}" key_f="${3:-1001}"
+    local idx="$1"
+    # `idx` is declared on its own line on purpose. In a single
+    # `local idx="$1" key="${2:-$(( 2000 + idx ))}"` the expansion is evaluated before `idx`
+    # is assigned, so the key would come from an unset (or inherited) variable.
+    local key_i="${2:-$(( 2000 + idx ))}" key_f="${3:-$(( 2000 + idx ))}"
     local base=10.201
     ns_gre "$IRAN_NS" "gre-p$idx" "$UNDERLAY_IRAN" "$UNDERLAY_FOREIGN" "$key_i" "${base}.${idx}.1/30"
     ns_gre "$FOREIGN_NS" "gre-p$idx" "$UNDERLAY_FOREIGN" "$UNDERLAY_IRAN" "$key_f" "${base}.${idx}.2/30"
+}
+
+# Remove a pair from BOTH namespaces. Leaving the far end behind keeps a stale tunnel that
+# the next pair_up cannot replace, so the failure surfaces later against the wrong test.
+pair_down() { # pair_down IDX
+    local idx="$1"
+    ip netns exec "$IRAN_NS" ip tunnel del "gre-p$idx" 2>/dev/null || true
+    ip netns exec "$FOREIGN_NS" ip tunnel del "gre-p$idx" 2>/dev/null || true
 }
 
 ns_ping() { # ns_ping NS TARGET
@@ -286,8 +305,20 @@ if (( multi_ok )); then
 else
     bad "multiple: not all three tunnels passed traffic"
 fi
+# The three pairs must carry DIFFERENT keys, or the kernel cannot tell their packets apart.
+keys_seen=""
+for idx in 1 2 3; do
+    keys_seen+=" $(ip netns exec "$IRAN_NS" ip -d tunnel show "gre-p$idx" 2>/dev/null \
+        | sed -n 's/.*[[:space:]]key[[:space:]]\+\([0-9]\+\).*/\1/p' | head -n1)"
+done
+if [[ "$(tr ' ' '\n' <<< "$keys_seen" | grep -c .)" == "3" ]] \
+   && [[ "$(tr ' ' '\n' <<< "$keys_seen" | grep . | sort -u | wc -l)" == "3" ]]; then
+    ok "multiple: each tunnel carries its own GRE key"
+else
+    bad "multiple: the tunnels do not have distinct keys ($keys_seen)"
+fi
 # And they must be independent: breaking one must not disturb the others.
-ip netns exec "$IRAN_NS" ip tunnel del gre-p2
+pair_down 2
 sleep 0.3
 if ns_ping "$IRAN_NS" "10.201.1.2" && ns_ping "$IRAN_NS" "10.201.3.2" && ! ns_ping "$IRAN_NS" "10.201.2.2"; then
     ok "multiple: removing one tunnel leaves the others working"
@@ -440,7 +471,7 @@ IRAN_IP='"$UNDERLAY_IRAN"'
 WAN_IF=lo
 SUBNET_BASE=10.201
 IDX=1
-KEY=2002
+KEY=2001
 TUN=gre-p1
 TCP_PORTS=3001
 UDP_PORTS=

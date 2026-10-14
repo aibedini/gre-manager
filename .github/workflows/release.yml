@@ -73,6 +73,13 @@ jobs:
           VERSION="$(cat VERSION | tr -d '[:space:]')"
           TMP="$(mktemp -d)"
           tar xzf gre-hub.tar.gz -C "$TMP"
+          # Every path here must be inside hub/. The archive is built with
+          # `tar czf gre-hub.tar.gz hub/`, so a `tests/...` entry can never be satisfied —
+          # it fails the release even though the artifact is fine. Two such entries
+          # (tests/netns-gre.sh, tests/foreign-endpoint-suite.sh) were added for the v2.17.0
+          # release and both v2.18.0 and v2.18.1 failed on them, which is why the release
+          # never published. The bash suites are repository test assets, not runtime files,
+          # and are not meant to ship.
           for f in hub/VERSION hub/build-info.json hub/.npmrc hub/package.json hub/package-lock.json \
                    hub/server/index.js hub/server/version.js hub/server/xui.js \
                    hub/server/route-inspection.js hub/server/route-credential-fastpath.js \
@@ -90,8 +97,7 @@ jobs:
                    hub/scripts/boot-hub-for-ui.sh \
                    hub/server/connections.js hub/server/connection-planner.js \
                    hub/public/connections-ui.js \
-                   hub/public/app.js hub/public/index.html hub/public/style.css \
-                   tests/foreign-endpoint-suite.sh tests/netns-gre.sh; do
+                   hub/public/app.js hub/public/index.html hub/public/style.css; do
             [ -f "$TMP/$f" ] || { echo "::error::gre-hub.tar.gz is missing $f"; exit 1; }
           done
           [ "$(tr -d '[:space:]' < "$TMP/hub/VERSION")" = "$VERSION" ] || { echo "::error::tarball hub/VERSION mismatch"; exit 1; }
