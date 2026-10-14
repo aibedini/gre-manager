@@ -1125,6 +1125,7 @@ source "$TESTS_DIR/edit-suite.sh"
 source "$TESTS_DIR/foreign-endpoint-suite.sh"
 source "$TESTS_DIR/mtu-suite.sh"
 source "$TESTS_DIR/health-suite.sh"
+source "$TESTS_DIR/interactive-suite.sh"
 
 echo "PASS=$PASS FAIL=$FAIL"
 [[ $FAIL -eq 0 ]]

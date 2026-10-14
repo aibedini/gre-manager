@@ -138,6 +138,93 @@ ask() { # ask VAR "prompt" ["default"]
     printf -v "$__var" '%s' "$__input"
 }
 
+# ask_valid VAR "prompt" [default] VALIDATOR "error message"
+#
+# The validated counterpart of ask(): the SAME question is repeated until the answer is
+# valid, so an invalid value can never advance the workflow.
+#
+# This exists because ask() trusts whatever it reads. The interactive peer wizard used it
+# for every field and validated the collected values only at the end, so a typo anywhere
+# meant answering every remaining question and then being told about all of them at once
+# (or, for fields with no batch check, not at all).
+#
+# Contract:
+#   - the prompt and its default are displayed exactly like ask();
+#   - Enter accepts the default, but ONLY after that default has been validated too, so a
+#     bad default is reported instead of silently accepted;
+#   - an invalid answer prints the error and repeats this prompt, never the next one;
+#   - the value is returned verbatim: nothing is trimmed, stripped or rewritten, because a
+#     silent repair would hide a wrong answer and could change what the operator typed;
+#   - EOF (piped input that ran out) returns 1 instead of looping forever.
+ask_valid() { # ask_valid VAR PROMPT DEFAULT VALIDATOR ERROR_MESSAGE
+    local __var="$1" __prompt="$2" __default="$3" __validator="$4" __emsg="$5"
+    local __input="" __value=""
+    while true; do
+        if [[ -n "$__default" ]]; then
+            read -rp "$__prompt [$__default]: " __input || return 1
+            __value="${__input:-$__default}"
+        else
+            read -rp "$__prompt: " __input || return 1
+            __value="$__input"
+        fi
+        if "$__validator" "$__value"; then
+            printf -v "$__var" '%s' "$__value"
+            return 0
+        fi
+        err "$__emsg"
+    done
+}
+
+# ask_yes_no "prompt" default(y|n) -> 0 for yes, 1 for no
+#
+# Replaces confirm()/confirm_yes() where the answer must be validated. Those two treat
+# EVERY unrecognised string as "no", so a typo silently selects the opposite of what the
+# operator intended and the wizard moves on: `1io11` answered the MSS question with "no".
+# An unreadable answer is now rejected and the same question is asked again.
+ask_yes_no() { # ask_yes_no PROMPT DEFAULT(y|n)
+    local __prompt="$1" __default="${2:-n}" __ans="" __lower=""
+    local __hint="[y/N]"
+    [[ "$__default" == "y" ]] && __hint="[Y/n]"
+    while true; do
+        read -rp "$__prompt $__hint: " __ans || return 1
+        __lower="${__ans,,}"
+        if [[ -z "$__lower" ]]; then
+            [[ "$__default" == "y" ]] && return 0
+            return 1
+        fi
+        case "$__lower" in
+            y|yes) return 0 ;;
+            n|no)  return 1 ;;
+            *)     err "Please answer 'y' or 'n'." ;;
+        esac
+    done
+}
+
+# ask_optional_valid VAR PROMPT VALIDATOR ERROR_MESSAGE
+#
+# For prefilled wizards where an EMPTY answer means "keep the current value". Empty is
+# accepted without validation; anything the operator actually types must be valid, and an
+# invalid answer repeats this prompt instead of being quietly discarded.
+#
+# This is why it is separate from ask_valid: ask_valid treats empty as "take the default",
+# but here empty carries the distinct meaning "leave this field alone".
+ask_optional_valid() { # ask_optional_valid VAR PROMPT VALIDATOR ERROR_MESSAGE
+    local __var="$1" __prompt="$2" __validator="$3" __emsg="$4"
+    local __input=""
+    while true; do
+        read -rp "$__prompt: " __input || return 1
+        if [[ -z "$__input" ]]; then
+            printf -v "$__var" '%s' ""
+            return 0
+        fi
+        if "$__validator" "$__input"; then
+            printf -v "$__var" '%s' "$__input"
+            return 0
+        fi
+        err "$__emsg"
+    done
+}
+
 # ------------------------------------------------------------- validators
 valid_ip() {
     local ip="$1" o
@@ -180,6 +267,11 @@ valid_port_list() { # comma list of ports or a:b ranges, max 15 (multiport limit
     local list="$1" p a b
     [[ -z "$list" ]] && return 0
     [[ "$list" =~ ^[0-9,:]+$ ]] || return 1
+    # `read -ra` drops a trailing empty field, so "80," was accepted as "80": a list with an
+    # empty element the operator did not intend and would never see in the prompt. Reject the
+    # structural cases explicitly.
+    [[ "$list" == ,* || "$list" == *, || "$list" == *,,* ]] && return 1
+    [[ "$list" == :* || "$list" == *: || "$list" == *::* ]] && return 1
     local IFS=','
     read -ra p <<< "$list"
     unset IFS
@@ -191,6 +283,7 @@ valid_port_list() { # comma list of ports or a:b ranges, max 15 (multiport limit
             [[ -n "$a" && -n "$b" ]] || return 1
             (( a >= 1 && a <= 65535 && b >= 1 && b <= 65535 && a <= b )) || return 1
         else
+            [[ -n "$item" ]] || return 1
             (( item >= 1 && item <= 65535 )) || return 1
         fi
     done
@@ -223,6 +316,50 @@ valid_subnet_base() { # A.B prefix of the tunnel /30 (e.g. 10.200 -> 10.200.IDX.
 
 valid_iface() { # Linux interface name (IFNAMSIZ: max 15 chars, no spaces/slashes)
     [[ "$1" =~ ^[a-zA-Z0-9_.:-]{1,15}$ ]]
+}
+
+# The Linux GRE key is an unsigned 32-bit field.
+valid_key() {
+    local key="$1"
+    [[ "$key" =~ ^[0-9]+$ ]] || return 1
+    # Reject leading zeros only where they would change the value's meaning? No: `0` is a
+    # legal key and `007` is simply 7, so both are accepted. What matters is the RANGE.
+    (( key >= 0 && key <= 4294967295 )) || return 1
+    return 0
+}
+
+# Tunnel index: the /30 tunnel numbering uses the third octet, so 1-254.
+valid_idx() {
+    local idx="$1"
+    [[ "$idx" =~ ^[0-9]+$ ]] || return 1
+    (( idx >= 1 && idx <= 254 ))
+}
+
+# A non-negative whole number (downtime tolerance in minutes).
+valid_nonneg_int() {
+    [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+# The documented affirmative/negative spellings for a toggle field.
+valid_on_off() {
+    case "${1,,}" in
+        on|1|yes|y) return 0 ;;
+        off|0|no|n) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Does this interface exist on THIS host?
+#
+# `valid_iface` only checks the SYNTAX of a name, so `ask` accepted the string
+# "ajsdafajgag" and the wizard proceeded to build a tunnel on an interface that does not
+# exist. A configured WAN interface must be present locally; on the FOREIGN side the
+# equivalent interface belongs to that server and is NOT required to exist here, which is
+# why this check is applied only where the value describes the local host.
+iface_exists() {
+    local iface="$1"
+    [[ -n "$iface" ]] || return 1
+    ip link show "$iface" >/dev/null 2>&1
 }
 
 # Validate a conf file BEFORE sourcing: only KEY=VALUE lines with whitelisted
@@ -411,7 +548,7 @@ validate_peer_values() { # validate_peer_values ["quiet"]
     valid_subnet_base "$SUBNET_BASE" || { [[ -z "$quiet" ]] && err "Invalid subnet base: '$SUBNET_BASE' (expected A.B, e.g. 10.201)"; e=1; }
     { [[ "$IDX" =~ ^[0-9]+$ ]] && (( IDX >= 1 && IDX <= 254 )); } \
                                  || { [[ -z "$quiet" ]] && err "Invalid tunnel index: '$IDX' (1-254)"; e=1; }
-    [[ "$KEY" =~ ^[0-9]+$ ]]     || { [[ -z "$quiet" ]] && err "Invalid GRE key: '$KEY'"; e=1; }
+    valid_key "$KEY"             || { [[ -z "$quiet" ]] && err "Invalid GRE key: '$KEY' (0-4294967295)"; e=1; }
     valid_iface "$WAN_IF"        || { [[ -z "$quiet" ]] && err "Invalid WAN interface: '$WAN_IF'"; e=1; }
     valid_port_list "$TCP_PORTS" || { [[ -z "$quiet" ]] && err "Invalid TCP port list: '$TCP_PORTS'"; e=1; }
     valid_port_list "$UDP_PORTS" || { [[ -z "$quiet" ]] && err "Invalid UDP port list: '$UDP_PORTS'"; e=1; }
@@ -2285,11 +2422,10 @@ ask_downtime_tolerance() { # sets ASKED_ENABLED / ASKED_INTERVAL / ASKED_TOL
     info "If a tunnel dies, the watchdog revives it automatically."
     info "How many minutes of tunnel downtime are acceptable for you? (0 = disable auto-heal)"
     local tol=""
-    ask tol "Downtime tolerance in minutes" "2"
-    if ! [[ "$tol" =~ ^[0-9]+$ ]]; then
-        warn "Not a number; using the default of 2 minutes."
-        tol=2
-    fi
+    # Validate at the prompt. This used to accept anything and silently substitute 2 later,
+    # which meant a typo was quietly replaced by a value the operator never chose.
+    ask_valid tol "Downtime tolerance in minutes" "2" valid_nonneg_int \
+        "Enter a whole number of minutes, 0 or more (0 disables auto-heal)." || return 1
     ASKED_TOL="$tol"
     if (( tol == 0 )); then
         ASKED_ENABLED=0
@@ -2456,27 +2592,39 @@ interactive_add_iran_peer() { # interactive_add_iran_peer FIRST(0|1)
     fi
     local IRAN_IP="" FOREIGN_IP="" NAME="" SUBNET_BASE="" IDX="" KEY="" WAN_IF="" \
           TCP_PORTS="" UDP_PORTS="" MSS_CLAMP="0" TUN=""
-    ask IRAN_IP      "Public IP of THIS Iran server" "$detected_ip"
-    ask FOREIGN_IP   "Public IP of the FOREIGN server"
-    ask NAME         "Peer name (must match the name used on FOREIGN, e.g. de1)" "de1"
-    ask SUBNET_BASE  "Tunnel subnet base (A.B; the tunnel net is A.B.IDX.0/30)" "$sug_base"
+    # Every field is validated AT THE PROMPT, so an invalid answer cannot reach the next
+    # question. The wizard previously used plain ask() for all of these and validated the
+    # collected set once, after the last question.
+    ask_valid IRAN_IP "Public IP of THIS Iran server" "$detected_ip" valid_ip \
+        "Invalid IPv4 address. Enter a valid IPv4 address (four octets, 0-255)." || return 1
+    ask_valid FOREIGN_IP "Public IP of the FOREIGN server" "" valid_ip \
+        "Invalid IPv4 address. Enter a valid IPv4 address (four octets, 0-255)." || return 1
+    ask_valid NAME "Peer name (must match the name used on FOREIGN, e.g. de1)" "de1" valid_name \
+        "Invalid peer name. Use 1-11 letters, digits, '_' or '-', starting with a letter or digit." || return 1
+    ask_valid SUBNET_BASE "Tunnel subnet base (A.B; the tunnel net is A.B.IDX.0/30)" "$sug_base" valid_subnet_base \
+        "Invalid subnet base. Expected exactly A.B with both octets 0-255 (for example 10.201)." || return 1
     local sug_idx="1"
     sug_idx="$(next_free_peer_idx "$SUBNET_BASE")" || sug_idx="1"
-    ask IDX          "Tunnel index (must match FOREIGN, 1-254)" "$sug_idx"
+    ask_valid IDX "Tunnel index (must match FOREIGN, 1-254)" "$sug_idx" valid_idx \
+        "Invalid tunnel index. Enter a whole number from 1 to 254." || return 1
     local default_key="1001"
     [[ "$IDX" =~ ^[0-9]+$ ]] && default_key=$(( 1000 + IDX ))
-    ask KEY          "GRE key (must match FOREIGN)" "$default_key"
-    ask WAN_IF       "Public (WAN) interface" "$wan_if"
+    ask_valid KEY "GRE key (must match FOREIGN)" "$default_key" valid_key \
+        "Invalid GRE key. Enter a whole number from 0 to 4294967295." || return 1
+    ask_valid WAN_IF "Public (WAN) interface" "$wan_if" iface_exists \
+        "Interface '${WAN_IF:-}' does not exist on this host. Enter an existing interface name (see: ip link show)." || return 1
     echo
     info "Enter the service ports on this Iran server that should be forwarded to THIS foreign."
     info "Comma separated, ranges allowed with ':', max 15 entries. Leave empty for none."
     local sug_tcp="" sug_udp=""
     sug_tcp="$(suggest_free_port tcp)" || sug_tcp=""
     sug_udp="$(suggest_free_port udp)" || sug_udp=""
-    ask TCP_PORTS  "TCP ports (suggested free: $sug_tcp)" "$sug_tcp"
-    ask UDP_PORTS  "UDP ports (suggested free: $sug_udp)" "$sug_udp"
+    ask_valid TCP_PORTS "TCP ports (suggested free: $sug_tcp)" "$sug_tcp" valid_port_list \
+        "Invalid TCP port list. Use ports 1-65535, comma separated, ranges as A:B with A<=B, at most 15 entries." || return 1
+    ask_valid UDP_PORTS "UDP ports (suggested free: $sug_udp)" "$sug_udp" valid_port_list \
+        "Invalid UDP port list. Use ports 1-65535, comma separated, ranges as A:B with A<=B, at most 15 entries." || return 1
 
-    if confirm_yes "Enable TCP MSS clamping on the tunnel? (recommended)"; then
+    if ask_yes_no "Enable TCP MSS clamping on the tunnel? (recommended)" y; then
         MSS_CLAMP="1"
     fi
 
@@ -2486,7 +2634,14 @@ interactive_add_iran_peer() { # interactive_add_iran_peer FIRST(0|1)
     fi
 
     TUN="gre-$NAME"
+    # Interactive validation is the FIRST layer, not the only one: everything is checked
+    # again as a set before a single system-changing command runs, so a value that was
+    # valid in isolation but conflicts with the existing configuration still stops here.
     validate_peer_values || return 1
+    iface_exists "$WAN_IF" || {
+        err "WAN interface '$WAN_IF' does not exist on this host; nothing was changed."
+        return 1
+    }
     if peer_exists "$NAME"; then
         err "Peer '$NAME' already exists. Remove it first (gre iran peer remove --name $NAME)."
         return 1
@@ -2639,32 +2794,43 @@ interactive_edit_iran_peer() { # interactive_edit_iran_peer CURRENT_NAME
     echo
     info "Editing '$CURRENT'. Press Enter to keep the value shown in [brackets]."
 
-    ask v "Foreign IP [${PLAN_REQ_FOREIGN_IP}]" ""
+    ask_optional_valid v "Foreign IP [${PLAN_REQ_FOREIGN_IP}]" valid_ip \
+        "Invalid IPv4 address for the foreign IP." || { edit_txn_commit; return 1; }
     [[ -n "$v" ]] && PLAN_REQ_FOREIGN_IP="$v"
-    ask v "Iran IP [${PLAN_REQ_IRAN_IP}]" ""
+    ask_optional_valid v "Iran IP [${PLAN_REQ_IRAN_IP}]" valid_ip \
+        "Invalid IPv4 address for the Iran IP." || { edit_txn_commit; return 1; }
     [[ -n "$v" ]] && PLAN_REQ_IRAN_IP="$v"
-    ask v "Name [${PLAN_REQ_NAME}]" ""
+    ask_optional_valid v "Name [${PLAN_REQ_NAME}]" valid_name \
+        "Invalid name. Use 1-11 letters, digits, '_' or '-', starting with a letter or digit." || { edit_txn_commit; return 1; }
     [[ -n "$v" ]] && PLAN_REQ_NAME="$v"
-    ask v "Subnet base [${PLAN_REQ_SUBNET_BASE}]" ""
+    ask_optional_valid v "Subnet base [${PLAN_REQ_SUBNET_BASE}]" valid_subnet_base \
+        "Invalid subnet base. Expected exactly A.B with both octets 0-255." || { edit_txn_commit; return 1; }
     [[ -n "$v" ]] && PLAN_REQ_SUBNET_BASE="$v"
-    ask v "Index [${PLAN_REQ_IDX}]" ""
+    ask_optional_valid v "Index [${PLAN_REQ_IDX}]" valid_idx \
+        "Invalid tunnel index. Enter a whole number from 1 to 254." || { edit_txn_commit; return 1; }
     [[ -n "$v" ]] && PLAN_REQ_IDX="$v"
-    ask v "GRE key [${PLAN_REQ_KEY}]" ""
+    ask_optional_valid v "GRE key [${PLAN_REQ_KEY}]" valid_key \
+        "Invalid GRE key. Enter a whole number from 0 to 4294967295." || { edit_txn_commit; return 1; }
     [[ -n "$v" ]] && PLAN_REQ_KEY="$v"
-    ask v "WAN interface [${PLAN_REQ_WAN_IF}]" ""
+    ask_optional_valid v "WAN interface [${PLAN_REQ_WAN_IF}]" iface_exists \
+        "Interface '${v:-}' does not exist on this host." || { edit_txn_commit; return 1; }
     [[ -n "$v" ]] && PLAN_REQ_WAN_IF="$v"
-    ask v "TCP ports [${PLAN_REQ_TCP_PORTS:-none}]" ""
+    ask_optional_valid v "TCP ports [${PLAN_REQ_TCP_PORTS:-none}]" valid_port_list \
+        "Invalid TCP port list. Ports 1-65535, comma separated, ranges A:B with A<=B, max 15 entries." || { edit_txn_commit; return 1; }
     [[ -n "$v" ]] && PLAN_REQ_TCP_PORTS="$v"
-    ask v "UDP ports [${PLAN_REQ_UDP_PORTS:-none}]" ""
+    ask_optional_valid v "UDP ports [${PLAN_REQ_UDP_PORTS:-none}]" valid_port_list \
+        "Invalid UDP port list. Ports 1-65535, comma separated, ranges A:B with A<=B, max 15 entries." || { edit_txn_commit; return 1; }
     [[ -n "$v" ]] && PLAN_REQ_UDP_PORTS="$v"
     local cur_mss
     [[ "${PLAN_REQ_MSS_CLAMP:-0}" == "1" ]] && cur_mss="on" || cur_mss="off"
-    ask v "MSS clamp on|off [$cur_mss]" ""
+    # Empty keeps the current setting; anything else must be a documented value. This used
+    # to warn and silently keep the old value, so a typo looked like an accepted change.
+    ask_optional_valid v "MSS clamp on|off [$cur_mss]" valid_on_off \
+        "Expected 'on' or 'off'." || { edit_txn_commit; return 1; }
     if [[ -n "$v" ]]; then
-        case "$v" in
-            on|ON|1|yes)  PLAN_REQ_MSS_CLAMP="1" ;;
-            off|OFF|0|no) PLAN_REQ_MSS_CLAMP="0" ;;
-            *) err "Expected on or off; keeping '$cur_mss'." ;;
+        case "${v,,}" in
+            on|1|yes)  PLAN_REQ_MSS_CLAMP="1" ;;
+            off|0|no)  PLAN_REQ_MSS_CLAMP="0" ;;
         esac
     fi
     PLAN_REQ_TUN="gre-$PLAN_REQ_NAME"
@@ -2836,8 +3002,8 @@ setup_foreign() {
         local detected_ip; detected_ip="$(detect_public_ip "$wan_if")"
         echo
         info "FOREIGN server setup (first run)"
-        ask FOREIGN_IP "Public IP of THIS foreign server" "$detected_ip"
-        valid_ip "$FOREIGN_IP" || { err "Invalid IP: $FOREIGN_IP"; return 1; }
+        ask_valid FOREIGN_IP "Public IP of THIS foreign server" "$detected_ip" valid_ip \
+            "Invalid IPv4 address. Enter a valid IPv4 address (four octets, 0-255)." || return 1
 
         local icmp_drop="0" gre_whitelist="0"
         local other_tuns=""
@@ -2886,30 +3052,45 @@ EOF
 
     echo
     info "Add a new IRAN node"
-    ask NAME    "Node name (e.g. ir01)" "ir01"
-    valid_name "$NAME" || { err "Invalid node name: $NAME (use 1-11 letters, digits, '_' or '-'; start with a letter or digit)"; return 1; }
+    # Each field is validated at its own prompt. This flow already validated field by field,
+    # but it aborted the wizard on the first bad answer, so a typo in the first question
+    # meant starting over; the same question is now repeated instead.
+    ask_valid NAME "Node name (e.g. ir01)" "ir01" valid_name \
+        "Invalid node name. Use 1-11 letters, digits, '_' or '-', starting with a letter or digit." || return 1
     if [[ -f "$NODES_DIR/$NAME.conf" ]]; then
         err "Node '$NAME' already exists. Remove it first (menu option 3)."
         return 1
     fi
 
-    ask IRAN_IP "Public IP of the Iran server"
-    valid_ip "$IRAN_IP" || { err "Invalid IP: $IRAN_IP"; return 1; }
+    ask_valid IRAN_IP "Public IP of the Iran server" "" valid_ip \
+        "Invalid IPv4 address. Enter a valid IPv4 address (four octets, 0-255)." || return 1
 
     local SUBNET_BASE=""
-    ask SUBNET_BASE "Tunnel subnet base (A.B; the tunnel net is A.B.IDX.0/30)" "$DEFAULT_SUBNET_BASE"
-    valid_subnet_base "$SUBNET_BASE" || { err "Invalid subnet base: $SUBNET_BASE"; return 1; }
+    ask_valid SUBNET_BASE "Tunnel subnet base (A.B; the tunnel net is A.B.IDX.0/30)" "$DEFAULT_SUBNET_BASE" valid_subnet_base \
+        "Invalid subnet base. Expected exactly A.B with both octets 0-255 (for example 10.201)." || return 1
 
     local idx; idx="$(next_free_idx "$SUBNET_BASE")" || { err "No free tunnel index left in $SUBNET_BASE"; return 1; }
-    ask IDX "Tunnel index (1-254)" "$idx"
-    [[ "$IDX" =~ ^[0-9]+$ ]] && (( IDX >= 1 && IDX <= 254 )) || { err "Invalid index: $IDX"; return 1; }
+    ask_valid IDX "Tunnel index (1-254)" "$idx" valid_idx \
+        "Invalid tunnel index. Enter a whole number from 1 to 254." || return 1
     if node_idx_taken "$SUBNET_BASE" "$IDX"; then
         err "Subnet/index ${SUBNET_BASE}.${IDX} is already used by another node."
         return 1
     fi
     local default_key=$(( 1000 + IDX ))
-    ask KEY "GRE key" "$default_key"
-    [[ "$KEY" =~ ^[0-9]+$ ]] || { err "Invalid key: $KEY"; return 1; }
+    ask_valid KEY "GRE key" "$default_key" valid_key \
+        "Invalid GRE key. Enter a whole number from 0 to 4294967295." || return 1
+
+    # Final pass before anything is written or applied: the values above were each valid on
+    # their own, and this confirms they are consistent as a set.
+    if ! { valid_name "$NAME" && valid_ip "$IRAN_IP" && valid_subnet_base "$SUBNET_BASE" \
+           && valid_idx "$IDX" && valid_key "$KEY"; }; then
+        err "The collected values did not pass the final check; nothing was changed."
+        return 1
+    fi
+    if node_idx_taken "$SUBNET_BASE" "$IDX"; then
+        err "Subnet/index ${SUBNET_BASE}.${IDX} is already used by another node; nothing was changed."
+        return 1
+    fi
 
     cat > "$NODES_DIR/$NAME.conf" <<EOF
 NAME=$NAME
