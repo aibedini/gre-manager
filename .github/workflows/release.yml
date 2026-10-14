@@ -84,6 +84,10 @@ jobs:
                    hub/scripts/overview-test.js hub/scripts/api-shape-test.js \
                    hub/scripts/provision-safety-test.js hub/scripts/_fake-ssh.js \
                    hub/scripts/connections-test.js hub/scripts/_fake-gre-ssh.js \
+                   hub/server/connection-mtu.js hub/server/connection-health.js \
+                   hub/scripts/mtu-test.js hub/scripts/mtu-contract-test.js \
+                   hub/scripts/health-test.js hub/scripts/ui-browser-test.js \
+                   hub/scripts/boot-hub-for-ui.sh tests/interactive-suite.sh \
                    hub/server/connections.js hub/server/connection-planner.js \
                    hub/public/connections-ui.js \
                    hub/public/app.js hub/public/index.html hub/public/style.css \
