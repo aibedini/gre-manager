@@ -5870,15 +5870,15 @@ mtu_resolve() { # mtu_resolve NAME
 mtu_collect() { # mtu_collect [--probe]
     local do_probe="${1:-}"
     local self_tun_ip
-    # .1 is the IRAN end of the /30 and .2 is the FOREIGN end. This mapping must agree with
-    # mtu_resolve (which sets MTU_SIDE from the config file this host holds) and with
-    # health_check_run, which derives HEALTH_SELF_CIDR from the same rule. It was inverted
-    # here, so a connection served by an Iran peer config reported its FOREIGN address as
-    # "self" and every MTU line that depends on self_tun_ip described the wrong end.
+    # .2 is the IRAN end of the /30 and .1 is the FOREIGN end. This is the convention the rest
+    # of the manager uses consistently: `apply_iran_peer` creates the Iran interface with
+    # ${SUBNET_BASE}.${IDX}.2/30 and `apply_foreign_node` uses .1, `tunnel_diagnose` maps the
+    # sides the same way, and the peer wizard prints ".2 <-> the foreign IP". The netns suite
+    # had this backwards, which made this function look inverted; the suite was corrected.
     if [[ "$MTU_SIDE" == "iran" ]]; then
-        self_tun_ip="${MTU_SUBNET_BASE}.${MTU_IDX}.1"
-    else
         self_tun_ip="${MTU_SUBNET_BASE}.${MTU_IDX}.2"
+    else
+        self_tun_ip="${MTU_SUBNET_BASE}.${MTU_IDX}.1"
     fi
 
     local tun_present="no" tun_mtu="" iface_up="unknown"
@@ -7420,6 +7420,14 @@ health_check_run() {
     HEALTH_TUN_MTU="$MTU_TUN_MTU"
     HEALTH_TUN_PRESENT="$MTU_TUN_PRESENT"
     HEALTH_MODE="$MODE"
+    # .2 is the IRAN end of the /30 and .1 is the FOREIGN end.
+    #
+    #   side=iran     a foreigns/<name>.conf lives on the IRAN server, so THIS host is the
+    #                 Iran end (.2) and the peer is the foreign end (.1)
+    #   side=foreign  a nodes/<name>.conf lives on the FOREIGN server, so THIS host is the
+    #                 foreign end (.1) and the peer is Iran (.2)
+    #
+    # This matches apply_iran_peer, apply_foreign_node and tunnel_diagnose.
     if [[ "$HEALTH_SIDE" == "iran" ]]; then
         HEALTH_SELF_TUN_IP="${MTU_SUBNET_BASE}.${MTU_IDX}.2"
         HEALTH_PEER_TUN_IP="${MTU_SUBNET_BASE}.${MTU_IDX}.1"

@@ -10,15 +10,11 @@
 sect "25. gre mtu: diagnosis, recommendation and safe apply"
 
 mkroot
-printf 'DBG R=%s files=%s\n' "$R" "$(ls "$R/etc/multi-gre/foreigns/" 2>&1 | tr '\n' ',')"
 gre foreign-setup --foreign-ip 203.0.113.10 --yes >/dev/null
-printf 'DBG after foreign-setup rc=%s\n' "$GRE_RC"
 gre iran peer add --name de1 --foreign-ip 203.0.113.10 --iran-ip 198.51.100.20 \
     --subnet-base 10.200 --idx 1 --key 1001 --tcp-ports 80,443 --udp-ports 443 --yes >/dev/null
-printf 'DBG add de1 rc=%s files=%s out=[%s]\n' "$GRE_RC" "$(ls "$R/etc/multi-gre/foreigns/" 2>&1 | tr '\n' ',')" "$(tail -2 <<< "$GRE_OUT" | tr '\n' ' ')"
 gre iran peer add --name nl1 --foreign-ip 203.0.113.11 --iran-ip 198.51.100.20 \
     --subnet-base 10.201 --idx 1 --key 1001 --tcp-ports 8443 --yes >/dev/null
-printf 'DBG add nl1 rc=%s files=%s\n' "$GRE_RC" "$(ls "$R/etc/multi-gre/foreigns/" 2>&1 | tr '\n' ',')"
 
 # ---------------------------------------------------------------- help and list
 gre mtu --help
@@ -231,7 +227,11 @@ gre iran peer add --name nl1 --foreign-ip 203.0.113.11 --iran-ip 198.51.100.20 \
     --subnet-base 10.201 --idx 1 --key 1001 --tcp-ports 8443 --yes >/dev/null
 
 nat_before="$(md5sum "$R/state/iptables.nat" | cut -d' ' -f1)"
-nl1_before="$(md5sum "$R/state/iptables.mangle" | cut -d' ' -f1)"
+# nl1's own MSS rules, compared as a SET. Refreshing de1's clamp re-adds de1's rules, which
+# changes their position in the mangle table; rule order is not meaningful to iptables, so a
+# byte-identical comparison would fail for a reason that says nothing about correctness. What
+# must hold is that nl1's rules still exist and still carry nl1's MSS.
+nl1_rules_before="$(grep 'multi-gre-iran-nl1' "$R/state/iptables.mangle" 2>/dev/null | sort)"
 de1_rules_before="$(grep -c 'multi-gre-iran-de1' "$R/state/iptables.nat")"
 
 gre mtu set --name de1 --mtu 1400 --yes >/dev/null 2>&1
@@ -240,6 +240,15 @@ assert "the GRE key is preserved" grep -q 'key 1001' "$R/state/tunnels/gre-de1"
 assert "the endpoints are preserved" bash -c \
     "grep -q 'local 198.51.100.20' '$R/state/tunnels/gre-de1' && grep -q 'remote 203.0.113.10' '$R/state/tunnels/gre-de1'"
 assert "the NAT rules are untouched" test "$nat_before" = "$(md5sum "$R/state/iptables.nat" | cut -d' ' -f1)"
+# de1's MSS clamp is refreshed from its new MTU. nl1's clamp must not move with it: the two
+# connections share a mangle table, and a refresh that rewrote by table instead of by
+# ownership comment would silently change the other peer's MSS.
+assert "the other connection's MSS value is untouched" \
+    test "$nl1_rules_before" = "$(grep 'multi-gre-iran-nl1' "$R/state/iptables.mangle" 2>/dev/null | sort)"
+assert "the other connection still advertises its own MSS" \
+    bash -c "grep 'multi-gre-iran-nl1' '$R/state/iptables.mangle' | grep -q 'set-mss 1436'"
+assert "only the edited connection's MSS changed" \
+    bash -c "grep 'multi-gre-iran-de1' '$R/state/iptables.mangle' | grep -q 'set-mss 1360'"
 assert "the connection keeps its own NAT rules" test "$de1_rules_before" = "$(grep -c 'multi-gre-iran-de1' "$R/state/iptables.nat")"
 assert "the other connection's config is untouched" test -f "$R/etc/multi-gre/foreigns/nl1.conf"
 # A `--apply` legitimately rebuilds every connection, so nl1 having an interface MTU is
