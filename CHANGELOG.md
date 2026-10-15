@@ -4,6 +4,26 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.18.2] - 2026-10-15
+
+### Fixed
+
+- **The release gate expected files that cannot exist in the archive.** `gre-hub.tar.gz`
+  is built with `tar czf gre-hub.tar.gz hub/`, so it contains only the `hub/` tree. The
+  "Verify the hub tarball contents" step nevertheless required
+  `tests/netns-gre.sh` and `tests/foreign-endpoint-suite.sh`, which can never be present.
+  Both entries are removed; every remaining path is inside `hub/`. This is what failed
+  v2.18.0 and v2.18.1 before any artifact was published.
+- **The network-namespace suite had the /30 ends the wrong way round.** It built the IRAN
+  namespace at `.1` and the FOREIGN namespace at `.2`, the opposite of the convention used
+  by `apply_iran_peer`, `apply_foreign_node`, `tunnel_diagnose` and the `ip` stub. That
+  inversion made a healthy tunnel report as `GRE_SUBNET_MISMATCH` and produced an
+  apparently self-contradictory health report.
+- The same suite shared one GRE key across three simultaneous tunnels, which the kernel
+  cannot demultiplex, and reused interface names without deleting them first; a pair that
+  could not be created or could not pass traffic now reports that fact with the relevant
+  link/address/route state instead of failing an unrelated assertion later.
+
 ## [2.18.1] - 2026-10-14
 
 ### Fixed
