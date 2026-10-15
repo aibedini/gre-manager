@@ -504,6 +504,15 @@ section "G. the health check against real kernel state"
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ -f "$REPO/gre-manager.sh" ]]; then
+    # Print the real state the health check is about to inspect. Without this a failing
+    # assertion here is unattributable: the same check can fail because the interface is
+    # missing, because its address differs, or because the kernel routes the peer elsewhere.
+    printf '      --- state the health check will see (%s) ---\n' "$IRAN_NS"
+    ip netns exec "$IRAN_NS" ip -d link show gre-p1 2>&1 | sed 's/^/      /' || true
+    ip netns exec "$IRAN_NS" ip -4 addr show gre-p1 2>&1 | sed 's/^/      /' || true
+    printf '      route to 10.201.1.1: %s\n' \
+        "$(ip netns exec "$IRAN_NS" ip -4 route get 10.201.1.1 2>&1 | tr '\n' ' ')"
+    ip netns exec "$IRAN_NS" ip -4 route show 2>&1 | sed 's/^/      /' || true
     links_before="$(ip netns exec "$IRAN_NS" ip -o link show | awk -F': ' '{print $2}' | sort | tr '\n' ' ')"
     hc_out="$(ip netns exec "$IRAN_NS" bash -c '
         set -u
@@ -542,6 +551,8 @@ EOF
     else
         # The address is 10.201.1.1/30 for the iran side of this pair.
         bad "health-check: did not confirm the tunnel address"
+        printf '      raw health-check output:\n'
+        printf '%s\n' "$hc_out" | sed 's/^/      /'
     fi
     if grep -qE '"id":"inner_route","category":"[^"]+","status":"PASS"' <<< "$hc_out"; then
         ok "health-check: confirms the kernel routes the peer's tunnel address over the interface"
