@@ -5870,10 +5870,15 @@ mtu_resolve() { # mtu_resolve NAME
 mtu_collect() { # mtu_collect [--probe]
     local do_probe="${1:-}"
     local self_tun_ip
+    # .1 is the IRAN end of the /30 and .2 is the FOREIGN end. This mapping must agree with
+    # mtu_resolve (which sets MTU_SIDE from the config file this host holds) and with
+    # health_check_run, which derives HEALTH_SELF_CIDR from the same rule. It was inverted
+    # here, so a connection served by an Iran peer config reported its FOREIGN address as
+    # "self" and every MTU line that depends on self_tun_ip described the wrong end.
     if [[ "$MTU_SIDE" == "iran" ]]; then
-        self_tun_ip="${MTU_SUBNET_BASE}.${MTU_IDX}.2"
-    else
         self_tun_ip="${MTU_SUBNET_BASE}.${MTU_IDX}.1"
+    else
+        self_tun_ip="${MTU_SUBNET_BASE}.${MTU_IDX}.2"
     fi
 
     local tun_present="no" tun_mtu="" iface_up="unknown"

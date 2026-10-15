@@ -554,10 +554,14 @@ EOF
         printf '      raw health-check output:\n'
         printf '%s\n' "$hc_out" | sed 's/^/      /'
     fi
-    if grep -qE '"id":"inner_route","category":"[^"]+","status":"PASS"' <<< "$hc_out"; then
+    # This check is SKIPPED by --quick on purpose (it is part of the full pass), so assert on
+    # a FULL run. Asserting PASS against a quick run would fail for the design, not a bug.
+    hc_full="$(ip netns exec "$IRAN_NS" bash /tmp/gre-hc-sut.sh health-check --name p1 --full --json 2>&1)"
+    if grep -qE '"id":"inner_route","category":"[^"]+","status":"PASS"' <<< "$hc_full"; then
         ok "health-check: confirms the kernel routes the peer's tunnel address over the interface"
     else
-        bad "health-check: did not confirm the inner route"
+        bad "health-check: did not confirm the inner route (full run)"
+        printf '%s\n' "$hc_full" | tr ',' '\n' | grep -i 'inner_route' | sed 's/^/      /' || true
     fi
     links_after="$(ip netns exec "$IRAN_NS" ip -o link show | awk -F': ' '{print $2}' | sort | tr '\n' ' ')"
     if [[ "$links_before" == "$links_after" ]]; then
