@@ -9,7 +9,7 @@
 #
 #   ns-iran                          ns-foreign
 #   10.99.0.1/30  <---- veth ---->   10.99.0.2/30        (underlay)
-#   gre-*   10.201.N.1/30  <-- GRE -->  10.201.N.2/30    (tunnel)
+#   gre-*   10.201.N.2/30  <-- GRE -->  10.201.N.1/30    (tunnel; .2 is IRAN, .1 is FOREIGN)
 #
 # REQUIREMENTS: Linux, root (or CAP_NET_ADMIN), iproute2, and a kernel with the GRE
 # module. When any of those is missing the suite prints SKIP for every case and exits
@@ -143,12 +143,16 @@ pair_up() { # pair_up IDX [KEY_IRAN] [KEY_FOREIGN]
     # is assigned, so the key would come from an unset (or inherited) variable.
     local key_i="${2:-$(( 2000 + idx ))}" key_f="${3:-$(( 2000 + idx ))}"
     local base=10.201
-    if ! ns_gre "$IRAN_NS" "gre-p$idx" "$UNDERLAY_IRAN" "$UNDERLAY_FOREIGN" "$key_i" "${base}.${idx}.1/30"; then
+    # .2 is the IRAN end and .1 is the FOREIGN end. This suite had them the other way round,
+    # which inverted it against the manager's own convention (apply_iran_peer builds the Iran
+    # interface at .2/30, apply_foreign_node at .1/30, and tunnel_diagnose maps the sides the
+    # same way). The result was a health check that looked wrong when the test fixture was.
+    if ! ns_gre "$IRAN_NS" "gre-p$idx" "$UNDERLAY_IRAN" "$UNDERLAY_FOREIGN" "$key_i" "${base}.${idx}.2/30"; then
         bad "setup: could not create gre-p$idx in $IRAN_NS (key $key_i)"
         dumptunnel "$IRAN_NS" "gre-p$idx"
         return 1
     fi
-    if ! ns_gre "$FOREIGN_NS" "gre-p$idx" "$UNDERLAY_FOREIGN" "$UNDERLAY_IRAN" "$key_f" "${base}.${idx}.2/30"; then
+    if ! ns_gre "$FOREIGN_NS" "gre-p$idx" "$UNDERLAY_FOREIGN" "$UNDERLAY_IRAN" "$key_f" "${base}.${idx}.1/30"; then
         bad "setup: could not create gre-p$idx in $FOREIGN_NS (key $key_f)"
         dumptunnel "$FOREIGN_NS" "gre-p$idx"
         return 1
@@ -175,6 +179,13 @@ pair_down() { # pair_down IDX
     ip netns exec "$FOREIGN_NS" ip tunnel del "gre-p$idx" 2>/dev/null || true
 }
 
+# Deleting a GRE tunnel by name is not always enough. On the CI runner `ip tunnel del gre-p2`
+# left the device behind — the kernel logged `add tunnel "gre0" failed: File exists` and the
+# next add for gre-p2 failed with the same message, so gre-p2 never existed while a stale
+# interface squatted the name. A section that needs a predictable starting point therefore
+# calls setup_topology again rather than trying to repair the namespaces in place, which is
+# what section D does.
+
 ns_ping() { # ns_ping NS TARGET
     ip netns exec "$1" ping -c 2 -W 2 "$2" >/dev/null 2>&1
 }
@@ -198,12 +209,12 @@ else
     bad "gre: the interface was not created"
 fi
 
-if ns_ping "$IRAN_NS" "10.201.1.2"; then
+if ns_ping "$IRAN_NS" "10.201.1.1"; then
     ok "gre: bidirectional ping over the tunnel (iran -> foreign tunnel address)"
 else
     bad "gre: no ping across the tunnel from iran"
 fi
-if ns_ping "$FOREIGN_NS" "10.201.1.1"; then
+if ns_ping "$FOREIGN_NS" "10.201.1.2"; then
     ok "gre: bidirectional ping over the tunnel (foreign -> iran tunnel address)"
 else
     bad "gre: no ping across the tunnel from foreign"
@@ -217,7 +228,7 @@ ip netns exec "$IRAN_NS" ip tunnel del gre-p1 2>/dev/null || true
 ip netns exec "$FOREIGN_NS" ip tunnel del gre-p1 2>/dev/null || true
 pair_up 1 1001 9999
 sleep 0.5
-if ns_ping "$IRAN_NS" "10.201.1.2"; then
+if ns_ping "$IRAN_NS" "10.201.1.1"; then
     bad "gre: a MISMATCHED GRE key still passed traffic (it must not)"
 else
     ok "gre: mismatched GRE keys do not pass traffic"
@@ -226,10 +237,10 @@ fi
 # --- correct keys, but the remote endpoint is wrong
 ip netns exec "$IRAN_NS" ip tunnel del gre-p1 2>/dev/null || true
 ip netns exec "$FOREIGN_NS" ip tunnel del gre-p1 2>/dev/null || true
-ns_gre "$IRAN_NS" gre-p1 "$UNDERLAY_IRAN" "10.99.0.99" 1001 "10.201.1.1/30"
-ns_gre "$FOREIGN_NS" gre-p1 "$UNDERLAY_FOREIGN" "$UNDERLAY_IRAN" 1001 "10.201.1.2/30"
+ns_gre "$IRAN_NS" gre-p1 "$UNDERLAY_IRAN" "10.99.0.99" 1001 "10.201.1.2/30"
+ns_gre "$FOREIGN_NS" gre-p1 "$UNDERLAY_FOREIGN" "$UNDERLAY_IRAN" 1001 "10.201.1.1/30"
 sleep 0.5
-if ns_ping "$IRAN_NS" "10.201.1.2"; then
+if ns_ping "$IRAN_NS" "10.201.1.1"; then
     bad "gre: a WRONG remote endpoint still passed traffic (it must not)"
 else
     ok "gre: a wrong remote endpoint does not pass traffic"
@@ -238,10 +249,10 @@ fi
 # --- correct remote, but the local endpoint is wrong (the defect class this fixes)
 ip netns exec "$IRAN_NS" ip tunnel del gre-p1 2>/dev/null || true
 ip netns exec "$FOREIGN_NS" ip tunnel del gre-p1 2>/dev/null || true
-ns_gre "$IRAN_NS" gre-p1 "10.99.0.99" "$UNDERLAY_FOREIGN" 1001 "10.201.1.1/30"
-ns_gre "$FOREIGN_NS" gre-p1 "$UNDERLAY_FOREIGN" "$UNDERLAY_IRAN" 1001 "10.201.1.2/30"
+ns_gre "$IRAN_NS" gre-p1 "10.99.0.99" "$UNDERLAY_FOREIGN" 1001 "10.201.1.2/30"
+ns_gre "$FOREIGN_NS" gre-p1 "$UNDERLAY_FOREIGN" "$UNDERLAY_IRAN" 1001 "10.201.1.1/30"
 sleep 0.5
-if ns_ping "$IRAN_NS" "10.201.1.2"; then
+if ns_ping "$IRAN_NS" "10.201.1.1"; then
     bad "gre: a WRONG local endpoint still passed traffic (it must not)"
 else
     ok "gre: a wrong local endpoint does not pass traffic"
@@ -260,13 +271,13 @@ ip netns exec "$IRAN_NS" ip tunnel del gre-p1 2>/dev/null || true
 ip netns exec "$FOREIGN_NS" ip tunnel del gre-p1 2>/dev/null || true
 pair_up 1
 sleep 0.5
-if ns_ping "$IRAN_NS" "10.201.1.2"; then
+if ns_ping "$IRAN_NS" "10.201.1.1"; then
     ok "gre: the pair works again before the firewall test"
 else
     bad "gre: the pair did not recover before the firewall test"
 fi
 ip netns exec "$FOREIGN_NS" iptables -A INPUT -p gre -s "$UNDERLAY_IRAN" -j DROP
-if ns_ping "$IRAN_NS" "10.201.1.2"; then
+if ns_ping "$IRAN_NS" "10.201.1.1"; then
     bad "gre: protocol 47 was blocked but the tunnel still passed traffic"
 else
     ok "gre: blocking protocol 47 stops the tunnel"
@@ -282,7 +293,7 @@ ip netns exec "$FOREIGN_NS" iptables -D INPUT -p gre -s "$UNDERLAY_IRAN" -j DROP
 
 # --- a route that sends the GRE packet back into the GRE interface
 ip netns exec "$IRAN_NS" ip route add "$UNDERLAY_FOREIGN/32" dev gre-p1 2>/dev/null || true
-if ns_ping "$IRAN_NS" "10.201.1.2"; then
+if ns_ping "$IRAN_NS" "10.201.1.1"; then
     bad "gre: traffic still flowed with the underlay route pointed at the tunnel"
 else
     ok "gre: a route looping the underlay into the tunnel breaks it (and is detectable)"
@@ -296,12 +307,12 @@ ip netns exec "$IRAN_NS" ip tunnel del gre-p1 2>/dev/null || true
 ip netns exec "$FOREIGN_NS" ip tunnel del gre-p1 2>/dev/null || true
 pair_up 1
 sleep 0.5
-assert_healthy() { ns_ping "$IRAN_NS" "10.201.1.2"; }
+assert_healthy() { ns_ping "$IRAN_NS" "10.201.1.1"; }
 
 # Class A: rules only. Replacing a NAT rule must NOT touch the GRE interface.
-ip netns exec "$IRAN_NS" iptables -t nat -A POSTROUTING -o gre-p1 -d 10.201.1.2 -j SNAT --to-source 10.201.1.1
-ip netns exec "$IRAN_NS" iptables -t nat -D POSTROUTING -o gre-p1 -d 10.201.1.2 -j SNAT --to-source 10.201.1.1 2>/dev/null || true
-ip netns exec "$IRAN_NS" iptables -t nat -A POSTROUTING -o gre-p1 -d 10.201.1.2 -j SNAT --to-source 10.201.1.1
+ip netns exec "$IRAN_NS" iptables -t nat -A POSTROUTING -o gre-p1 -d 10.201.1.1 -j SNAT --to-source 10.201.1.2
+ip netns exec "$IRAN_NS" iptables -t nat -D POSTROUTING -o gre-p1 -d 10.201.1.1 -j SNAT --to-source 10.201.1.2 2>/dev/null || true
+ip netns exec "$IRAN_NS" iptables -t nat -A POSTROUTING -o gre-p1 -d 10.201.1.1 -j SNAT --to-source 10.201.1.2
 sleep 0.3
 if ip netns exec "$IRAN_NS" ip link show gre-p1 >/dev/null 2>&1 && assert_healthy; then
     ok "class A: replacing a rule leaves the interface up and the tunnel passing traffic"
@@ -323,6 +334,11 @@ fi
 # ==========================================================================
 section "D. multiple simultaneous tunnels"
 
+# Start from clean namespaces so the three pairs are built on a known state. Reusing the
+# namespaces from section C left a device that could not be deleted, which made gre-p2 fail to
+# create and looked like a multi-tunnel bug.
+setup_topology
+pair_up 1
 pair_up 2
 pair_up 3
 sleep 0.5
@@ -355,7 +371,7 @@ fi
 # And they must be independent: breaking one must not disturb the others.
 pair_down 2
 sleep 0.3
-if ns_ping "$IRAN_NS" "10.201.1.2" && ns_ping "$IRAN_NS" "10.201.3.2" && ! ns_ping "$IRAN_NS" "10.201.2.2"; then
+if ns_ping "$IRAN_NS" "10.201.1.1" && ns_ping "$IRAN_NS" "10.201.3.1" && ! ns_ping "$IRAN_NS" "10.201.2.1"; then
     ok "multiple: removing one tunnel leaves the others working"
 else
     bad "multiple: tunnels are not independent"
@@ -424,11 +440,11 @@ section "F. MTU on a real interface"
 # keeps flowing.
 ip netns exec "$IRAN_NS" ip tunnel del gre-p4 2>/dev/null || true
 ip netns exec "$FOREIGN_NS" ip tunnel del gre-p4 2>/dev/null || true
-ns_gre "$IRAN_NS" gre-p4 "$UNDERLAY_IRAN" "$UNDERLAY_FOREIGN" 1004 "10.201.4.1/30"
-ns_gre "$FOREIGN_NS" gre-p4 "$UNDERLAY_FOREIGN" "$UNDERLAY_IRAN" 1004 "10.201.4.2/30"
+ns_gre "$IRAN_NS" gre-p4 "$UNDERLAY_IRAN" "$UNDERLAY_FOREIGN" 1004 "10.201.4.2/30"
+ns_gre "$FOREIGN_NS" gre-p4 "$UNDERLAY_FOREIGN" "$UNDERLAY_IRAN" 1004 "10.201.4.1/30"
 sleep 0.5
 
-if ns_ping "$IRAN_NS" "10.201.4.2"; then
+if ns_ping "$IRAN_NS" "10.201.4.1"; then
     ok "mtu: the tunnel works at its default MTU"
 else
     bad "mtu: the tunnel did not come up at its default MTU"
@@ -460,7 +476,7 @@ else
         ok "mtu: the key is not reported by this kernel (nothing to compare)"
     fi
 fi
-if ns_ping "$IRAN_NS" "10.201.4.2"; then
+if ns_ping "$IRAN_NS" "10.201.4.1"; then
     ok "mtu: the tunnel still passes traffic after the MTU change"
 else
     bad "mtu: the MTU change broke connectivity"
@@ -492,6 +508,17 @@ section "G. the health check against real kernel state"
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 if [[ -f "$REPO/gre-manager.sh" ]]; then
+    # Print the real state the health check is about to inspect. Without this a failing
+    # assertion here is unattributable: the same check can fail because the interface is
+    # missing, because its address differs, or because the kernel routes the peer elsewhere.
+    printf '      --- state the health check will see (%s) ---\n' "$IRAN_NS"
+    ip netns exec "$IRAN_NS" ip -d link show gre-p1 2>&1 | sed 's/^/      /' || true
+    ip netns exec "$IRAN_NS" ip -4 addr show gre-p1 2>&1 | sed 's/^/      /' || true
+    # The peer is the FOREIGN end of the /30, which is .1. The health check's inner_route
+    # check asserts that THIS address routes over the tunnel interface.
+    printf '      route to the peer (10.201.1.1): %s\n' \
+        "$(ip netns exec "$IRAN_NS" ip -4 route get 10.201.1.1 2>&1 | tr '\n' ' ')"
+    ip netns exec "$IRAN_NS" ip -4 route show 2>&1 | sed 's/^/      /' || true
     links_before="$(ip netns exec "$IRAN_NS" ip -o link show | awk -F': ' '{print $2}' | sort | tr '\n' ' ')"
     hc_out="$(ip netns exec "$IRAN_NS" bash -c '
         set -u
@@ -528,13 +555,20 @@ EOF
     if grep -qE '"id":"tunnel_address","category":"[^"]+","status":"PASS"' <<< "$hc_out"; then
         ok "health-check: confirms the real tunnel address"
     else
-        # The address is 10.201.1.1/30 for the iran side of this pair.
+        # .2 is the IRAN end of the /30; this connection is a foreigns/ peer on the Iran
+        # server, so the health check must find 10.201.1.2 on gre-p1.
         bad "health-check: did not confirm the tunnel address"
+        printf '      raw health-check output:\n'
+        printf '%s\n' "$hc_out" | sed 's/^/      /'
     fi
-    if grep -qE '"id":"inner_route","category":"[^"]+","status":"PASS"' <<< "$hc_out"; then
+    # This check is SKIPPED by --quick on purpose (it is part of the full pass), so assert on
+    # a FULL run. Asserting PASS against a quick run would fail for the design, not a bug.
+    hc_full="$(ip netns exec "$IRAN_NS" bash /tmp/gre-hc-sut.sh health-check --name p1 --full --json 2>&1)"
+    if grep -qE '"id":"inner_route","category":"[^"]+","status":"PASS"' <<< "$hc_full"; then
         ok "health-check: confirms the kernel routes the peer's tunnel address over the interface"
     else
-        bad "health-check: did not confirm the inner route"
+        bad "health-check: did not confirm the inner route (full run)"
+        printf '%s\n' "$hc_full" | tr ',' '\n' | grep -i 'inner_route' | sed 's/^/      /' || true
     fi
     links_after="$(ip netns exec "$IRAN_NS" ip -o link show | awk -F': ' '{print $2}' | sort | tr '\n' ' ')"
     if [[ "$links_before" == "$links_after" ]]; then
